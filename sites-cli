@@ -1,0 +1,419 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# sites-cli — insert or update a GXB tenant site from a local folder
+# Local:  SITES_ROOT/bin/rails runner FILE.rb
+# Prod:   SITES_ROOT + kamal-cli runner FILE.rb
+# Config: SITES_ROOT env; default ~/projects/sites
+
+require 'json'
+require 'optparse'
+require 'yaml'
+require 'base64'
+require 'tempfile'
+require 'open3'
+require 'fileutils'
+require 'stringio'
+
+VERSION = '1.0.0'
+SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
+
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
+
+def emit(data)
+  puts JSON.generate(data)
+  $stdout.flush
+end
+
+def success(data)
+  emit(ok: true, data: data)
+  0
+end
+
+def failure(msg, code: 'ERROR')
+  emit(ok: false, error: msg, code: code)
+  1
+end
+
+# -----------------------------------------------------------------------------
+# Validation / reading a site folder
+# -----------------------------------------------------------------------------
+
+def read_site_data(dir)
+  dir = File.expand_path(dir)
+  yaml_path = File.join(dir, 'site.yml')
+  html_path = File.join(dir, 'index.html')
+
+  return nil, failure("site.yml not found: #{yaml_path}", code: 'MISSING_SITE_YML') unless File.file?(yaml_path)
+  return nil, failure("index.html not found: #{html_path}", code: 'MISSING_INDEX_HTML') unless File.file?(html_path)
+
+  begin
+    spec = YAML.safe_load_file(yaml_path, permitted_classes: [], aliases: false) || {}
+  rescue Psych::Exception => e
+    return nil, failure("site.yml parse error: #{e.message}", code: 'YAML_ERROR')
+  end
+
+  slug = spec['slug'].to_s.strip
+  name = spec['name'].to_s.strip
+  return nil, failure("slug is required", code: 'MISSING_SLUG') if slug.empty?
+  return nil, failure("name is required", code: 'MISSING_NAME') if name.empty?
+  return nil, failure("slug must be lowercase letters, numbers, and dashes", code: 'INVALID_SLUG') unless slug.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+
+  body = File.read(html_path, encoding: 'UTF-8')
+  body = strip_document_wrapper(body)
+
+  assets = {}
+  assets_dir = File.join(dir, 'assets')
+  if Dir.exist?(assets_dir)
+    Dir[File.join(assets_dir, '*.{png,jpg,jpeg,webp,gif}')].sort.each do |path|
+      filename = File.basename(path)
+      assets[filename] = {
+        'filename' => filename,
+        'content_type' => content_type_from_ext(filename),
+        'base64' => Base64.strict_encode64(File.binread(path))
+      }
+    end
+  end
+
+  business = spec['business'] || {}
+  theme = spec['theme'] || {}
+  page = spec['page'] || {}
+  tailwind = spec.fetch('tailwind', true)
+  noindex = spec.fetch('noindex', true)
+  status = spec.fetch('status', 'live')
+
+  markdown = page['markdown'] || default_markdown(name, business)
+
+  data = {
+    'slug' => slug,
+    'name' => name,
+    'status' => status,
+    'tailwind' => tailwind,
+    'noindex' => noindex,
+    'theme' => theme,
+    'business' => business,
+    'settings' => spec['settings'] || {},
+    'files' => spec['files'] || {},
+    'page' => {
+      'title' => page.fetch('title', name),
+      'description' => page.fetch('description', business['tagline']),
+      'schema_type' => page.fetch('schema_type', 'LocalBusiness'),
+      'body' => body,
+      'markdown' => markdown
+    },
+    'assets' => assets
+  }
+
+  [data, nil]
+end
+
+def content_type_from_ext(filename)
+  case File.extname(filename).downcase
+  when '.png' then 'image/png'
+  when '.jpg', '.jpeg' then 'image/jpeg'
+  when '.webp' then 'image/webp'
+  when '.gif' then 'image/gif'
+  else 'application/octet-stream'
+  end
+end
+
+def strip_document_wrapper(html)
+  # If the file is a full document, extract the inner HTML of <body>.
+  return html unless html.match?(/<html/i) || html.match?(/<body/i)
+
+  body = html[/<body[^>]*>(.*)<\/body>/im, 1]
+  return body.strip if body
+
+  # No body tag: strip head and html wrapper heuristically.
+  html.sub(/.*<body[^>]*>/im, '').sub(/<\/body>.*/im, '').sub(/<\/html>.*/im, '').strip
+end
+
+def default_markdown(name, business)
+  lines = ["# #{name}"]
+  lines << business['tagline'] if business['tagline']
+  if business['phone_display']
+    lines << ""
+    lines << "Call or text: #{business['phone_display']}"
+  end
+  if business.dig('address', 'street')
+    lines << ""
+    lines << "#{business['address']['street']}, #{business['address']['locality']}, #{business['address']['region']} #{business['address']['postal_code']}"
+  end
+  lines << ""
+  lines << "This is a preview site built by GXB."
+  lines.join("\n")
+end
+
+# -----------------------------------------------------------------------------
+# Build the Rails runner script
+# -----------------------------------------------------------------------------
+
+def runner_script(data)
+  <<~RUBY
+    require 'json'
+    require 'base64'
+    require 'stringio'
+
+    PAYLOAD = <<'PAYLOAD'
+    #{JSON.pretty_generate(data)}
+    PAYLOAD
+    payload = JSON.parse(PAYLOAD)
+
+    team = Team.find_or_create_by!(name: "GXB")
+    site = Site.find_or_initialize_by(slug: payload["slug"])
+    site.assign_attributes(
+      team: team,
+      name: payload["name"],
+      status: payload["status"],
+      theme: payload["theme"],
+      business: payload["business"],
+      settings: payload["settings"].merge("locale" => "en", "tailwind" => payload["tailwind"]),
+      files: payload["files"]
+    )
+    site.save!
+
+    # Attach or replace assets by filename
+    payload["assets"].each do |filename, asset|
+      io = StringIO.new(Base64.decode64(asset["base64"]))
+      existing = site.media.find { |m| m.file.attached? && m.file.filename.to_s == filename }
+      if existing
+        existing.file.attach(io: io, filename: filename, content_type: asset["content_type"])
+        existing.save!
+      else
+        m = site.media.new(alt: File.basename(filename, ".*").tr("-", " "), kind: "image")
+        m.file.attach(io: io, filename: filename, content_type: asset["content_type"])
+        m.save!
+      end
+    end
+
+    page = site.pages.find_or_initialize_by(path: "/")
+    page.noindex = payload["noindex"]
+    page.save!
+
+    page.draft!(
+      title: payload["page"]["title"],
+      description: payload["page"]["description"],
+      schema_type: payload["page"]["schema_type"],
+      body: payload["page"]["body"],
+      css: nil,
+      format: "html",
+      sections: [],
+      meta: { "markdown" => payload["page"]["markdown"] },
+      author: "sites-cli"
+    )
+    page.publish! if page.pending?
+
+    # Warm the per-site Tailwind stylesheet so first request is fast.
+    site.stylesheet.css if payload["tailwind"]
+
+    puts JSON.generate({
+      slug: site.slug,
+      name: site.name,
+      status: site.status,
+      host: site.canonical_host,
+      url: "https://\#{site.canonical_host}",
+      pages: site.pages.live.count,
+      assets: site.media.count
+    })
+  RUBY
+end
+
+# -----------------------------------------------------------------------------
+# Run the runner locally or through kamal-cli
+# -----------------------------------------------------------------------------
+
+def run_runner(script, prod:)
+  file = Tempfile.new(['sites-cli-', '.rb'])
+  file.write(script)
+  file.close
+
+  if prod
+    Dir.chdir(SITES_ROOT) do
+      out, err, status = Open3.capture3('kamal-cli', 'runner', file.path)
+      return parse_kamal_output(out, err, status)
+    end
+  else
+    Dir.chdir(SITES_ROOT) do
+      out, err, status = Open3.capture3('bin/rails', 'runner', file.path)
+      if status.success?
+        begin
+          data = JSON.parse(out.lines.find { |l| l.start_with?('{') } || out)
+          return success(data)
+        rescue JSON::ParserError
+          return success(stdout: out.strip, stderr: err.strip)
+        end
+      else
+        return failure("rails runner failed\n#{err.strip}\n#{out.strip}", code: 'RUNNER_FAILED')
+      end
+    end
+  end
+ensure
+  file&.unlink
+end
+
+def parse_kamal_output(out, err, status)
+  begin
+    parsed = JSON.parse(out)
+  rescue JSON::ParserError
+    return failure("kamal-cli did not return JSON\nOUT: #{out.strip}\nERR: #{err.strip}", code: 'KAMAL_JSON_ERROR')
+  end
+
+  unless parsed['ok']
+    return failure("kamal-cli failed: #{parsed['error'] || parsed.inspect}", code: 'KAMAL_FAILED')
+  end
+
+  runner_stdout = parsed.dig('data', 'stdout').to_s
+  runner_stderr = parsed.dig('data', 'stderr').to_s
+  runner_status = parsed.dig('data', 'exit')
+
+  if runner_status.to_i.zero?
+    begin
+      data = JSON.parse(runner_stdout.lines.find { |l| l.start_with?('{') } || runner_stdout)
+      return success(data)
+    rescue JSON::ParserError
+      return success(stdout: runner_stdout.strip, stderr: runner_stderr.strip)
+    end
+  else
+    return failure("runner exited #{runner_status}\n#{runner_stderr.strip}\n#{runner_stdout.strip}", code: 'RUNNER_EXIT_FAILED')
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Stdout capture helper (used by open to extract URL without double-printing)
+# -----------------------------------------------------------------------------
+
+def capture_stdout
+  old = $stdout
+  $stdout = StringIO.new
+  yield
+  $stdout.string
+ensure
+  $stdout = old
+end
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+
+def cmd_list(prod:)
+  script = <<~RUBY
+    sites = Site.includes(:domains).order(:slug)
+    puts JSON.generate(sites.map { |s| {
+      slug: s.slug,
+      name: s.name,
+      status: s.status,
+      host: s.canonical_host,
+      url: "https://\#{s.canonical_host}",
+      pages: s.pages.live.count
+    }})
+  RUBY
+  run_runner(script, prod: prod)
+end
+
+def cmd_show(slug, prod:)
+  script = <<~RUBY
+    site = Site.find_by!(slug: #{JSON.dump(slug)})
+    puts JSON.generate({
+      slug: site.slug,
+      name: site.name,
+      status: site.status,
+      host: site.canonical_host,
+      url: "https://\#{site.canonical_host}",
+      pages: site.pages.live.map { |p| { path: p.path, title: p.live_revision&.title } },
+      domains: site.domains.pluck(:host),
+      tailwind: site.settings["tailwind"],
+      noindex: site.home&.noindex
+    })
+  RUBY
+  run_runner(script, prod: prod)
+end
+
+def cmd_push(dir, prod:)
+  data, err = read_site_data(dir)
+  return err if err
+
+  script = runner_script(data)
+  run_runner(script, prod: prod)
+end
+
+def cmd_open(slug, prod:)
+  script = <<~RUBY
+    site = Site.find_by!(slug: #{JSON.dump(slug)})
+    puts "https://\#{site.canonical_host}"
+  RUBY
+
+  captured = capture_stdout { run_runner(script, prod: prod) }
+  result = $?.nil? ? 1 : 0 # unused; we already captured
+
+  json_line = captured.lines.find { |l| l.start_with?('{') }
+  output = json_line ? (JSON.parse(json_line) rescue {}) : {}
+  return failure("could not resolve site URL", code: 'URL_ERROR') unless output['ok']
+
+  url = output.dig('data', 'url')
+  return failure("runner did not return a URL", code: 'URL_ERROR') unless url
+
+  if prod
+    system('open', url)
+    return success(url: url, opened: true)
+  else
+    puts "\nPreview URL (production): #{url}"
+    puts "Local inspection (Host header): curl -H 'Host: #{slug}.sites.gxb.vc' http://sites.localhost/"
+    return success(url: url, opened: false, local_curl: "curl -H 'Host: #{slug}.sites.gxb.vc' http://sites.localhost/")
+  end
+end
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def usage
+  puts <<~USAGE
+    sites-cli — insert/update a GXB tenant site from a folder
+
+    Commands:
+      sites-cli list [--prod]              List tenant sites
+      sites-cli show SLUG [--prod]         Show a tenant site
+      sites-cli push DIR [--prod]          Upsert site from DIR/site.yml + DIR/index.html + DIR/assets/
+      sites-cli open SLUG [--prod]         Print URL; with --prod, open it
+
+    Environment:
+      SITES_ROOT   Path to sites Rails app (default: ~/projects/sites)
+
+    Folder layout for push:
+      site.yml       # slug, name, business, theme, page, tailwind, noindex, status
+      index.html     # inner HTML only (no <html>/<head>/<body>)
+      assets/*       # optional png/jpg/jpeg/webp/gif
+
+    Examples:
+      sites-cli push ./metrolocksmith
+      sites-cli push ./metrolocksmith --prod
+      sites-cli open metrolocksmith --prod
+  USAGE
+  0
+end
+
+def run(argv)
+  command = argv.shift
+  case command
+  when '-h', '--help', 'help', nil then return usage
+  when 'list' then return cmd_list(prod: argv.include?('--prod'))
+  when 'show'
+    slug = argv.find { |a| a != '--prod' }
+    return failure("show requires SLUG", code: 'USAGE') unless slug
+    return cmd_show(slug, prod: argv.include?('--prod'))
+  when 'push'
+    dir = argv.find { |a| a != '--prod' }
+    return failure("push requires DIR", code: 'USAGE') unless dir
+    return cmd_push(dir, prod: argv.include?('--prod'))
+  when 'open'
+    slug = argv.find { |a| a != '--prod' }
+    return failure("open requires SLUG", code: 'USAGE') unless slug
+    return cmd_open(slug, prod: argv.include?('--prod'))
+  else
+    return failure("Unknown command: #{command}", code: 'USAGE')
+  end
+end
+
+exit run(ARGV.dup)
