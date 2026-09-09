@@ -78,6 +78,9 @@ def read_site_data(dir)
   end
 
   business = spec['business'] || {}
+  if business['person'].is_a?(String)
+    business['person'] = { 'name' => business['person'] }
+  end
   theme = spec['theme'] || {}
   page = spec['page'] || {}
   tailwind = spec.fetch('tailwind', true)
@@ -224,6 +227,15 @@ end
 # Run the runner locally or through kamal-cli
 # -----------------------------------------------------------------------------
 
+def sites_env
+  env = ENV.to_h
+  version_file = File.join(SITES_ROOT, '.ruby-version')
+  env['RBENV_VERSION'] = File.read(version_file).strip if File.file?(version_file)
+  shims = File.expand_path('~/.rbenv/shims')
+  env['PATH'] = "#{shims}:#{env['PATH']}" if File.directory?(shims)
+  env
+end
+
 def run_runner(script, prod:)
   file = Tempfile.new(['sites-cli-', '.rb'])
   file.write(script)
@@ -231,12 +243,12 @@ def run_runner(script, prod:)
 
   if prod
     Dir.chdir(SITES_ROOT) do
-      out, err, status = Open3.capture3('kamal-cli', 'runner', file.path)
+      out, err, status = Open3.capture3(sites_env, 'kamal-cli', 'runner', file.path)
       return parse_kamal_output(out, err, status)
     end
   else
     Dir.chdir(SITES_ROOT) do
-      out, err, status = Open3.capture3('bin/rails', 'runner', file.path)
+      out, err, status = Open3.capture3(sites_env, 'bin/rails', 'runner', file.path)
       if status.success?
         begin
           data = JSON.parse(out.lines.find { |l| l.start_with?('{') } || out)
