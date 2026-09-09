@@ -341,12 +341,10 @@ end
 def cmd_open(slug, prod:)
   script = <<~RUBY
     site = Site.find_by!(slug: #{JSON.dump(slug)})
-    puts "https://\#{site.canonical_host}"
+    puts JSON.generate({ slug: site.slug, host: site.canonical_host, url: "https://\#{site.canonical_host}" })
   RUBY
 
   captured = capture_stdout { run_runner(script, prod: prod) }
-  result = $?.nil? ? 1 : 0 # unused; we already captured
-
   json_line = captured.lines.find { |l| l.start_with?('{') }
   output = json_line ? (JSON.parse(json_line) rescue {}) : {}
   return failure("could not resolve site URL", code: 'URL_ERROR') unless output['ok']
