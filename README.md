@@ -1,76 +1,35 @@
 # sites-cli
 
-Insert or update a GXB tenant site on the `sites` platform from a local folder.
+Manage GXB tenant sites on the `sites` Rails platform, and author an
+existing site's pages/design as text files over its agent HTTP gateway
+(`plans/24-agent-sites.md` in `~/projects/sites`).
 
 Local sites live in `~/projects/sites`. Use `SITES_ROOT` to override.
 
-## Commands
+See `AGENTS.md` for the full command reference. Quick start:
 
 ```bash
-sites-cli list [--prod]             # list tenant sites
-sites-cli show SLUG [--prod]        # show one site
-sites-cli push DIR [--prod]         # upsert site from folder
-sites-cli open SLUG [--prod]        # print URL; open with --prod
+# Staff-only, runner-based
+sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]  # provision an empty site
+sites-cli list [--prod]                                      # list tenant sites
+sites-cli show SLUG [--prod]                                  # show one site
+sites-cli open SLUG [--prod]                                  # print URL; open with --prod
+
+# Text file tools, once a site has a token in ~/.config/sites-cli/tokens.json
+sites-cli describe_site SLUG
+sites-cli read_file SLUG about.md
+sites-cli write_file SLUG about.md --content "$(cat about.md)"
+sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg
+sites-cli publish SLUG about.md
 ```
 
-Without `--prod`, the tool runs `bin/rails runner` in `SITES_ROOT`. With `--prod`, it generates a self-contained runner file and pipes it through `kamal-cli runner` from the sites app.
+Without `--prod`, the runner-based commands run `bin/rails runner` in
+`SITES_ROOT`. With `--prod`, they pipe a self-contained runner file through
+`kamal-cli runner` from the sites app -- requires `kamal-cli` on PATH.
 
-## Folder layout
-
-```
-DIR/site.yml      # slug, name, business, theme, page, tailwind, noindex, status
-DIR/index.html    # inner HTML only; Tailwind v4 utilities
-DIR/assets/*      # optional png/jpg/jpeg/webp/gif, attached by filename
-```
-
-Example `site.yml`:
-
-```yaml
-slug: metrolocksmith
-name: Metro Locksmith
-status: live
-noindex: true
-tailwind: true
-business:
-  tagline: 24/7 mobile locksmith serving Dallas and Fort Worth.
-  phone: "+1-214-638-9911"
-  phone_display: (214) 638-9911
-  email: info@metrolocksmith.example
-  address:
-    street: 5321 Kiwanis Rd
-    locality: Dallas
-    region: TX
-    postal_code: "75236"
-    country: US
-  area_served:
-    - Dallas
-    - Fort Worth
-    - Irving
-    - Arlington
-  services:
-    - Emergency lockout
-    - Lock rekeying
-    - Key duplication
-    - Safe opening
-    - Automotive keys
-  schema_types:
-    - Locksmith
-    - LocalBusiness
-theme:
-  palette:
-    primary: "#1f2937"
-    accent: "#2563eb"
-    ink: "#111827"
-    surface: "#ffffff"
-    muted: "#6b7280"
-  fonts:
-    heading: Inter
-    body: Inter
-page:
-  title: Metro Locksmith · Dallas TX
-  description: 24/7 mobile locksmith. Fast, local, and fully insured.
-  schema_type: LocalBusiness
-```
+There is no folder importer (`push`/`site.yml`) any more. `create` provisions
+an empty site; every page and design edit after that goes through the same
+six text file tools an agent uses.
 
 ## Setup
 
@@ -79,4 +38,13 @@ cd ~/tools/sites-cli
 ln -s ~/tools/sites-cli/sites-cli ~/bin/sites-cli
 ```
 
-For production pushes, `kamal-cli` must be on PATH and `~/projects/sites/config/deploy.yml` must exist.
+After `create`, mint an API token (`Admin::ApiTokensController` on the
+site's admin page) and put it in `~/.config/sites-cli/tokens.json` as
+`{"SLUG": "sk_site_..."}`. That file lives outside this git checkout; the
+CLI tightens it to mode 600 on every read.
+
+## Testing
+
+```bash
+ruby test_sites_cli.rb
+```

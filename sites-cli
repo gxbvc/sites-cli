@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # sites-cli — GXB tenant site management
-# Local:  SITES_ROOT/bin/rails runner FILE.rb (list/show/push/open/create)
+# Local:  SITES_ROOT/bin/rails runner FILE.rb (list/show/open/create)
 # Prod:   SITES_ROOT + kamal-cli runner FILE.rb
 # Text file tools (describe_site/list_files/read_file/write_file/edit_file/
 # publish) talk HTTP to the site-token gateway instead -- see the "Text file
@@ -11,8 +11,6 @@
 
 require 'json'
 require 'optparse'
-require 'yaml'
-require 'base64'
 require 'tempfile'
 require 'open3'
 require 'fileutils'
@@ -37,194 +35,15 @@ def success(data)
   0
 end
 
-def failure(msg, code: 'ERROR')
-  emit(ok: false, error: msg, code: code)
+# status/body pass through the API's real HTTP status and full structured
+# 409/422 payload (e.g. conflict path/version) instead of collapsing them
+# into one message string.
+def failure(msg, code: 'ERROR', status: nil, body: nil)
+  payload = { ok: false, error: msg, code: code }
+  payload[:status] = status if status
+  payload[:body] = body if body
+  emit(payload)
   1
-end
-
-# -----------------------------------------------------------------------------
-# Validation / reading a site folder
-# -----------------------------------------------------------------------------
-
-def read_site_data(dir)
-  dir = File.expand_path(dir)
-  yaml_path = File.join(dir, 'site.yml')
-  html_path = File.join(dir, 'index.html')
-
-  return nil, failure("site.yml not found: #{yaml_path}", code: 'MISSING_SITE_YML') unless File.file?(yaml_path)
-  return nil, failure("index.html not found: #{html_path}", code: 'MISSING_INDEX_HTML') unless File.file?(html_path)
-
-  begin
-    spec = YAML.safe_load_file(yaml_path, permitted_classes: [], aliases: false) || {}
-  rescue Psych::Exception => e
-    return nil, failure("site.yml parse error: #{e.message}", code: 'YAML_ERROR')
-  end
-
-  slug = spec['slug'].to_s.strip
-  name = spec['name'].to_s.strip
-  return nil, failure("slug is required", code: 'MISSING_SLUG') if slug.empty?
-  return nil, failure("name is required", code: 'MISSING_NAME') if name.empty?
-  return nil, failure("slug must be lowercase letters, numbers, and dashes", code: 'INVALID_SLUG') unless slug.match?(/\A[a-z0-9][a-z0-9-]*\z/)
-
-  body = File.read(html_path, encoding: 'UTF-8')
-  body = strip_document_wrapper(body)
-
-  assets = {}
-  assets_dir = File.join(dir, 'assets')
-  if Dir.exist?(assets_dir)
-    Dir[File.join(assets_dir, '*.{png,jpg,jpeg,webp,gif}')].sort.each do |path|
-      filename = File.basename(path)
-      assets[filename] = {
-        'filename' => filename,
-        'content_type' => content_type_from_ext(filename),
-        'base64' => Base64.strict_encode64(File.binread(path))
-      }
-    end
-  end
-
-  business = spec['business'] || {}
-  if business['person'].is_a?(String)
-    business['person'] = { 'name' => business['person'] }
-  end
-  theme = spec['theme'] || {}
-  page = spec['page'] || {}
-  tailwind = spec.fetch('tailwind', true)
-  noindex = spec.fetch('noindex', true)
-  status = spec.fetch('status', 'live')
-
-  markdown = page['markdown'] || default_markdown(name, business)
-
-  data = {
-    'slug' => slug,
-    'name' => name,
-    'status' => status,
-    'tailwind' => tailwind,
-    'noindex' => noindex,
-    'theme' => theme,
-    'business' => business,
-    'settings' => spec['settings'] || {},
-    'files' => spec['files'] || {},
-    'page' => {
-      'title' => page.fetch('title', name),
-      'description' => page.fetch('description', business['tagline']),
-      'schema_type' => page.fetch('schema_type', 'LocalBusiness'),
-      'body' => body,
-      'markdown' => markdown
-    },
-    'assets' => assets
-  }
-
-  [data, nil]
-end
-
-def content_type_from_ext(filename)
-  case File.extname(filename).downcase
-  when '.png' then 'image/png'
-  when '.jpg', '.jpeg' then 'image/jpeg'
-  when '.webp' then 'image/webp'
-  when '.gif' then 'image/gif'
-  else 'application/octet-stream'
-  end
-end
-
-def strip_document_wrapper(html)
-  # If the file is a full document, extract the inner HTML of <body>.
-  return html unless html.match?(/<html/i) || html.match?(/<body/i)
-
-  body = html[/<body[^>]*>(.*)<\/body>/im, 1]
-  return body.strip if body
-
-  # No body tag: strip head and html wrapper heuristically.
-  html.sub(/.*<body[^>]*>/im, '').sub(/<\/body>.*/im, '').sub(/<\/html>.*/im, '').strip
-end
-
-def default_markdown(name, business)
-  lines = ["# #{name}"]
-  lines << business['tagline'] if business['tagline']
-  if business['phone_display']
-    lines << ""
-    lines << "Call or text: #{business['phone_display']}"
-  end
-  if business.dig('address', 'street')
-    lines << ""
-    lines << "#{business['address']['street']}, #{business['address']['locality']}, #{business['address']['region']} #{business['address']['postal_code']}"
-  end
-  lines << ""
-  lines << "This is a preview site built by GXB."
-  lines.join("\n")
-end
-
-# -----------------------------------------------------------------------------
-# Build the Rails runner script
-# -----------------------------------------------------------------------------
-
-def runner_script(data)
-  <<~RUBY
-    require 'json'
-    require 'base64'
-    require 'stringio'
-
-    PAYLOAD = <<'PAYLOAD'
-    #{JSON.pretty_generate(data)}
-    PAYLOAD
-    payload = JSON.parse(PAYLOAD)
-
-    team = Team.find_or_create_by!(name: "GXB")
-    site = Site.find_or_initialize_by(slug: payload["slug"])
-    site.assign_attributes(
-      team: team,
-      name: payload["name"],
-      status: payload["status"],
-      theme: payload["theme"],
-      business: payload["business"],
-      settings: payload["settings"].merge("locale" => "en", "tailwind" => payload["tailwind"]),
-      files: payload["files"]
-    )
-    site.save!
-
-    # Attach or replace assets by filename
-    payload["assets"].each do |filename, asset|
-      io = StringIO.new(Base64.decode64(asset["base64"]))
-      existing = site.media.find { |m| m.file.attached? && m.file.filename.to_s == filename }
-      if existing
-        existing.file.attach(io: io, filename: filename, content_type: asset["content_type"])
-        existing.save!
-      else
-        m = site.media.new(alt: File.basename(filename, ".*").tr("-", " "), kind: "image")
-        m.file.attach(io: io, filename: filename, content_type: asset["content_type"])
-        m.save!
-      end
-    end
-
-    page = site.pages.find_or_initialize_by(path: "/")
-    page.noindex = payload["noindex"]
-    page.save!
-
-    page.draft!(
-      title: payload["page"]["title"],
-      description: payload["page"]["description"],
-      schema_type: payload["page"]["schema_type"],
-      body: payload["page"]["body"],
-      css: nil,
-      format: "html",
-      sections: [],
-      meta: { "markdown" => payload["page"]["markdown"] },
-      author: "sites-cli"
-    )
-    # Page#publish! compiles and persists Site#published_css itself now, so
-    # there is no separate warm-up call left to make here.
-    page.publish! if page.pending?
-
-    puts JSON.generate({
-      slug: site.slug,
-      name: site.name,
-      status: site.status,
-      host: site.canonical_host,
-      url: "https://\#{site.canonical_host}",
-      pages: site.pages.live.count,
-      assets: site.media.count
-    })
-  RUBY
 end
 
 # -----------------------------------------------------------------------------
@@ -310,7 +129,7 @@ ensure
 end
 
 # -----------------------------------------------------------------------------
-# Runner-based commands: list / show / push / open / create
+# Runner-based commands: list / show / open / create
 # -----------------------------------------------------------------------------
 
 def cmd_list(prod:)
@@ -346,14 +165,6 @@ def cmd_show(slug, prod:)
   run_runner(script, prod: prod)
 end
 
-def cmd_push(dir, prod:)
-  data, err = read_site_data(dir)
-  return err if err
-
-  script = runner_script(data)
-  run_runner(script, prod: prod)
-end
-
 def cmd_open(slug, prod:)
   script = <<~RUBY
     site = Site.find_by!(slug: #{JSON.dump(slug)})
@@ -373,8 +184,8 @@ def cmd_open(slug, prod:)
     return success(url: url, opened: true)
   else
     puts "\nPreview URL (production): #{url}"
-    puts "Local inspection (Host header): curl -H 'Host: #{slug}.sites.gxb.vc' http://sites.localhost/"
-    return success(url: url, opened: false, local_curl: "curl -H 'Host: #{slug}.sites.gxb.vc' http://sites.localhost/")
+    puts "Local inspection (Host header): curl -H 'Host: #{slug}.gxbsites.com' http://sites.localhost/"
+    return success(url: url, opened: false, local_curl: "curl -H 'Host: #{slug}.gxbsites.com' http://sites.localhost/")
   end
 end
 
@@ -395,7 +206,8 @@ end
 # edit_file, publish (plans/24-agent-sites.md slice 3 item 18). These talk
 # HTTP to the site-token gateway (Api::V1::ToolsController) -- a site token
 # is scoped to exactly one site, unlike the runner credentials the commands
-# above use. write --file (binary uploads) waits for slice 5a.
+# above use. write --file streams a binary upload through the media API
+# (plans/24-agent-sites.md slice 5a: single PUT, jpg/png/webp/gif).
 # -----------------------------------------------------------------------------
 
 CONFIG_DIR = File.expand_path(ENV.fetch('SITES_CLI_CONFIG_DIR', '~/.config/sites-cli'))
@@ -413,7 +225,18 @@ def save_json(path, data)
   File.chmod(0o600, path)
 end
 
-def token_for(slug) = load_json(TOKENS_PATH)[slug]
+# Credentials live outside this git checkout (~/.config, not ~/tools/sites-cli)
+# and get tightened to owner-only on every read, in case the file was
+# created or edited by hand with looser permissions.
+def secure_permissions!(path)
+  return unless File.file?(path)
+  File.chmod(0o600, path) unless (File.stat(path).mode & 0o777) == 0o600
+end
+
+def token_for(slug)
+  secure_permissions!(TOKENS_PATH)
+  load_json(TOKENS_PATH)[slug]
+end
 
 # read_file caches {slug, path, version} locally so write/edit/publish can
 # default --expected-version from the caller's own last read -- a write
@@ -448,7 +271,7 @@ def api_call(slug, tool, arguments)
 
   return [ body, nil ] if res.code.to_i.between?(200, 299)
 
-  [ nil, failure(body['message'] || body['error'] || "HTTP #{res.code}", code: (body['error'] || "HTTP_#{res.code}").to_s) ]
+  [ nil, failure(body['message'] || body['error'] || "HTTP #{res.code}", code: (body['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: body) ]
 end
 
 def cmd_describe_site(slug, path)
@@ -530,7 +353,7 @@ def media_api_call(slug, method, path, body)
   end
   return [ parsed, nil ] if res.code.to_i.between?(200, 299)
 
-  [ nil, failure(parsed['message'] || parsed['error'] || "HTTP #{res.code}", code: (parsed['error'] || "HTTP_#{res.code}").to_s) ]
+  [ nil, failure(parsed['message'] || parsed['error'] || "HTTP #{res.code}", code: (parsed['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: parsed) ]
 end
 
 # A streamed PUT (body_stream, not the whole file in memory) against the
@@ -544,7 +367,7 @@ def put_upload(upload_url, file_path, content_type, byte_size)
   req.body_stream = File.open(file_path, 'rb')
   res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
   req.body_stream.close
-  res.code.to_i.between?(200, 299) ? nil : failure("upload PUT failed: HTTP #{res.code}", code: 'UPLOAD_FAILED')
+  res.code.to_i.between?(200, 299) ? nil : failure("upload PUT failed: HTTP #{res.code}", code: 'UPLOAD_FAILED', status: res.code.to_i)
 end
 
 def cmd_write_file_upload(slug, path, file_path, expected_version)
@@ -587,10 +410,9 @@ def usage
   puts <<~USAGE
     sites-cli — GXB tenant site management
 
-    Site folder commands (runner-based):
+    Site folder commands (runner-based, staff-only):
       sites-cli list [--prod]              List tenant sites
       sites-cli show SLUG [--prod]         Show a tenant site
-      sites-cli push DIR [--prod]          Upsert site from DIR/site.yml + DIR/index.html + DIR/assets/
       sites-cli open SLUG [--prod]         Print URL; with --prod, open it
       sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]
                                             Staff-only: create an empty site
@@ -602,7 +424,9 @@ def usage
       sites-cli write_file SLUG PATH --content C --expected-version V
                                                      alias: write
       sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]
-                                                     binary upload (5a: single PUT, jpg/png/webp/gif)
+                                                     binary upload: authorize -> single presigned
+                                                     PUT streamed from disk -> complete -> poll
+                                                     (jpg/png/webp/gif; no multipart/resume yet)
       sites-cli edit_file SLUG PATH --edits-file F.json --expected-version V
                                                      alias: edit
       sites-cli publish SLUG PATH --expected-version V
@@ -617,13 +441,8 @@ def usage
       SITES_CLI_HOST         Site-token gateway host (default: https://sites.gxb.vc)
       SITES_CLI_CONFIG_DIR   Token/state directory (default: ~/.config/sites-cli)
 
-    Folder layout for push:
-      site.yml       # slug, name, business, theme, page, tailwind, noindex, status
-      index.html     # inner HTML only (no <html>/<head>/<body>)
-      assets/*       # optional png/jpg/jpeg/webp/gif
-
     Examples:
-      sites-cli push ./metrolocksmith
+      sites-cli create metrolocksmith --name "Metro Locksmith"
       sites-cli describe_site acme
       sites-cli read_file acme about.md
       sites-cli write_file acme about.md --content "$(cat about.md)"
@@ -654,10 +473,6 @@ def run(argv)
     slug = argv.find { |a| a != '--prod' }
     return failure("show requires SLUG", code: 'USAGE') unless slug
     return cmd_show(slug, prod: argv.include?('--prod'))
-  when 'push'
-    dir = argv.find { |a| a != '--prod' }
-    return failure("push requires DIR", code: 'USAGE') unless dir
-    return cmd_push(dir, prod: argv.include?('--prod'))
   when 'open'
     slug = argv.find { |a| a != '--prod' }
     return failure("open requires SLUG", code: 'USAGE') unless slug
