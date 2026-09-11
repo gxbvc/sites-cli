@@ -1,9 +1,12 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# sites-cli — insert or update a GXB tenant site from a local folder
-# Local:  SITES_ROOT/bin/rails runner FILE.rb
+# sites-cli — GXB tenant site management
+# Local:  SITES_ROOT/bin/rails runner FILE.rb (list/show/push/open/create)
 # Prod:   SITES_ROOT + kamal-cli runner FILE.rb
+# Text file tools (describe_site/list_files/read_file/write_file/edit_file/
+# publish) talk HTTP to the site-token gateway instead -- see the "Text file
+# tools" section below.
 # Config: SITES_ROOT env; default ~/projects/sites
 
 require 'json'
@@ -14,6 +17,8 @@ require 'tempfile'
 require 'open3'
 require 'fileutils'
 require 'stringio'
+require 'net/http'
+require 'uri'
 
 VERSION = '1.0.0'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
@@ -206,10 +211,9 @@ def runner_script(data)
       meta: { "markdown" => payload["page"]["markdown"] },
       author: "sites-cli"
     )
+    # Page#publish! compiles and persists Site#published_css itself now, so
+    # there is no separate warm-up call left to make here.
     page.publish! if page.pending?
-
-    # Warm the per-site Tailwind stylesheet so first request is fast.
-    site.stylesheet.css if payload["tailwind"]
 
     puts JSON.generate({
       slug: site.slug,
@@ -306,7 +310,7 @@ ensure
 end
 
 # -----------------------------------------------------------------------------
-# Commands
+# Runner-based commands: list / show / push / open / create
 # -----------------------------------------------------------------------------
 
 def cmd_list(prod:)
@@ -374,22 +378,162 @@ def cmd_open(slug, prod:)
   end
 end
 
+# Staff-only create (plans/24-agent-sites.md slice 3 item 19): mints no agent
+# create_site tool. A token and a form recipient are separate steps after
+# this, not automatic -- see the admin site page once this returns.
+def cmd_create(slug, name, team, prod:)
+  script = <<~RUBY
+    team = Team.find_or_create_by!(name: #{JSON.dump(team || 'GXB')})
+    site = Site.create!(slug: #{JSON.dump(slug)}, name: #{JSON.dump(name || slug)}, team: team)
+    puts JSON.generate({ slug: site.slug, name: site.name, host: site.canonical_host, url: "https://\#{site.canonical_host}" })
+  RUBY
+  run_runner(script, prod: prod)
+end
+
+# -----------------------------------------------------------------------------
+# Text file tools: describe_site, list_files, read_file, write_file,
+# edit_file, publish (plans/24-agent-sites.md slice 3 item 18). These talk
+# HTTP to the site-token gateway (Api::V1::ToolsController) -- a site token
+# is scoped to exactly one site, unlike the runner credentials the commands
+# above use. write --file (binary uploads) waits for slice 5a.
+# -----------------------------------------------------------------------------
+
+CONFIG_DIR = File.expand_path(ENV.fetch('SITES_CLI_CONFIG_DIR', '~/.config/sites-cli'))
+TOKENS_PATH = File.join(CONFIG_DIR, 'tokens.json')
+STATE_PATH = File.join(CONFIG_DIR, 'state.json')
+API_HOST = ENV.fetch('SITES_CLI_HOST', 'https://sites.gxb.vc')
+
+def load_json(path)
+  File.file?(path) ? (JSON.parse(File.read(path)) rescue {}) : {}
+end
+
+def save_json(path, data)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, JSON.pretty_generate(data))
+  File.chmod(0o600, path)
+end
+
+def token_for(slug) = load_json(TOKENS_PATH)[slug]
+
+# read_file caches {slug, path, version} locally so write/edit/publish can
+# default --expected-version from the caller's own last read -- a write
+# never preceded by a read still fails, and a 409 is never silently retried.
+def state_key(slug, path) = "#{slug}/#{path}"
+
+def remember_version(slug, path, version)
+  return unless version
+  state = load_json(STATE_PATH)
+  state[state_key(slug, path)] = version
+  save_json(STATE_PATH, state)
+end
+
+def cached_version(slug, path) = load_json(STATE_PATH)[state_key(slug, path)]
+
+def api_call(slug, tool, arguments)
+  token = token_for(slug)
+  return nil, failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+
+  uri = URI.join(API_HOST, '/api/v1/tools')
+  req = Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  req['Content-Type'] = 'application/json'
+  req.body = JSON.generate(tool: tool, arguments: arguments)
+
+  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  body = begin
+    JSON.parse(res.body.to_s)
+  rescue JSON::ParserError
+    { 'error' => res.body }
+  end
+
+  return [ body, nil ] if res.code.to_i.between?(200, 299)
+
+  [ nil, failure(body['message'] || body['error'] || "HTTP #{res.code}", code: (body['error'] || "HTTP_#{res.code}").to_s) ]
+end
+
+def cmd_describe_site(slug, path)
+  data, err = api_call(slug, 'describe_site', path ? { path: path } : {})
+  return err if err
+  success(data)
+end
+
+def cmd_list_files(slug, prefix)
+  data, err = api_call(slug, 'list_files', prefix ? { prefix: prefix } : {})
+  return err if err
+  success(data)
+end
+
+def cmd_read_file(slug, path, view:)
+  data, err = api_call(slug, 'read_file', { path: path, view: view })
+  return err if err
+  remember_version(slug, path, data['version'])
+  success(data)
+end
+
+def cmd_write_file(slug, path, content, expected_version)
+  version = expected_version || cached_version(slug, path)
+  return failure("no --expected-version and no cached version from a prior read_file -- read #{path} first", code: 'NO_VERSION') unless version
+
+  data, err = api_call(slug, 'write_file', { path: path, content: content, expected_version: version })
+  return err if err
+  remember_version(slug, path, data['version'])
+  success(data)
+end
+
+def cmd_edit_file(slug, path, edits, expected_version)
+  version = expected_version || cached_version(slug, path)
+  return failure("no --expected-version and no cached version from a prior read_file -- read #{path} first", code: 'NO_VERSION') unless version
+
+  data, err = api_call(slug, 'edit_file', { path: path, edits: edits, expected_version: version })
+  return err if err
+  remember_version(slug, path, data['version'])
+  success(data)
+end
+
+def cmd_publish(slug, path, expected_version)
+  version = expected_version || cached_version(slug, path)
+  return failure("no --expected-version and no cached version -- read_file/describe_site #{path} first", code: 'NO_VERSION') unless version
+
+  data, err = api_call(slug, 'publish', { path: path, expected_version: version })
+  return err if err
+  success(data)
+end
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
 def usage
   puts <<~USAGE
-    sites-cli — insert/update a GXB tenant site from a folder
+    sites-cli — GXB tenant site management
 
-    Commands:
+    Site folder commands (runner-based):
       sites-cli list [--prod]              List tenant sites
       sites-cli show SLUG [--prod]         Show a tenant site
       sites-cli push DIR [--prod]          Upsert site from DIR/site.yml + DIR/index.html + DIR/assets/
       sites-cli open SLUG [--prod]         Print URL; with --prod, open it
+      sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]
+                                            Staff-only: create an empty site
+
+    Text file tools (HTTP, via a site token in #{TOKENS_PATH}):
+      sites-cli describe_site SLUG [PATH]           alias: describe
+      sites-cli list_files SLUG [--prefix P]        alias: list SLUG
+      sites-cli read_file SLUG PATH [--view live]   alias: read
+      sites-cli write_file SLUG PATH --content C --expected-version V
+                                                     alias: write
+      sites-cli edit_file SLUG PATH --edits-file F.json --expected-version V
+                                                     alias: edit
+      sites-cli publish SLUG PATH --expected-version V
+
+    read_file caches {slug, path, version} in #{STATE_PATH}, so
+    write/edit/publish can omit --expected-version right after a read. A
+    write never preceded by a read still fails, and a 409 is never silently
+    retried -- rerun read_file/describe_site and look at it before retrying.
 
     Environment:
-      SITES_ROOT   Path to sites Rails app (default: ~/projects/sites)
+      SITES_ROOT            Path to sites Rails app (default: ~/projects/sites)
+      SITES_CLI_HOST         Site-token gateway host (default: https://sites.gxb.vc)
+      SITES_CLI_CONFIG_DIR   Token/state directory (default: ~/.config/sites-cli)
 
     Folder layout for push:
       site.yml       # slug, name, business, theme, page, tailwind, noindex, status
@@ -398,17 +542,31 @@ def usage
 
     Examples:
       sites-cli push ./metrolocksmith
-      sites-cli push ./metrolocksmith --prod
-      sites-cli open metrolocksmith --prod
+      sites-cli describe_site acme
+      sites-cli read_file acme about.md
+      sites-cli write_file acme about.md --content "$(cat about.md)"
+      sites-cli publish acme about.md
   USAGE
   0
+end
+
+def opt(argv, flag)
+  i = argv.index(flag)
+  return nil unless i
+  argv.delete_at(i)
+  argv.delete_at(i)
 end
 
 def run(argv)
   command = argv.shift
   case command
   when '-h', '--help', 'help', nil then return usage
-  when 'list' then return cmd_list(prod: argv.include?('--prod'))
+
+  # -- runner-based site folder commands --
+  when 'list'
+    slug = argv.find { |a| a != '--prod' }
+    prod = argv.include?('--prod')
+    return slug ? cmd_list_files(slug, opt(argv, '--prefix')) : cmd_list(prod: prod)
   when 'show'
     slug = argv.find { |a| a != '--prod' }
     return failure("show requires SLUG", code: 'USAGE') unless slug
@@ -421,6 +579,49 @@ def run(argv)
     slug = argv.find { |a| a != '--prod' }
     return failure("open requires SLUG", code: 'USAGE') unless slug
     return cmd_open(slug, prod: argv.include?('--prod'))
+  when 'create'
+    prod = argv.include?('--prod')
+    name = opt(argv, '--name')
+    team = opt(argv, '--team')
+    slug = argv.find { |a| a != '--prod' }
+    return failure("create requires SLUG", code: 'USAGE') unless slug
+    return cmd_create(slug, name, team, prod: prod)
+
+  # -- text file tools (HTTP) --
+  when 'describe_site', 'describe'
+    slug = argv.shift
+    return failure("#{command} requires SLUG", code: 'USAGE') unless slug
+    return cmd_describe_site(slug, argv.shift)
+  when 'list_files'
+    slug = argv.shift
+    return failure("list_files requires SLUG", code: 'USAGE') unless slug
+    return cmd_list_files(slug, opt(argv, '--prefix'))
+  when 'read_file', 'read'
+    slug = argv.shift
+    path = argv.shift
+    return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
+    return cmd_read_file(slug, path, view: opt(argv, '--view') || 'current')
+  when 'write_file', 'write'
+    slug = argv.shift
+    path = argv.shift
+    return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
+    return failure("write --file waits for slice 5a; use --content", code: 'USAGE') if argv.include?('--file')
+    content = opt(argv, '--content')
+    return failure("#{command} requires --content", code: 'USAGE') unless content
+    return cmd_write_file(slug, path, content, opt(argv, '--expected-version'))
+  when 'edit_file', 'edit'
+    slug = argv.shift
+    path = argv.shift
+    return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
+    edits_file = opt(argv, '--edits-file')
+    return failure("#{command} requires --edits-file", code: 'USAGE') unless edits_file
+    edits = JSON.parse(File.read(edits_file))
+    return cmd_edit_file(slug, path, edits, opt(argv, '--expected-version'))
+  when 'publish'
+    slug = argv.shift
+    path = argv.shift
+    return failure("publish requires SLUG PATH", code: 'USAGE') unless slug && path
+    return cmd_publish(slug, path, opt(argv, '--expected-version'))
   else
     return failure("Unknown command: #{command}", code: 'USAGE')
   end
