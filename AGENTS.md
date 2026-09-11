@@ -46,9 +46,11 @@ sites-cli publish SLUG about.md [--expected-version V]   # or SLUG design
   look at it before trying again.
 - `--edits-file` is a JSON array of `{"old_text": "...", "new_text": "..."}`;
   each `old_text` must match the file's current source exactly once.
-- `write --file` (binary/media upload) is not implemented yet -- it waits
-  for slice 5a's upload transport. Use the admin media page for images in
-  the meantime.
+- `write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]`
+  uploads a photo: authorize -> single presigned PUT (streamed, bounded
+  memory) -> complete -> poll until ready/failed. 5a only -- jpg/png/webp/gif,
+  25 MiB / 40 megapixel limits, no multipart/resume (slice 5b). Prints the
+  CDN original URL on success; remembers the version like read_file does.
 - `sites-cli list SLUG` lists that site's files, not all tenant sites.
   `sites-cli list` with no slug still lists all sites.
 

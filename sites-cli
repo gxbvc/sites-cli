@@ -500,6 +500,86 @@ def cmd_publish(slug, path, expected_version)
 end
 
 # -----------------------------------------------------------------------------
+# Media upload (plans/24-agent-sites.md slice 5a): authorize -> single
+# presigned PUT, streamed from disk with bounded memory -> complete -> poll
+# until ready/failed. 5a only -- no multipart, retry, or resume (slice 5b).
+# -----------------------------------------------------------------------------
+
+MEDIA_CONTENT_TYPES = {
+  '.jpg' => 'image/jpeg', '.jpeg' => 'image/jpeg', '.png' => 'image/png',
+  '.webp' => 'image/webp', '.gif' => 'image/gif'
+}.freeze
+
+def media_api_call(slug, method, path, body)
+  token = token_for(slug)
+  return nil, failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+
+  uri = URI.join(API_HOST, path)
+  req = method == :get ? Net::HTTP::Get.new(uri) : Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  if body
+    req['Content-Type'] = 'application/json'
+    req.body = JSON.generate(body)
+  end
+
+  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  parsed = begin
+    JSON.parse(res.body.to_s)
+  rescue JSON::ParserError
+    { 'error' => res.body }
+  end
+  return [ parsed, nil ] if res.code.to_i.between?(200, 299)
+
+  [ nil, failure(parsed['message'] || parsed['error'] || "HTTP #{res.code}", code: (parsed['error'] || "HTTP_#{res.code}").to_s) ]
+end
+
+# A streamed PUT (body_stream, not the whole file in memory) against the
+# presigned URL the authorize step returned. content_length must match the
+# byte_size sent at authorize -- R2 rejects the signature otherwise.
+def put_upload(upload_url, file_path, content_type, byte_size)
+  uri = URI(upload_url)
+  req = Net::HTTP::Put.new(uri)
+  req['Content-Type'] = content_type
+  req.content_length = byte_size
+  req.body_stream = File.open(file_path, 'rb')
+  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  req.body_stream.close
+  res.code.to_i.between?(200, 299) ? nil : failure("upload PUT failed: HTTP #{res.code}", code: 'UPLOAD_FAILED')
+end
+
+def cmd_write_file_upload(slug, path, file_path, expected_version)
+  version = expected_version || cached_version(slug, path)
+  return failure("no --expected-version and no cached version from a prior read_file -- read #{path} first", code: 'NO_VERSION') unless version
+  return failure("no such file: #{file_path}", code: 'NO_FILE') unless File.file?(file_path)
+
+  content_type = MEDIA_CONTENT_TYPES[File.extname(file_path).downcase]
+  return failure("unsupported file extension #{File.extname(file_path)} -- 5a accepts jpg/jpeg/png/webp/gif", code: 'BAD_TYPE') unless content_type
+
+  data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
+    { label: path, content_type: content_type, byte_size: File.size(file_path), expected_version: version })
+  return err if err
+
+  put_err = put_upload(data['upload_url'], file_path, content_type, File.size(file_path))
+  return put_err if put_err
+
+  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{data['id']}/complete", {})
+  return err if err
+
+  status = data['status']
+  until %w[ready failed].include?(status)
+    sleep 1
+    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{data['id']}", nil)
+    return err if err
+    status = data['status']
+  end
+
+  return failure(data['error'] || 'upload verification failed', code: 'UPLOAD_FAILED') unless status == 'ready'
+
+  remember_version(slug, path, data['id'].to_s)
+  success(data)
+end
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -521,6 +601,8 @@ def usage
       sites-cli read_file SLUG PATH [--view live]   alias: read
       sites-cli write_file SLUG PATH --content C --expected-version V
                                                      alias: write
+      sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]
+                                                     binary upload (5a: single PUT, jpg/png/webp/gif)
       sites-cli edit_file SLUG PATH --edits-file F.json --expected-version V
                                                      alias: edit
       sites-cli publish SLUG PATH --expected-version V
@@ -545,6 +627,7 @@ def usage
       sites-cli describe_site acme
       sites-cli read_file acme about.md
       sites-cli write_file acme about.md --content "$(cat about.md)"
+      sites-cli write_file acme assets/hero.jpg --file ./hero.jpg
       sites-cli publish acme about.md
   USAGE
   0
@@ -605,10 +688,12 @@ def run(argv)
     slug = argv.shift
     path = argv.shift
     return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
-    return failure("write --file waits for slice 5a; use --content", code: 'USAGE') if argv.include?('--file')
+    file_path = opt(argv, '--file')
+    expected_version = opt(argv, '--expected-version')
+    return cmd_write_file_upload(slug, path, file_path, expected_version) if file_path
     content = opt(argv, '--content')
-    return failure("#{command} requires --content", code: 'USAGE') unless content
-    return cmd_write_file(slug, path, content, opt(argv, '--expected-version'))
+    return failure("#{command} requires --content or --file", code: 'USAGE') unless content
+    return cmd_write_file(slug, path, content, expected_version)
   when 'edit_file', 'edit'
     slug = argv.shift
     path = argv.shift
