@@ -50,11 +50,15 @@ sites-cli publish SLUG about.md [--expected-version V]   # or SLUG design
 - `--edits-file` is a JSON array of `{"old_text": "...", "new_text": "..."}`;
   each `old_text` must match the file's current source exactly once.
 - `write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]`
-  uploads a photo: authorize -> single presigned PUT, streamed straight from
-  disk (`body_stream`, not buffered in memory) -> complete -> poll until
-  ready/failed. 5a only -- jpg/png/webp/gif, 25 MiB / 40 megapixel limits, no
-  multipart/resume (slice 5b). Prints the CDN original URL on success;
-  remembers the version like read_file does.
+  uploads a photo or a video, both authorize -> stage bytes -> complete ->
+  poll until ready/failed. jpg/png/webp/gif (25 MiB / 40 megapixel limits)
+  is one presigned PUT streamed straight from disk (`body_stream`, not
+  buffered in memory). mp4 (1 GiB limit) is multipart: the file is sliced
+  per the server's reported part size, parts upload with bounded
+  parallelism (4 at a time), a part that fails is retried with a fresh
+  presign, and an unrecoverable part aborts the whole upload (`DELETE
+  .../uploads/:id`, releasing the server's quota reservation). Prints the
+  CDN original URL on success; remembers the version like read_file does.
 - `sites-cli list SLUG` lists that site's files, not all tenant sites.
   `sites-cli list` with no slug still lists all sites.
 - A non-2xx response (409 conflict, 422 invalid, or an upload rejection)

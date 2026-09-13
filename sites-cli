@@ -323,22 +323,29 @@ def cmd_publish(slug, path, expected_version)
 end
 
 # -----------------------------------------------------------------------------
-# Media upload (plans/24-agent-sites.md slice 5a): authorize -> single
-# presigned PUT, streamed from disk with bounded memory -> complete -> poll
-# until ready/failed. 5a only -- no multipart, retry, or resume (slice 5b).
+# Media upload: authorize -> stage bytes -> complete -> poll until
+# ready/failed. A photo (5a) is one presigned PUT streamed from disk. A
+# video (5b) is multipart: bounded batches of part presigns, each part
+# retried independently, a bounded number of parts in flight at once, and
+# an abort call if it can't be finished -- never the whole file buffered at
+# once either way.
 # -----------------------------------------------------------------------------
 
 MEDIA_CONTENT_TYPES = {
   '.jpg' => 'image/jpeg', '.jpeg' => 'image/jpeg', '.png' => 'image/png',
-  '.webp' => 'image/webp', '.gif' => 'image/gif'
+  '.webp' => 'image/webp', '.gif' => 'image/gif', '.mp4' => 'video/mp4'
 }.freeze
+
+PART_CONCURRENCY = 4
+PART_MAX_ATTEMPTS = 3
 
 def media_api_call(slug, method, path, body)
   token = token_for(slug)
   return nil, failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
 
   uri = URI.join(API_HOST, path)
-  req = method == :get ? Net::HTTP::Get.new(uri) : Net::HTTP::Post.new(uri)
+  req_class = { get: Net::HTTP::Get, delete: Net::HTTP::Delete }.fetch(method, Net::HTTP::Post)
+  req = req_class.new(uri)
   req['Authorization'] = "Bearer #{token}"
   if body
     req['Content-Type'] = 'application/json'
@@ -376,22 +383,33 @@ def cmd_write_file_upload(slug, path, file_path, expected_version)
   return failure("no such file: #{file_path}", code: 'NO_FILE') unless File.file?(file_path)
 
   content_type = MEDIA_CONTENT_TYPES[File.extname(file_path).downcase]
-  return failure("unsupported file extension #{File.extname(file_path)} -- 5a accepts jpg/jpeg/png/webp/gif", code: 'BAD_TYPE') unless content_type
+  return failure("unsupported file extension #{File.extname(file_path)} -- accepts jpg/jpeg/png/webp/gif/mp4", code: 'BAD_TYPE') unless content_type
 
   data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
     { label: path, content_type: content_type, byte_size: File.size(file_path), expected_version: version })
   return err if err
+  upload_id = data['id']
 
-  put_err = put_upload(data['upload_url'], file_path, content_type, File.size(file_path))
-  return put_err if put_err
+  if data['multipart']
+    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'])
+    if part_err
+      media_api_call(slug, :delete, "/api/v1/media/uploads/#{upload_id}", nil)
+      return part_err
+    end
+    complete_body = { parts: parts }
+  else
+    put_err = put_upload(data['upload_url'], file_path, content_type, File.size(file_path))
+    return put_err if put_err
+    complete_body = {}
+  end
 
-  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{data['id']}/complete", {})
+  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/complete", complete_body)
   return err if err
 
   status = data['status']
   until %w[ready failed].include?(status)
     sleep 1
-    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{data['id']}", nil)
+    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{upload_id}", nil)
     return err if err
     status = data['status']
   end
@@ -400,6 +418,73 @@ def cmd_write_file_upload(slug, path, file_path, expected_version)
 
   remember_version(slug, path, data['id'].to_s)
   success(data)
+end
+
+# Bounded-parallelism multipart upload (plans/24-agent-sites.md 5b): a fixed
+# worker count pulls part numbers off a shared queue, each part fetched and
+# retried independently (part_max_attempts each, a fresh presign every
+# attempt so an expired one just renews), at most one part's bytes
+# (part_size, 16 MiB) resident per worker regardless of total file size.
+def upload_video_parts(slug, upload_id, file_path, parts_count, part_size)
+  total_size = File.size(file_path)
+  queue = Queue.new
+  (1..parts_count).each { |n| queue << n }
+  results = Array.new(parts_count)
+  mutex = Mutex.new
+  first_error = nil
+
+  workers = [ PART_CONCURRENCY, parts_count ].min.times.map do
+    Thread.new do
+      loop do
+        part_number = begin queue.pop(true) rescue nil end
+        break unless part_number
+        mutex.synchronize { break if first_error }
+
+        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size)
+        mutex.synchronize do
+          if err
+            first_error ||= err
+          else
+            results[part_number - 1] = { part_number: part_number, etag: etag }
+          end
+        end
+      end
+    end
+  end
+  workers.each(&:join)
+
+  return [ nil, first_error ] if first_error
+  [ results, nil ]
+end
+
+def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size)
+  offset = (part_number - 1) * part_size
+  length = [ part_size, total_size - offset ].min
+
+  attempts = 0
+  loop do
+    attempts += 1
+    presign, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts", { part_numbers: [ part_number ] })
+    return [ nil, err ] if err
+
+    part_url = presign.dig('parts', 0, 'upload_url')
+    return [ nil, failure("no presigned URL returned for part #{part_number}", code: 'PART_UPLOAD_FAILED') ] unless part_url
+
+    etag = put_part(part_url, file_path, offset, length)
+    return [ etag, nil ] if etag
+    return [ nil, failure("part #{part_number} failed after #{attempts} attempts", code: 'PART_UPLOAD_FAILED') ] if attempts >= PART_MAX_ATTEMPTS
+  end
+end
+
+# Bounded to exactly this part's bytes (<=16 MiB), never the whole file.
+def put_part(upload_url, file_path, offset, length)
+  bytes = File.open(file_path, 'rb') { |f| f.seek(offset); f.read(length) }
+  uri = URI(upload_url)
+  req = Net::HTTP::Put.new(uri)
+  req.content_length = length
+  req.body = bytes
+  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  res.code.to_i.between?(200, 299) ? res['etag'] : nil
 end
 
 # -----------------------------------------------------------------------------
@@ -424,9 +509,12 @@ def usage
       sites-cli write_file SLUG PATH --content C --expected-version V
                                                      alias: write
       sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]
-                                                     binary upload: authorize -> single presigned
-                                                     PUT streamed from disk -> complete -> poll
-                                                     (jpg/png/webp/gif; no multipart/resume yet)
+                                                     binary upload: authorize -> complete -> poll.
+                                                     jpg/png/webp/gif is one presigned PUT streamed
+                                                     from disk. mp4 is multipart: bounded batches of
+                                                     part presigns, each part retried independently,
+                                                     a bounded number of parts in flight, aborted on
+                                                     unrecoverable failure.
       sites-cli edit_file SLUG PATH --edits-file F.json --expected-version V
                                                      alias: edit
       sites-cli publish SLUG PATH --expected-version V

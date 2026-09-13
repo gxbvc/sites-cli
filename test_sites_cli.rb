@@ -11,6 +11,10 @@
 # Run: ruby test_sites_cli.rb
 
 require 'webrick'
+# ProcHandler only wires up do_GET/do_POST/do_PUT out of the box; DELETE
+# (the abort endpoint, 5b) dispatches through the exact same proc, which
+# already branches on req.request_method itself.
+WEBrick::HTTPServlet::ProcHandler.alias_method(:do_DELETE, :do_GET)
 require 'json'
 require 'open3'
 require 'tmpdir'
@@ -38,6 +42,17 @@ TOKEN_OTHER = "TESTTOKEN-OTHER-#{SecureRandom.hex(6)}"
 requests = Hash.new(0)                        # "TOKEN tool" => call count
 versions = Hash.new { |h, k| h[k] = 'v1' }     # path/label => current "live" version
 uploaded = {}                                  # request path => bytes received
+
+# -- multipart video (plans/24-agent-sites.md 5b) stub state ----------------
+MP4_PART_SIZE = 10
+MP4_PARTS_COUNT = 8
+part_attempts = Hash.new(0)                    # part_number => PUT attempts so far
+uploaded_parts = {}                            # part_number => bytes received
+mutex = Mutex.new
+concurrent_parts = 0
+max_concurrent_parts = 0
+always_fail_part = nil                         # a test arms this to force an unrecoverable part
+flaky_part = nil                               # a test arms this to fail once, then succeed
 
 server = nil
 port = nil
@@ -90,12 +105,16 @@ server.mount_proc('/') do |req, res|
     payload = JSON.parse(req.body)
     requests["#{token} media_authorize"] += 1
     current = versions[payload['label']]
-    if payload['expected_version'] == current
-      res.status = 200
-      res.body = JSON.generate(id: 'up1', upload_url: "http://127.0.0.1:#{port}/put/up1")
-    else
+    if payload['expected_version'] != current
       res.status = 409
       res.body = JSON.generate(error: 'source_changed', path: payload['label'], version: current, message: 'stale')
+    elsif payload['content_type'] == 'video/mp4'
+      res.status = 201
+      res.body = JSON.generate(id: 'upvideo', status: 'pending', multipart: true,
+        parts_count: MP4_PARTS_COUNT, part_size: MP4_PART_SIZE, method: 'PUT', content_type: 'video/mp4')
+    else
+      res.status = 200
+      res.body = JSON.generate(id: 'up1', upload_url: "http://127.0.0.1:#{port}/put/up1")
     end
 
   in [ 'POST', '/api/v1/media/uploads/up1/complete' ]
@@ -106,6 +125,47 @@ server.mount_proc('/') do |req, res|
   in [ 'GET', '/api/v1/media/uploads/up1' ]
     res.status = 200
     res.body = JSON.generate(id: 'up1', status: 'ready', url: 'http://cdn.test/hero.jpg')
+
+  # -- multipart video (plans/24-agent-sites.md 5b) --------------------------
+
+  in [ 'POST', '/api/v1/media/uploads/upvideo/parts' ]
+    payload = JSON.parse(req.body)
+    requests["#{token} media_parts"] += 1
+    parts = payload['part_numbers'].map { |n| { part_number: n, upload_url: "http://127.0.0.1:#{port}/putpart/#{n}" } }
+    res.status = 200
+    res.body = JSON.generate(parts: parts)
+
+  in [ 'PUT', String => path ] if path.start_with?('/putpart/')
+    part_number = path.split('/').last.to_i
+    part_attempts[part_number] += 1
+    mutex.synchronize { concurrent_parts += 1; max_concurrent_parts = [ max_concurrent_parts, concurrent_parts ].max }
+    sleep 0.05 # widen the window so real parallelism, if any, is observable
+    mutex.synchronize { concurrent_parts -= 1 }
+
+    if part_number == always_fail_part
+      res.status = 500
+    elsif part_number == flaky_part && part_attempts[part_number] == 1
+      res.status = 500 # fails once, then succeeds -- exercises part retry
+    else
+      uploaded_parts[part_number] = req.body
+      res['ETag'] = %("part-#{part_number}-etag")
+      res.status = 200
+    end
+    res.body = ''
+
+  in [ 'POST', '/api/v1/media/uploads/upvideo/complete' ]
+    requests["#{token} media_complete"] += 1
+    res.status = 200
+    res.body = JSON.generate(id: 'upvideo', status: 'ready', url: 'http://cdn.test/tour.mp4')
+
+  in [ 'GET', '/api/v1/media/uploads/upvideo' ]
+    res.status = 200
+    res.body = JSON.generate(id: 'upvideo', status: 'ready', url: 'http://cdn.test/tour.mp4')
+
+  in [ 'DELETE', '/api/v1/media/uploads/upvideo' ]
+    requests["#{token} media_abort"] += 1
+    res.status = 200
+    res.body = JSON.generate(id: 'upvideo', status: 'aborted')
 
   in [ 'PUT', String => path ] if path.start_with?('/put/')
     uploaded[path] = req.body
@@ -218,6 +278,79 @@ check('write_file --file round-trips a multi-megabyte binary upload byte-for-byt
     assert(code == 0, "expected a successful upload, got: #{out}")
     assert(uploaded['/put/up1'] == original, 'uploaded bytes did not match the source file byte-for-byte')
   end
+end
+
+# -- multipart video: part retry, bounded parallelism, abort (5b) -----------
+
+check('write_file --file for an .mp4 uploads via multipart and round-trips bytes across parts') do
+  run_cli('read_file', 'acme', 'assets/tour.mp4')
+  before_completes = requests["#{TOKEN_ACME} media_complete"]
+
+  Dir.mktmpdir do |dir|
+    video_path = File.join(dir, 'tour.mp4')
+    original = SecureRandom.random_bytes(MP4_PART_SIZE * MP4_PARTS_COUNT)
+    File.binwrite(video_path, original)
+
+    out, _err, code = run_cli('write_file', 'acme', 'assets/tour.mp4', '--file', video_path)
+    assert(code == 0, "expected a successful multipart upload, got: #{out}")
+
+    reassembled = (1..MP4_PARTS_COUNT).map { |n| uploaded_parts.fetch(n) }.join
+    assert(reassembled == original, 'reassembled part bytes did not match the source file byte-for-byte')
+    assert(requests["#{TOKEN_ACME} media_complete"] == before_completes + 1, 'expected exactly one complete call')
+  end
+end
+
+check('a part that fails once is retried with a fresh presign, not treated as an unrecoverable failure') do
+  run_cli('read_file', 'acme', 'assets/tour.mp4') # the stub never advances this label's version
+  part_attempts.clear
+  flaky_part = 4
+
+  Dir.mktmpdir do |dir|
+    video_path = File.join(dir, 'retry.mp4')
+    File.binwrite(video_path, SecureRandom.random_bytes(MP4_PART_SIZE * MP4_PARTS_COUNT))
+
+    out, _err, code = run_cli('write_file', 'acme', 'assets/tour.mp4', '--file', video_path)
+    assert(code == 0, "expected the retried part to eventually succeed, got: #{out}")
+  end
+
+  assert(part_attempts[4] == 2, "expected part 4 to be attempted twice, got #{part_attempts[4]}")
+ensure
+  flaky_part = nil
+end
+
+check('parts upload with bounded parallelism -- more than one at a time, never unbounded') do
+  run_cli('read_file', 'acme', 'assets/tour.mp4')
+  max_concurrent_parts = 0
+
+  Dir.mktmpdir do |dir|
+    video_path = File.join(dir, 'parallel.mp4')
+    File.binwrite(video_path, SecureRandom.random_bytes(MP4_PART_SIZE * MP4_PARTS_COUNT))
+    out, _err, code = run_cli('write_file', 'acme', 'assets/tour.mp4', '--file', video_path)
+    assert(code == 0, "expected success, got: #{out}")
+  end
+
+  assert(max_concurrent_parts > 1, "expected real parallelism, saw max #{max_concurrent_parts} at once")
+  assert(max_concurrent_parts <= 4, "expected parallelism bounded to 4 workers, saw #{max_concurrent_parts}")
+end
+
+check('an unrecoverable part failure gives up after bounded retries and aborts the upload') do
+  run_cli('read_file', 'acme', 'assets/tour.mp4')
+  always_fail_part = 2
+  part_attempts.clear
+  before_abort_calls = requests["#{TOKEN_ACME} media_abort"]
+
+  Dir.mktmpdir do |dir|
+    video_path = File.join(dir, 'doomed.mp4')
+    File.binwrite(video_path, SecureRandom.random_bytes(MP4_PART_SIZE * MP4_PARTS_COUNT))
+    out, _err, code = run_cli('write_file', 'acme', 'assets/tour.mp4', '--file', video_path)
+    assert(code != 0, 'expected a nonzero exit once a part cannot be uploaded')
+    assert(JSON.parse(out)['code'] == 'PART_UPLOAD_FAILED', "expected PART_UPLOAD_FAILED, got: #{out}")
+  end
+
+  assert(part_attempts[2] == 3, "expected exactly 3 bounded attempts, got #{part_attempts[2]}")
+  assert(requests["#{TOKEN_ACME} media_abort"] == before_abort_calls + 1, 'expected the CLI to abort after giving up')
+ensure
+  always_fail_part = nil
 end
 
 # -- secret redaction ---------------------------------------------------------
