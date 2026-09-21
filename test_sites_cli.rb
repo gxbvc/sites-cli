@@ -41,6 +41,8 @@ end
 TOKEN_ACME  = "TESTTOKEN-ACME-#{SecureRandom.hex(6)}"
 TOKEN_OTHER = "TESTTOKEN-OTHER-#{SecureRandom.hex(6)}"
 TOKEN_ONYX  = "TESTTOKEN-ONYX-#{SecureRandom.hex(6)}"
+# A personal token is the only credential the platform door takes (slice F).
+TOKEN_USER  = "sk_user_42_#{SecureRandom.hex(6)}"
 
 requests = Hash.new(0)                        # "TOKEN tool" => call count
 last_args = {}                                 # tool => the last arguments hash
@@ -122,6 +124,23 @@ server.mount_proc('/') do |req, res|
     # -- plan 30 versioned tools --------------------------------------------
 
     when 'describe_site'
+      # acme is the legacy site throughout this file. A legacy describe_site
+      # answers a shape with no `versioned` and no `branches` -- and refuses a
+      # `branch` argument outright rather than ignoring it (slice F N9), which
+      # is why nothing may send one before it knows the contract.
+      if token == TOKEN_ACME && args['path'].nil?
+        if args['branch']
+          res.status = 422
+          res.body = JSON.generate(error: 'invalid_request',
+            message: 'branch is a versioned argument; acme still uses the file API, where path is the target',
+            site: 'acme', next: { tool: 'describe_site', why: 'call it with no branch, or with a path' })
+        else
+          res.status = 200
+          res.body = JSON.generate(site: 'acme', url: 'https://acme.gxbsites.com',
+            permissions: %w[read draft], pending: { pages: 0, design: false }, files: [])
+        end
+        next
+      end
       status = preview_queue.empty? ? 'queued' : preview_queue.shift
       res.status = 200
       res.body = JSON.generate(
@@ -233,6 +252,20 @@ server.mount_proc('/') do |req, res|
     when 'list_sites'
       res.status = 200
       res.body = JSON.generate(sites: [ { slug: 'onyx', name: 'Onyx', versioned: true } ])
+    when 'list_submissions'
+      if token == TOKEN_ONYX
+        res.status = 200
+        res.body = JSON.generate(site: 'onyx', submissions: [ { id: 4, form: args['form_slug'] || 'customer',
+          created_at: '2026-09-21T08:00:00Z', data: { name: 'Slice G Test' } } ], count: 1)
+      else
+        # what a token minted before read_submissions became its own capability gets
+        res.status = 403
+        res.body = JSON.generate(error: 'capability_denied', capability: 'read_submissions',
+          site: 'acme', message: 'list_submissions needs the read_submissions capability; this token carries read, draft')
+      end
+    when 'get_analytics'
+      res.status = 200
+      res.body = JSON.generate(site: 'onyx', period: args['period'] || '7d', visitors: 12, pageviews: 30)
     when 'create_site'
       res.status = 403
       res.body = JSON.generate(error: 'capability_denied', capability: 'create_site',
@@ -241,6 +274,56 @@ server.mount_proc('/') do |req, res|
       res.status = 404
       res.body = JSON.generate(error: 'unknown tool in stub')
     end
+
+  # -- the platform door: a personal token only (slice F section 4) ----------
+  in [ 'POST', '/api/v1/platform/tools' ]
+    payload = JSON.parse(req.body)
+    tool = payload['tool']
+    args = payload['arguments'] || {}
+    requests["#{token} platform:#{tool}"] += 1
+    last_args["platform:#{tool}"] = args
+
+    if !token.start_with?('sk_user_')
+      res.status = 403
+      res.body = JSON.generate(error: 'capability_denied',
+        message: 'this endpoint takes a personal token minted from your profile on sites.gxb.vc, not a site token')
+    else
+      case tool
+      when 'list_sites'
+        res.status = 200
+        res.body = JSON.generate(sites: [
+          { slug: 'onyx', name: 'Onyx', url: 'https://onyx.gxbsites.com', versioned: true, capabilities: %w[draft publish read] },
+          { slug: 'acme', name: 'Acme', url: 'https://acme.gxbsites.com', versioned: false, capabilities: %w[read] }
+        ])
+      when 'create_site'
+        res.status = 200
+        res.body = JSON.generate(site: args['slug'], name: args['name'],
+          url: "https://#{args['slug']}.gxbsites.com", versioned: true,
+          branch: 'draft', expected: 'snap_newsite0', capabilities: %w[draft publish read])
+      else
+        res.status = 404
+        res.body = JSON.generate(error: 'unknown_tool', message: "#{tool.inspect} is not a platform tool",
+          tools: %w[create_site list_sites])
+      end
+    end
+
+  in [ 'GET', '/api/v1/platform/tools' ]
+    requests["#{token} platform:index"] += 1
+    if token.start_with?('sk_user_')
+      res.status = 200
+      res.body = JSON.generate(tools: [ { name: 'list_sites' }, { name: 'create_site' } ])
+    else
+      res.status = 403
+      res.body = JSON.generate(error: 'capability_denied', message: 'not a personal token')
+    end
+
+  in [ 'GET', '/cors/blocked.js' ]
+    # 200, and deliberately no access-control-allow-origin: a real bucket-CORS
+    # failure, which is indistinguishable from a 404 inside the browser.
+    requests['cors_probe'] += 1
+    res.status = 200
+    res.content_type = 'text/javascript'
+    res.body = 'export const a = 1'
 
   in [ 'POST', '/api/v1/media/uploads' ]
     payload = JSON.parse(req.body)
@@ -325,9 +408,12 @@ server.mount_proc('/') do |req, res|
     requests["#{token} media_complete"] += 1
     payload = authorized.fetch(id)
     digest = payload['digest']
+    # The platform types bytes from content, not from the filename: a file
+    # called .png holding JPEG bytes is stored and served as image/jpeg.
+    media_type = uploaded["/put/#{id}"].to_s.start_with?("\xFF\xD8\xFF".b) ? 'image/jpeg' : payload['content_type']
     res.status = 200
     res.body = JSON.generate(id: id, status: 'ready', digest: digest,
-      media_type: payload['content_type'], byte_size: payload['byte_size'],
+      media_type: media_type, byte_size: payload['byte_size'],
       url: "http://cdn.test/blobs/#{digest}/asset.bin", version: id)
 
   in [ 'GET', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)\z}
@@ -846,30 +932,126 @@ check('wait-preview treats a missing preview_status as an error, not something t
   assert(JSON.parse(out)['code'] == 'PREVIEW_MISSING', "expected PREVIEW_MISSING, got #{out}")
 end
 
-check('list-sites posts the platform list_sites tool with that slug\'s token') do
+# -- the platform door (slice F section 4) -----------------------------------
+
+check('list-sites SLUG asks that one site through its own token at the site door') do
   before = requests["#{TOKEN_ONYX} list_sites"]
   out, _err, code = run_cli('list-sites', 'onyx')
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
-  assert(requests["#{TOKEN_ONYX} list_sites"] == before + 1, 'expected list_sites to reach the server')
+  assert(requests["#{TOKEN_ONYX} list_sites"] == before + 1, 'expected list_sites to reach the site endpoint')
+  assert(requests["#{TOKEN_ONYX} platform:list_sites"] == 0, 'a site token reached the platform endpoint')
 end
 
-check('create-site with no platform bearer refuses locally and names the runner command') do
+check('list-sites with no slug and no personal token refuses locally and names both ways out') do
+  before = requests.values.sum
+  out, _err, code = run_cli('list-sites')
+  assert(code == 1, 'expected a nonzero exit')
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'NO_TOKEN', "expected NO_TOKEN, got #{out}")
+  assert(parsed['error'].include?('/profile'), 'expected the place a personal token is minted')
+  assert(parsed['error'].include?('list-sites SLUG'), 'expected the site-token form to be named')
+  assert(requests.values.sum == before, 'list-sites reached the server with no bearer')
+end
+
+check('list-sites posts list_sites to /api/v1/platform/tools with a personal bearer') do
+  before = requests["#{TOKEN_USER} platform:list_sites"]
+  out, _err, code = run_cli('list-sites', env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(requests["#{TOKEN_USER} platform:list_sites"] == before + 1, 'expected the platform endpoint to be used')
+  slugs = JSON.parse(out).dig('data', 'sites').map { |s| s['slug'] }
+  assert(slugs == %w[onyx acme], "expected every readable site, got #{slugs.inspect}")
+end
+
+check('the personal bearer can also come from the _platform entry in tokens.json') do
+  tokens = JSON.parse(File.read(TOKENS_PATH))
+  begin
+    File.write(TOKENS_PATH, JSON.generate(tokens.merge('_platform' => TOKEN_USER)))
+    before = requests["#{TOKEN_USER} platform:list_sites"]
+    _out, _err, code = run_cli('list-sites')
+    assert(code == 0, 'expected the _platform entry to be used as the bearer')
+    assert(requests["#{TOKEN_USER} platform:list_sites"] == before + 1, 'expected the platform endpoint to be used')
+  ensure
+    File.write(TOKENS_PATH, JSON.generate(tokens))
+  end
+end
+
+check('create-site posts create_site to the platform door and remembers the new draft head') do
+  out, _err, code = run_cli('create-site', 'newsite', '--name', 'New Site', env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(requests["#{TOKEN_USER} platform:create_site"] == 1, 'expected create_site at the platform endpoint')
+  assert(last_args['platform:create_site'] == { 'slug' => 'newsite', 'name' => 'New Site' },
+    "got #{last_args['platform:create_site'].inspect}")
+  assert(JSON.parse(out).dig('data', 'expected') == 'snap_newsite0', "expected the new branch token printed, got #{out}")
+  assert(state['expected:newsite:draft'] == 'snap_newsite0', 'expected the new site\'s draft head remembered')
+end
+
+check('a site token at the platform door is a 403 the CLI prints verbatim') do
+  out, _err, code = run_cli('create-site', 'other', '--name', 'Other', env: { 'SITES_CLI_TOKEN' => TOKEN_ONYX })
+  assert(code == 1, 'expected a nonzero exit on 403')
+  parsed = JSON.parse(out)
+  assert(parsed['status'] == 403, "expected the real 403, got #{parsed['status'].inspect}")
+  assert(parsed.dig('body', 'error') == 'capability_denied', "expected the structured body, got #{out}")
+  assert(parsed.dig('body', 'message').include?('personal token'), "expected the server's own message, got #{out}")
+end
+
+check('platform-tools reads the two schemas from the server, not from this file') do
+  out, _err, code = run_cli('platform-tools', env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  names = JSON.parse(out).dig('data', 'tools').map { |t| t['name'] }
+  assert(names.sort == %w[create_site list_sites], "got #{names.inspect}")
+  assert(requests["#{TOKEN_USER} platform:index"] == 1, 'expected a GET at the platform endpoint')
+end
+
+check('create-site with no personal bearer refuses locally and names the runner command') do
   before = requests.values.sum
   out, _err, code = run_cli('create-site', 'newsite', '--name', 'New Site')
   assert(code == 1, 'expected a nonzero exit')
   parsed = JSON.parse(out)
   assert(parsed['code'] == 'NO_TOKEN', "expected NO_TOKEN, got #{out}")
-  assert(parsed['error'].include?('sites-cli create'), 'expected the runner fallback to be named')
+  assert(parsed['error'].include?('sites-cli create newsite'), 'expected the runner fallback to be named')
+  assert(parsed['error'].include?('/profile'), 'expected the place a personal token is minted')
   assert(requests.values.sum == before, 'create-site reached the server with no bearer')
 end
 
-check('create-site with a bearer passes the server 403 straight through') do
-  out, _err, code = run_cli('create-site', 'newsite', '--name', 'New Site', env: { 'SITES_CLI_TOKEN' => TOKEN_ONYX })
+# -- list_submissions and get_analytics ---------------------------------------
+
+check('list-submissions posts form_slug, since and an integer limit') do
+  out, _err, code = run_cli('list-submissions', 'onyx', '--form', 'customer',
+                            '--since', '2026-09-01T00:00:00Z', '--limit', '5')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['list_submissions'] == { 'form_slug' => 'customer', 'since' => '2026-09-01T00:00:00Z', 'limit' => 5 },
+    "got #{last_args['list_submissions'].inspect}")
+  assert(JSON.parse(out).dig('data', 'count') == 1, "expected the raw envelope, got #{out}")
+end
+
+check('a token without read_submissions gets the 403 verbatim plus how to fix it') do
+  out, err, code = run_cli('list-submissions', 'acme')
   assert(code == 1, 'expected a nonzero exit on 403')
   parsed = JSON.parse(out)
   assert(parsed['status'] == 403, "expected the real 403, got #{parsed['status'].inspect}")
-  assert(parsed.dig('body', 'error') == 'capability_denied', "expected the structured body, got #{out}")
-  assert(last_args['create_site'] == { 'slug' => 'newsite', 'name' => 'New Site' }, "got #{last_args['create_site'].inspect}")
+  assert(parsed.dig('body', 'capability') == 'read_submissions', "expected the structured body, got #{out}")
+  assert(err.include?('read_submissions'), "expected the recovery on stderr, got #{err.inspect}")
+  assert(err.include?('mint a new token'), "expected the recovery to name minting, got #{err.inspect}")
+end
+
+check('analytics posts get_analytics with the period') do
+  out, _err, code = run_cli('analytics', 'onyx', '--period', '30d')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['get_analytics'] == { 'period' => '30d' }, "got #{last_args['get_analytics'].inspect}")
+  assert(JSON.parse(out).dig('data', 'period') == '30d', "expected the raw envelope, got #{out}")
+end
+
+check('analytics with no --period sends none and lets the server default') do
+  run_cli('analytics', 'onyx')
+  assert(last_args['get_analytics'] == {}, "got #{last_args['get_analytics'].inspect}")
+end
+
+check('an out-of-range --period is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('analytics', 'onyx', '--period', '90d')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a bad period reached the server')
 end
 
 check('an unknown flag is refused before any request is made') do
@@ -886,6 +1068,7 @@ UPLOAD_TYPES = {
   'app.js' => 'text/javascript', 'mod.mjs' => 'text/javascript', 'site.css' => 'text/css',
   'logo.svg' => 'image/svg+xml', 'model.glb' => 'model/gltf-binary', 'body.woff' => 'font/woff',
   'body.woff2' => 'font/woff2', 'data.json' => 'application/json', 'LICENSE.txt' => 'text/plain',
+  'LICENSE' => 'text/plain', # extensionless, so a vendored notice can ship with its bundle
   'hero.png' => 'image/png', 'hero.jpg' => 'image/jpeg', 'hero.webp' => 'image/webp',
   'spin.gif' => 'image/gif'
 }.freeze
@@ -979,11 +1162,11 @@ def onyx_tree(dir)
   File.write(File.join(dir, '.git', 'config'), 'nope')
 end
 
-check('push --dry-run prints the change list with local digests and makes no request') do
+check('push --offline prints the change list with local digests and makes no request at all') do
   Dir.mktmpdir do |dir|
     onyx_tree(dir)
     before = requests.values.sum
-    out, _err, code = run_cli('push', 'onyx', dir, '--dry-run')
+    out, _err, code = run_cli('push', 'onyx', dir, '--offline')
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
 
     data = JSON.parse(out)['data']
@@ -991,14 +1174,68 @@ check('push --dry-run prints the change list with local digests and makes no req
     assert(keys == %w[assets/app.js assets/copy.js assets/vendor/three.module.js], "got #{keys.inspect}")
     assert(data['changes'].all? { |c| c['op'] == 'put' && c['kind'] == 'asset' }, "got #{data['changes'].inspect}")
     assert(data['changes'][0]['digest'] == Digest::SHA256.hexdigest('export const a = 1'), 'digest is not the local sha256')
-    assert(requests.values.sum == before, 'a dry run reached the server')
+    assert(data['contract'] == 'unchecked', "expected --offline to say it checked nothing, got #{data['contract'].inspect}")
+    assert(requests.values.sum == before, '--offline reached the server')
+  end
+end
+
+check('a change object carries only what save takes; media_type rides alongside it') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'poster.png'), 'not really a png')
+    out, _err, = run_cli('push', 'onyx', dir, '--offline')
+    data = JSON.parse(out)['data']
+    assert(data['changes'][0].keys.sort == %w[digest key kind op], "got #{data['changes'][0].keys.inspect}")
+    detail = data['file_details'][0]
+    assert(detail['media_type'] == 'image/png', "expected the declared media type reported, got #{detail.inspect}")
+    assert(detail['byte_size'] == 'not really a png'.bytesize, "got #{detail.inspect}")
+  end
+end
+
+check('push --dry-run asks describe_site which contract the site is on, and nothing else') do
+  Dir.mktmpdir do |dir|
+    onyx_tree(dir)
+    before_describe = requests["#{TOKEN_ONYX} describe_site"]
+    before_save = requests["#{TOKEN_ONYX} save"]
+    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+
+    out, _err, code = run_cli('push', 'onyx', dir, '--dry-run')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+
+    data = JSON.parse(out)['data']
+    assert(data['contract'] == 'versioned', "got #{data['contract'].inspect}")
+    assert(data['expected'] == branch_heads['draft'], "expected the real branch head, got #{data['expected'].inspect}")
+    assert(requests["#{TOKEN_ONYX} describe_site"] == before_describe + 1, 'expected exactly one describe_site')
+    assert(requests["#{TOKEN_ONYX} save"] == before_save, 'a dry run saved')
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize, 'a dry run uploaded')
+  end
+end
+
+check('push --dry-run on a legacy site fails early and names the tool that does work there') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'hero.jpg'), 'bytes')
+    out, _err, code = run_cli('push', 'acme', dir, '--dry-run')
+    assert(code == 1, "expected the rehearsal to refuse a legacy site, got #{code}: #{out}")
+    parsed = JSON.parse(out)
+    assert(parsed['code'] == 'NOT_VERSIONED', "expected NOT_VERSIONED, got #{out}")
+    assert(parsed['error'].include?('write_file'), 'expected the legacy tool to be named')
+  end
+end
+
+check('push --dry-run on a branch the site does not have fails and names create-branch') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'x.js'), 'x')
+    out, _err, code = run_cli('push', 'onyx', dir, '--branch', 'never-made', '--dry-run')
+    assert(code == 1, "expected a nonzero exit, got #{code}: #{out}")
+    parsed = JSON.parse(out)
+    assert(parsed['code'] == 'NO_BRANCH', "expected NO_BRANCH, got #{out}")
+    assert(parsed['error'].include?('create-branch'), 'expected create-branch to be named')
   end
 end
 
 check('push skips dotfiles and dot directories') do
   Dir.mktmpdir do |dir|
     onyx_tree(dir)
-    out, _err, = run_cli('push', 'onyx', dir, '--dry-run')
+    out, _err, = run_cli('push', 'onyx', dir, '--offline')
     keys = JSON.parse(out)['data']['changes'].map { |c| c['key'] }
     assert(keys.none? { |k| k.include?('.hidden') || k.include?('.git') }, "got #{keys.inspect}")
   end
@@ -1008,9 +1245,34 @@ check('push does not prefix a tree that already starts with the prefix') do
   Dir.mktmpdir do |dir|
     Dir.mkdir(File.join(dir, 'assets'))
     File.write(File.join(dir, 'assets', 'x.js'), 'x')
-    out, _err, = run_cli('push', 'onyx', dir, '--dry-run')
+    out, _err, = run_cli('push', 'onyx', dir, '--offline')
     keys = JSON.parse(out)['data']['changes'].map { |c| c['key'] }
     assert(keys == %w[assets/x.js], "got #{keys.inspect}")
+  end
+end
+
+check('push accepts an extensionless LICENSE as text/plain, so a vendored notice can ship') do
+  Dir.mktmpdir do |dir|
+    Dir.mkdir(File.join(dir, 'vendor'))
+    File.write(File.join(dir, 'vendor', 'LICENSE'), 'MIT License')
+    File.write(File.join(dir, 'vendor', 'three.module.js'), 'export class Scene {}')
+    out, _err, code = run_cli('push', 'onyx', dir, '--offline')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    details = JSON.parse(out)['data']['file_details']
+    licence = details.find { |d| d['key'].end_with?('LICENSE') }
+    assert(licence, "expected the licence in the change list, got #{details.inspect}")
+    assert(licence['media_type'] == 'text/plain', "got #{licence.inspect}")
+  end
+end
+
+check('push still refuses a file it cannot type, and names what it takes') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'notes.md'), '# hi')
+    out, _err, code = run_cli('push', 'onyx', dir, '--offline')
+    assert(code == 1, 'expected a nonzero exit')
+    parsed = JSON.parse(out)
+    assert(parsed['code'] == 'BAD_TYPE', "expected BAD_TYPE, got #{out}")
+    assert(parsed['error'].include?('LICENSE'), 'expected the extensionless names to be listed')
   end
 end
 
@@ -1083,6 +1345,17 @@ ensure
   fail_batch_read = false
 end
 
+check('push says so when the platform types a file differently from its name') do
+  Dir.mktmpdir do |dir|
+    # JPEG magic under a .png name, exactly like Onyx's poster (friction 15)
+    File.binwrite(File.join(dir, 'poster.png'), "\xFF\xD8\xFF\xE0jpeg bytes".b)
+    run_cli('describe', 'onyx')
+    _out, err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected exit 0, got #{code}")
+    assert(err.include?('poster.png is image/jpeg'), "expected the real media type on stderr, got #{err.inspect}")
+  end
+end
+
 check('push uploads nothing to save when an upload fails') do
   Dir.mktmpdir do |dir|
     File.write(File.join(dir, 'app.js'), 'a')
@@ -1114,8 +1387,15 @@ File.write(BROWSER_STUB, <<~'STUB')
     session = args.delete_at(i)
   end
   File.open(ENV.fetch('STUB_BROWSER_LOG'), 'a') { |f| f.puts("#{session} #{args.join(' ')}") }
-  broken = ENV['STUB_BROWSER_MODE'] == 'broken'
+  mode = ENV['STUB_BROWSER_MODE']
+  broken = mode == 'broken'
   url = args[1] || 'http://stub.test/'
+
+  # a preview hostname whose wildcard certificate is not installed yet
+  if mode == 'tls' && args[0] == 'open' && args[1]
+    puts JSON.generate(success: false, data: nil, error: 'Navigation failed: net::ERR_SSL_PROTOCOL_ERROR')
+    exit 0
+  end
 
   out =
     case [args[0], args[1]]
@@ -1130,6 +1410,10 @@ File.write(BROWSER_STUB, <<~'STUB')
       if broken
         requests << { url: "#{ENV.fetch('STUB_BROWSER_URL')}missing.png", status: 404, resourceType: 'Image' }
         requests << { url: "#{ENV.fetch('STUB_BROWSER_URL')}favicon.ico", status: 404, resourceType: 'Other' }
+      end
+      # what a blocked cross-origin module looks like: no status, no console
+      if mode == 'cors'
+        requests << { url: ENV.fetch('STUB_BROWSER_CORS_URL'), resourceType: 'Script', errorText: 'net::ERR_FAILED' }
       end
       { requests: requests }
     in ['screenshot', String => path]
@@ -1185,6 +1469,54 @@ check('check --ignore drops matching failed requests') do
   assert(code == 1, 'console errors alone still fail the check')
 end
 
+check('check tells a CORS block from a missing object, and says which on stdout and stderr') do
+  cors_url = "http://127.0.0.1:#{port}/cors/blocked.js"
+  out, err, code = run_cli('check', 'http://stub.test/',
+                           env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'cors', 'STUB_BROWSER_CORS_URL' => cors_url))
+  assert(code == 1, "expected exit 1 on a blocked subresource, got #{code}: #{out}")
+
+  failure = JSON.parse(out)['failed_requests'].find { |r| r['url'] == cors_url }
+  assert(failure, "expected the blocked request reported, got #{out}")
+  assert(failure['error'] == 'net::ERR_FAILED', "expected the browser's own failure text carried, got #{failure.inspect}")
+  assert(failure['diagnosis'] == 'cors_blocked', "expected a CORS diagnosis, got #{failure.inspect}")
+  assert(failure.dig('probe', 'status') == 200, "expected the probe to find the object present, got #{failure.inspect}")
+  assert(failure['message'].include?('bucket CORS'), "got #{failure['message'].inspect}")
+  assert(err.include?('bucket CORS'), "expected the diagnosis in prose on stderr, got #{err.inspect}")
+end
+
+check('check --no-probe asks the object nothing') do
+  cors_url = "http://127.0.0.1:#{port}/cors/blocked.js"
+  before = requests['cors_probe']
+  out, _err, code = run_cli('check', 'http://stub.test/', '--no-probe',
+                            env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'cors', 'STUB_BROWSER_CORS_URL' => cors_url))
+  assert(code == 1, "expected exit 1, got #{code}: #{out}")
+  assert(requests['cors_probe'] == before, '--no-probe still fetched the object')
+  failure = JSON.parse(out)['failed_requests'].find { |r| r['url'] == cors_url }
+  assert(failure['diagnosis'].nil?, "expected no diagnosis without a probe, got #{failure.inspect}")
+end
+
+check('a same-origin failure with a status is never probed -- the browser already got an answer') do
+  before = requests['cors_probe']
+  run_cli('check', 'http://stub.test/', env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'broken'))
+  assert(requests['cors_probe'] == before, 'a 404 with a status was probed anyway')
+end
+
+check('check names the missing preview wildcard certificate rather than just the TLS error') do
+  out, _err, code = run_cli('check', 'https://orst2izx5hazhn-onyx.gxbsites.com',
+                            env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'tls'))
+  assert(code == 1, "expected a nonzero exit, got #{code}: #{out}")
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'PREVIEW_TLS', "expected PREVIEW_TLS, got #{out}")
+  assert(parsed['error'].include?('wildcard certificate'), "expected the real cause named, got #{parsed['error'].inspect}")
+  assert(parsed['error'].include?('ERR_SSL_PROTOCOL_ERROR'), 'expected the browser error preserved too')
+end
+
+check('a live hostname keeps the plain browser error -- the hint is only for preview hosts') do
+  out, _err, code = run_cli('check', 'https://onyx.gxbsites.com', env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'tls'))
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'BROWSER_ERROR', "got #{out}")
+end
+
 check('check writes the screenshot it was asked for') do
   Dir.mktmpdir do |dir|
     shot = File.join(dir, 'shots', 'home.png')
@@ -1192,6 +1524,201 @@ check('check writes the screenshot it was asked for') do
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
     assert(File.file?(shot), 'expected the screenshot file to exist')
     assert(JSON.parse(out)['screenshot'] == shot, "expected the screenshot path in the report, got #{out}")
+  end
+end
+
+# -- fragment: a full HTML document -> a page body ----------------------------
+
+ONYX_PAGE = <<~HTML
+  <!doctype html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Onyx &mdash; A new way to build the grid.</title>
+    <meta name="description" content="Stealth hardware.">
+    <meta name="robots" content="noindex">
+    <link rel="icon" href="assets/onyx-favicon.svg">
+    <link rel="stylesheet" href="assets/stealth.css">
+    <link rel="stylesheet" href="https://fonts.example.com/inter.css">
+    <script type="importmap">{"imports":{"three":"./assets/vendor/three/three.module.js"}}</script>
+    <script type="module" src="assets/onyx-core-motion.js"></script>
+    <style>.hero { color: red; }</style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <main id="main" class="hero">
+      <img src="assets/onyx-logo-light.svg" alt="Onyx">
+      <div class="motion-stage" data-asset="assets/onyx-motion-studies.glb"></div>
+      <form id="inquiry-form" action="/f/customer" method="post"></form>
+      <script>document.addEventListener('submit', (e) => { e.preventDefault(); });</script>
+    </main>
+  </body>
+  </html>
+HTML
+
+def with_page_file(html = ONYX_PAGE)
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'index.html')
+    File.write(path, html)
+    yield dir, path
+  end
+end
+
+check('fragment drops the document shell and carries the head into config and metadata') do
+  with_page_file do |_dir, path|
+    out, _err, code = run_cli('fragment', path)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    data = JSON.parse(out)['data']
+
+    assert(data['metadata']['title'] == 'Onyx — A new way to build the grid.', "got #{data['metadata'].inspect}")
+    assert(data['metadata']['description'] == 'Stealth hardware.', "got #{data['metadata'].inspect}")
+    assert(data['metadata']['noindex'] == true, "got #{data['metadata'].inspect}")
+    assert(data['config']['stylesheets'] == %w[assets/stealth.css], "got #{data['config'].inspect}")
+    assert(data['config']['modules'] == %w[assets/onyx-core-motion.js], "got #{data['config'].inspect}")
+    assert(data['config']['imports'] == { 'three' => 'assets/vendor/three/three.module.js' }, "got #{data['config'].inspect}")
+    assert(data['config']['favicon'] == { 'url' => 'assets/onyx-favicon.svg' }, "got #{data['config'].inspect}")
+    assert(data['css'] == '.hero { color: red; }', "got #{data['css'].inspect}")
+  end
+end
+
+check('fragment rewrites every local assets/ reference to {{ asset: }} and leaves nothing of the shell') do
+  with_page_file do |_dir, path|
+    body = JSON.parse(run_cli('fragment', path).first).dig('data', 'body')
+    assert(body.include?('src="{{ asset:assets/onyx-logo-light.svg }}"'), "got #{body}")
+    assert(body.include?('data-asset="{{ asset:assets/onyx-motion-studies.glb }}"'), "got #{body}")
+    %w[<!doctype <html <head <title <meta <link <main importmap Skip\ to\ content].each do |gone|
+      assert(!body.include?(gone), "#{gone.inspect} survived into the body: #{body}")
+    end
+    assert(body.start_with?('<div class="hero">'), "expected <main> to become a div, got #{body[0, 60]}")
+    assert(body.include?("<script>document.addEventListener"), 'the page\'s own inline script was dropped')
+  end
+end
+
+check('fragment warns about the things that only break later: forms-1.js, an SVG favicon, an external sheet') do
+  with_page_file do |_dir, path|
+    _out, err, = run_cli('fragment', path)
+    assert(err.include?('stopPropagation'), "expected the double-submit warning, got #{err.inspect}")
+    assert(err.include?('415'), "expected the SVG favicon warning, got #{err.inspect}")
+    assert(err.include?('fonts.example.com'), "expected the external stylesheet warning, got #{err.inspect}")
+  end
+end
+
+check('fragment reports its change list on stderr and stdout stays one JSON envelope') do
+  with_page_file do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    assert(out.lines.size == 1, "expected exactly one line on stdout, got #{out.lines.size}")
+    assert(JSON.parse(out)['ok'] == true, 'expected the envelope')
+    assert(err.include?('fragment: dropped the document shell'), "got #{err.inspect}")
+    assert(JSON.parse(out).dig('data', 'changes').size >= 8, 'expected the change list in the payload too')
+  end
+end
+
+check('fragment leaves a body that is already a fragment alone, except for asset references') do
+  with_page_file('<p><img src="assets/x.png"></p>') do |_dir, path|
+    data = JSON.parse(run_cli('fragment', path).first)['data']
+    assert(data['body'] == '<p><img src="{{ asset:assets/x.png }}"></p>', "got #{data['body'].inspect}")
+    assert(data['metadata'] == {}, "got #{data['metadata'].inspect}")
+    assert(!data['changes'].any? { |c| c.include?('document shell') }, "got #{data['changes'].inspect}")
+  end
+end
+
+# -- save --page --html --config ----------------------------------------------
+
+check('save --page --html --config builds the two-change payload by itself') do
+  with_page_file do |dir, path|
+    config = File.join(dir, 'config.json')
+    File.write(config, JSON.generate(name: 'Onyx', runtime: { turbo: false, alpine: false }))
+    run_cli('describe', 'onyx')
+
+    out, _err, code = run_cli('save', 'onyx', '--page', '/', '--html', path, '--config', config, '--message', 'onyx homepage')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+
+    changes = last_args['save']['changes']
+    assert(changes.map { |c| [c['op'], c['kind']] } == [%w[put config], %w[put page]], "got #{changes.inspect}")
+    assert(changes[1]['key'] == '/', "got #{changes[1].inspect}")
+    assert(changes[1]['document']['format'] == 'html', "got #{changes[1]['document'].keys.inspect}")
+    assert(changes[1]['document']['metadata']['title'] == 'Onyx — A new way to build the grid.', "got #{changes[1]['document']['metadata'].inspect}")
+    assert(changes[1]['document']['body'].include?('{{ asset:assets/onyx-logo-light.svg }}'), 'expected the rewritten body')
+    assert(changes[1]['document']['css'] == '.hero { color: red; }', 'expected the inline style carried as page css')
+    assert(last_args['save']['message'] == 'onyx homepage', 'expected --message through')
+  end
+end
+
+check('save carries stylesheets, modules and imports into a config that does not declare them') do
+  with_page_file do |dir, path|
+    config = File.join(dir, 'config.json')
+    File.write(config, JSON.generate(name: 'Onyx'))
+    run_cli('describe', 'onyx')
+    _out, err, code = run_cli('save', 'onyx', '--page', '/', '--html', path, '--config', config)
+    assert(code == 0, 'expected exit 0')
+
+    document = last_args['save']['changes'][0]['document']
+    assert(document['stylesheets'] == %w[assets/stealth.css], "got #{document.inspect}")
+    assert(document['modules'] == %w[assets/onyx-core-motion.js], "got #{document.inspect}")
+    assert(document['imports'] == { 'three' => 'assets/vendor/three/three.module.js' }, "got #{document.inspect}")
+    assert(err.include?('carried'), "expected the carry reported on stderr, got #{err.inspect}")
+  end
+end
+
+check('a config that declares a key wins, even when it declares it empty') do
+  with_page_file do |dir, path|
+    config = File.join(dir, 'config.json')
+    File.write(config, JSON.generate(name: 'Onyx', stylesheets: []))
+    run_cli('describe', 'onyx')
+    run_cli('save', 'onyx', '--page', '/', '--html', path, '--config', config)
+    document = last_args['save']['changes'][0]['document']
+    assert(document['stylesheets'] == [], "an explicit empty list was overwritten: #{document.inspect}")
+  end
+end
+
+check('save --html with no --config says the stylesheets and modules will not load') do
+  with_page_file do |_dir, path|
+    run_cli('describe', 'onyx')
+    _out, err, code = run_cli('save', 'onyx', '--page', '/', '--html', path)
+    assert(code == 0, 'expected exit 0')
+    assert(last_args['save']['changes'].size == 1, 'expected only the page change')
+    assert(err.include?('will not load'), "expected the warning, got #{err.inspect}")
+  end
+end
+
+check('save --html of a titleless fragment refuses locally until --title is given') do
+  with_page_file('<p>hello</p>') do |_dir, path|
+    before = requests["#{TOKEN_ONYX} save"]
+    out, _err, code = run_cli('save', 'onyx', '--page', '/x', '--html', path)
+    assert(code == 1, 'expected a nonzero exit')
+    assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before, 'a page with no title reached the server')
+
+    run_cli('describe', 'onyx')
+    _out, _err, code = run_cli('save', 'onyx', '--page', '/x', '--html', path, '--title', 'Hello')
+    assert(code == 0, 'expected --title to be enough')
+    assert(last_args['save']['changes'][0]['document']['metadata'] == { 'title' => 'Hello' },
+      "got #{last_args['save']['changes'][0]['document']['metadata'].inspect}")
+  end
+end
+
+check('save --html needs --page, and refuses --changes in the same breath') do
+  with_page_file do |dir, path|
+    before = requests["#{TOKEN_ONYX} save"]
+    out, _err, code = run_cli('save', 'onyx', '--html', path)
+    assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE for --html with no --page, got #{out}")
+
+    changes = File.join(dir, 'changes.json')
+    File.write(changes, JSON.generate([]))
+    out, _err, code = run_cli('save', 'onyx', '--page', '/', '--html', path, '--changes', changes)
+    assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE for both forms at once, got #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before, 'a malformed save reached the server')
+  end
+end
+
+# -- stdout is one JSON envelope ----------------------------------------------
+
+check('every envelope-printing subcommand puts exactly one JSON object on stdout') do
+  [ %w[describe onyx], %w[diff onyx], %w[history onyx], %w[analytics onyx],
+    %w[list-submissions onyx] ].each do |args|
+    out, = run_cli(*args)
+    assert(out.lines.size == 1, "#{args.first} printed #{out.lines.size} lines on stdout")
+    assert(JSON.parse(out).key?('ok'), "#{args.first} printed something that is not the envelope: #{out}")
   end
 end
 
