@@ -2,23 +2,34 @@
 # frozen_string_literal: true
 
 # sites-cli — GXB tenant site management
-# Local:  SITES_ROOT/bin/rails runner FILE.rb (list/show/open/create)
-# Prod:   SITES_ROOT + kamal-cli runner FILE.rb
-# Text file tools (describe_site/list_files/read_file/write_file/edit_file/
-# publish) talk HTTP to the site-token gateway instead -- see the "Text file
-# tools" section below.
-# Config: SITES_ROOT env; default ~/projects/sites
+#
+# Three surfaces, one binary:
+#
+#   1. Runner commands (list/show/open/create) -- SITES_ROOT/bin/rails runner,
+#      or kamal-cli runner with --prod. Staff credentials, not a site token.
+#   2. Legacy file tools (describe_site/list_files/read_file/write_file/
+#      edit_file/publish) -- HTTP to the site-token gateway, for sites still on
+#      the file API (plans/24-agent-sites.md).
+#   3. v2 tools (describe/read/save/create-branch/diff/publish/merge-live/
+#      resolve-merge/history/revoke-preview, plus the upload/push/wait-preview/
+#      check helpers) -- the same HTTP gateway, for versioned sites
+#      (plans/30-agent-first-sites.md). Each subcommand posts the same-named
+#      MCP tool; the shell is the transport, not a second contract.
+#
+# Config: SITES_ROOT, SITES_CLI_HOST, SITES_CLI_CONFIG_DIR, SITES_CLI_TOKEN.
 
 require 'json'
-require 'optparse'
 require 'tempfile'
 require 'open3'
 require 'fileutils'
 require 'stringio'
 require 'net/http'
+require 'openssl'
 require 'uri'
+require 'securerandom'
+require 'digest'
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # -----------------------------------------------------------------------------
@@ -36,14 +47,25 @@ def success(data)
 end
 
 # status/body pass through the API's real HTTP status and full structured
-# 409/422 payload (e.g. conflict path/version) instead of collapsing them
-# into one message string.
+# 409/422 payload (e.g. conflict path/version, branch/expected) instead of
+# collapsing them into one message string.
 def failure(msg, code: 'ERROR', status: nil, body: nil)
   payload = { ok: false, error: msg, code: code }
   payload[:status] = status if status
   payload[:body] = body if body
   emit(payload)
   1
+end
+
+# Internal failures travel as plain hashes so a worker thread (upload, push)
+# can collect one per file instead of printing an envelope mid-flight. They
+# reach stdout through fail_with, which prints exactly the shape above.
+def api_error(msg, code: 'ERROR', status: nil, body: nil)
+  { error: msg, code: code, status: status, body: body }
+end
+
+def fail_with(err)
+  failure(err[:error], code: err[:code], status: err[:status], body: err[:body])
 end
 
 # -----------------------------------------------------------------------------
@@ -189,9 +211,10 @@ def cmd_open(slug, prod:)
   end
 end
 
-# Staff-only create (plans/24-agent-sites.md slice 3 item 19): mints no agent
-# create_site tool. A token and a form recipient are separate steps after
-# this, not automatic -- see the admin site page once this returns.
+# Staff-only create (plans/24-agent-sites.md slice 3 item 19, plan 30 section
+# 1.1). The `create_site` tool exists on the server, but /api/v1/tools only
+# authenticates site-bound tokens, so it always answers 403 there -- this
+# runner path is the one that works. See `create-site` below.
 def cmd_create(slug, name, team, prod:)
   script = <<~RUBY
     team = Team.find_or_create_by!(name: #{JSON.dump(team || 'GXB')})
@@ -202,18 +225,15 @@ def cmd_create(slug, name, team, prod:)
 end
 
 # -----------------------------------------------------------------------------
-# Text file tools: describe_site, list_files, read_file, write_file,
-# edit_file, publish (plans/24-agent-sites.md slice 3 item 18). These talk
-# HTTP to the site-token gateway (Api::V1::ToolsController) -- a site token
-# is scoped to exactly one site, unlike the runner credentials the commands
-# above use. write --file streams a binary upload through the media API
-# (plans/24-agent-sites.md slice 5a: single PUT, jpg/png/webp/gif).
+# Config: tokens and remembered CAS tokens
 # -----------------------------------------------------------------------------
 
 CONFIG_DIR = File.expand_path(ENV.fetch('SITES_CLI_CONFIG_DIR', '~/.config/sites-cli'))
 TOKENS_PATH = File.join(CONFIG_DIR, 'tokens.json')
 STATE_PATH = File.join(CONFIG_DIR, 'state.json')
 API_HOST = ENV.fetch('SITES_CLI_HOST', 'https://sites.gxb.vc')
+DEFAULT_BRANCH = 'draft'
+HTTP_TIMEOUT = 120
 
 def load_json(path)
   File.file?(path) ? (JSON.parse(File.read(path)) rescue {}) : {}
@@ -238,6 +258,16 @@ def token_for(slug)
   load_json(TOKENS_PATH)[slug]
 end
 
+# The two platform tools (list_sites, create_site) are not bound to a site.
+# SITES_CLI_TOKEN, or a "_platform" entry in tokens.json, is where a
+# non-site-bound bearer would go if the server ever accepts one.
+def platform_token
+  ENV['SITES_CLI_TOKEN'] || begin
+    secure_permissions!(TOKENS_PATH)
+    load_json(TOKENS_PATH)['_platform']
+  end
+end
+
 # read_file caches {slug, path, version} locally so write/edit/publish can
 # default --expected-version from the caller's own last read -- a write
 # never preceded by a read still fails, and a 409 is never silently retried.
@@ -252,9 +282,65 @@ end
 
 def cached_version(slug, path) = load_json(STATE_PATH)[state_key(slug, path)]
 
-def api_call(slug, tool, arguments)
-  token = token_for(slug)
-  return nil, failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+# The v2 half of the same idea: `expected` is a branch-head CAS token, so it
+# is remembered per slug+branch rather than per path. Prefixed so it can
+# never collide with a legacy "slug/path" key in the same flat file.
+def expected_key(slug, branch) = "expected:#{slug}:#{branch}"
+
+def cached_expected(slug, branch) = load_json(STATE_PATH)[expected_key(slug, branch)]
+
+# Called only with a 2xx body. A 409 branch_changed also carries the current
+# `expected`, and deliberately does NOT come through here: learning the new
+# token from the conflict is how a "never retried" conflict turns into a
+# silent overwrite on the very next command.
+def remember_expected(slug, data)
+  return unless data.is_a?(Hash)
+
+  pairs = []
+  pairs << [data['branch'], data['expected']]
+  Array(data['branches']).each { |b| pairs << [b['name'], b['expected']] if b.is_a?(Hash) }
+  pairs.reject! { |name, expected| name.to_s.empty? || expected.to_s.empty? }
+  return if pairs.empty?
+
+  state = load_json(STATE_PATH)
+  pairs.each { |name, expected| state[expected_key(slug, name)] = expected }
+  save_json(STATE_PATH, state)
+end
+
+def resolve_expected(slug, branch, given)
+  expected = given || cached_expected(slug, branch)
+  return [expected, nil] if expected
+  [nil, api_error("no --expected and nothing remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` first",
+                  code: 'NO_EXPECTED')]
+end
+
+# -----------------------------------------------------------------------------
+# HTTP transport
+# -----------------------------------------------------------------------------
+
+NETWORK_ERRORS = [SocketError, SystemCallError, IOError, Timeout::Error, OpenSSL::SSL::SSLError].freeze
+
+def http_request(req, uri)
+  Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
+                  open_timeout: 30, read_timeout: HTTP_TIMEOUT) { |http| http.request(req) }
+end
+
+def parse_api_response(res)
+  body = begin
+    JSON.parse(res.body.to_s)
+  rescue JSON::ParserError
+    { 'error' => res.body }
+  end
+
+  return [body, nil] if res.code.to_i.between?(200, 299)
+
+  [nil, api_error(body['message'] || body['error'] || "HTTP #{res.code}",
+                  code: (body['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: body)]
+end
+
+def api_call(slug, tool, arguments, token: nil)
+  token ||= token_for(slug)
+  return [nil, api_error("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN')] unless token
 
   uri = URI.join(API_HOST, '/api/v1/tools')
   req = Net::HTTP::Post.new(uri)
@@ -262,33 +348,42 @@ def api_call(slug, tool, arguments)
   req['Content-Type'] = 'application/json'
   req.body = JSON.generate(tool: tool, arguments: arguments)
 
-  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
-  body = begin
-    JSON.parse(res.body.to_s)
-  rescue JSON::ParserError
-    { 'error' => res.body }
-  end
-
-  return [ body, nil ] if res.code.to_i.between?(200, 299)
-
-  [ nil, failure(body['message'] || body['error'] || "HTTP #{res.code}", code: (body['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: body) ]
+  parse_api_response(http_request(req, uri))
+rescue *NETWORK_ERRORS => e
+  [nil, api_error("#{tool} request failed: #{e.class}: #{e.message}", code: 'HTTP_ERROR')]
 end
 
-def cmd_describe_site(slug, path)
-  data, err = api_call(slug, 'describe_site', path ? { path: path } : {})
-  return err if err
+# Every v2 subcommand is the same three steps: post the same-named tool,
+# remember whatever branch head token the response carries, print {ok, data}.
+def tool_call(slug, tool, arguments, token: nil)
+  data, err = api_call(slug, tool, arguments, token: token)
+  return fail_with(err) if err
+  remember_expected(slug, data)
+  success(data)
+end
+
+# -----------------------------------------------------------------------------
+# Legacy file tools: describe_site, list_files, read_file, write_file,
+# edit_file, publish (plans/24-agent-sites.md slice 3 item 18). A site token is
+# scoped to exactly one site, unlike the runner credentials above.
+# -----------------------------------------------------------------------------
+
+def cmd_describe_site(slug, arguments)
+  data, err = api_call(slug, 'describe_site', arguments)
+  return fail_with(err) if err
+  remember_expected(slug, data)
   success(data)
 end
 
 def cmd_list_files(slug, prefix)
   data, err = api_call(slug, 'list_files', prefix ? { prefix: prefix } : {})
-  return err if err
+  return fail_with(err) if err
   success(data)
 end
 
 def cmd_read_file(slug, path, view:)
   data, err = api_call(slug, 'read_file', { path: path, view: view })
-  return err if err
+  return fail_with(err) if err
   remember_version(slug, path, data['version'])
   success(data)
 end
@@ -298,7 +393,7 @@ def cmd_write_file(slug, path, content, expected_version)
   return failure("no --expected-version and no cached version from a prior read_file -- read #{path} first", code: 'NO_VERSION') unless version
 
   data, err = api_call(slug, 'write_file', { path: path, content: content, expected_version: version })
-  return err if err
+  return fail_with(err) if err
   remember_version(slug, path, data['version'])
   success(data)
 end
@@ -308,40 +403,57 @@ def cmd_edit_file(slug, path, edits, expected_version)
   return failure("no --expected-version and no cached version from a prior read_file -- read #{path} first", code: 'NO_VERSION') unless version
 
   data, err = api_call(slug, 'edit_file', { path: path, edits: edits, expected_version: version })
-  return err if err
+  return fail_with(err) if err
   remember_version(slug, path, data['version'])
   success(data)
 end
 
-def cmd_publish(slug, path, expected_version)
+def cmd_publish_legacy(slug, path, expected_version)
   version = expected_version || cached_version(slug, path)
   return failure("no --expected-version and no cached version -- read_file/describe_site #{path} first", code: 'NO_VERSION') unless version
 
   data, err = api_call(slug, 'publish', { path: path, expected_version: version })
-  return err if err
+  return fail_with(err) if err
   success(data)
 end
 
 # -----------------------------------------------------------------------------
 # Media upload: authorize -> stage bytes -> complete -> poll until
-# ready/failed. A photo (5a) is one presigned PUT streamed from disk. A
-# video (5b) is multipart: bounded batches of part presigns, each part
-# retried independently, a bounded number of parts in flight at once, and
-# an abort call if it can't be finished -- never the whole file buffered at
-# once either way.
+# ready/failed. A photo (plans/24 5a) is one presigned PUT streamed from disk.
+# A video (5b) is multipart: bounded batches of part presigns, each part
+# retried independently, a bounded number of parts in flight at once, and an
+# abort call if it can't be finished -- never the whole file buffered at once
+# either way. A versioned site (plan 30 section 1.1 step 2) omits `label` and
+# sends `filename`; the digest in the response is what `save` binds.
 # -----------------------------------------------------------------------------
 
+# What the legacy file API takes. Unchanged on purpose: a legacy site's
+# assets/ label is the name its published HTML already references.
 MEDIA_CONTENT_TYPES = {
   '.jpg' => 'image/jpeg', '.jpeg' => 'image/jpeg', '.png' => 'image/png',
   '.webp' => 'image/webp', '.gif' => 'image/gif', '.mp4' => 'video/mp4'
 }.freeze
 
+# The plan 30 / slice B set. .mjs is accepted as a filename but the server
+# delivers it as asset.js with text/javascript -- the suffix comes from the
+# validated type, never from the filename (slice B deviation 3).
+UPLOAD_CONTENT_TYPES = MEDIA_CONTENT_TYPES.merge(
+  '.js' => 'text/javascript', '.mjs' => 'text/javascript',
+  '.css' => 'text/css', '.svg' => 'image/svg+xml',
+  '.glb' => 'model/gltf-binary',
+  '.woff' => 'font/woff', '.woff2' => 'font/woff2',
+  '.json' => 'application/json', '.txt' => 'text/plain'
+).freeze
+
 PART_CONCURRENCY = 4
 PART_MAX_ATTEMPTS = 3
+UPLOAD_CONCURRENCY = 4
+UPLOAD_POLL_TIMEOUT = 300
+UPLOAD_POLL_INTERVAL = 1
 
-def media_api_call(slug, method, path, body)
-  token = token_for(slug)
-  return nil, failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+def media_api_call(slug, method, path, body, token: nil)
+  token ||= token_for(slug)
+  return [nil, api_error("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN')] unless token
 
   uri = URI.join(API_HOST, path)
   req_class = { get: Net::HTTP::Get, delete: Net::HTTP::Delete }.fetch(method, Net::HTTP::Post)
@@ -352,15 +464,9 @@ def media_api_call(slug, method, path, body)
     req.body = JSON.generate(body)
   end
 
-  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
-  parsed = begin
-    JSON.parse(res.body.to_s)
-  rescue JSON::ParserError
-    { 'error' => res.body }
-  end
-  return [ parsed, nil ] if res.code.to_i.between?(200, 299)
-
-  [ nil, failure(parsed['message'] || parsed['error'] || "HTTP #{res.code}", code: (parsed['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: parsed) ]
+  parse_api_response(http_request(req, uri))
+rescue *NETWORK_ERRORS => e
+  [nil, api_error("upload request failed: #{e.class}: #{e.message}", code: 'HTTP_ERROR')]
 end
 
 # A streamed PUT (body_stream, not the whole file in memory) against the
@@ -372,9 +478,53 @@ def put_upload(upload_url, file_path, content_type, byte_size)
   req['Content-Type'] = content_type
   req.content_length = byte_size
   req.body_stream = File.open(file_path, 'rb')
-  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  res = http_request(req, uri)
   req.body_stream.close
-  res.code.to_i.between?(200, 299) ? nil : failure("upload PUT failed: HTTP #{res.code}", code: 'UPLOAD_FAILED', status: res.code.to_i)
+  res.code.to_i.between?(200, 299) ? nil : api_error("upload PUT failed: HTTP #{res.code}", code: 'UPLOAD_FAILED', status: res.code.to_i)
+rescue *NETWORK_ERRORS => e
+  api_error("upload PUT failed: #{e.class}: #{e.message}", code: 'UPLOAD_FAILED')
+end
+
+# The whole authorize -> stage -> complete -> poll flow for one file. `target`
+# carries either a legacy {label:, expected_version:} or a versioned
+# {filename:, digest:}. Returns the final upload_status body.
+def media_upload(slug, file_path, content_type, target, token:)
+  byte_size = File.size(file_path)
+  data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
+                             target.merge(content_type: content_type, byte_size: byte_size), token: token)
+  return [nil, err] if err
+  upload_id = data['id']
+
+  if data['multipart']
+    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'], token: token)
+    if part_err
+      media_api_call(slug, :delete, "/api/v1/media/uploads/#{upload_id}", nil, token: token)
+      return [nil, part_err]
+    end
+    complete_body = { parts: parts }
+  else
+    put_err = put_upload(data['upload_url'], file_path, content_type, byte_size)
+    return [nil, put_err] if put_err
+    complete_body = {}
+  end
+
+  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/complete", complete_body, token: token)
+  return [nil, err] if err
+
+  deadline = Time.now + UPLOAD_POLL_TIMEOUT
+  until %w[ready failed].include?(data['status'])
+    return [nil, api_error("upload #{upload_id} still #{data['status']} after #{UPLOAD_POLL_TIMEOUT}s", code: 'UPLOAD_TIMEOUT', body: data)] if Time.now >= deadline
+    sleep UPLOAD_POLL_INTERVAL
+    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{upload_id}", nil, token: token)
+    return [nil, err] if err
+  end
+
+  unless data['status'] == 'ready'
+    return [nil, api_error(data['error'] || 'upload verification failed',
+                           code: (data['error_code'] || 'UPLOAD_FAILED').to_s, body: data)]
+  end
+
+  [data, nil]
 end
 
 def cmd_write_file_upload(slug, path, file_path, expected_version)
@@ -385,36 +535,9 @@ def cmd_write_file_upload(slug, path, file_path, expected_version)
   content_type = MEDIA_CONTENT_TYPES[File.extname(file_path).downcase]
   return failure("unsupported file extension #{File.extname(file_path)} -- accepts jpg/jpeg/png/webp/gif/mp4", code: 'BAD_TYPE') unless content_type
 
-  data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
-    { label: path, content_type: content_type, byte_size: File.size(file_path), expected_version: version })
-  return err if err
-  upload_id = data['id']
-
-  if data['multipart']
-    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'])
-    if part_err
-      media_api_call(slug, :delete, "/api/v1/media/uploads/#{upload_id}", nil)
-      return part_err
-    end
-    complete_body = { parts: parts }
-  else
-    put_err = put_upload(data['upload_url'], file_path, content_type, File.size(file_path))
-    return put_err if put_err
-    complete_body = {}
-  end
-
-  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/complete", complete_body)
-  return err if err
-
-  status = data['status']
-  until %w[ready failed].include?(status)
-    sleep 1
-    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{upload_id}", nil)
-    return err if err
-    status = data['status']
-  end
-
-  return failure(data['error'] || 'upload verification failed', code: 'UPLOAD_FAILED') unless status == 'ready'
+  data, err = media_upload(slug, file_path, content_type,
+                           { label: path, expected_version: version }, token: token_for(slug))
+  return fail_with(err) if err
 
   remember_version(slug, path, data['id'].to_s)
   success(data)
@@ -422,10 +545,10 @@ end
 
 # Bounded-parallelism multipart upload (plans/24-agent-sites.md 5b): a fixed
 # worker count pulls part numbers off a shared queue, each part fetched and
-# retried independently (part_max_attempts each, a fresh presign every
+# retried independently (PART_MAX_ATTEMPTS each, a fresh presign every
 # attempt so an expired one just renews), at most one part's bytes
 # (part_size, 16 MiB) resident per worker regardless of total file size.
-def upload_video_parts(slug, upload_id, file_path, parts_count, part_size)
+def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, token:)
   total_size = File.size(file_path)
   queue = Queue.new
   (1..parts_count).each { |n| queue << n }
@@ -440,7 +563,7 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size)
         break unless part_number
         mutex.synchronize { break if first_error }
 
-        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size)
+        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, token: token)
         mutex.synchronize do
           if err
             first_error ||= err
@@ -457,22 +580,23 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size)
   [ results, nil ]
 end
 
-def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size)
+def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, token:)
   offset = (part_number - 1) * part_size
   length = [ part_size, total_size - offset ].min
 
   attempts = 0
   loop do
     attempts += 1
-    presign, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts", { part_numbers: [ part_number ] })
+    presign, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts",
+                                  { part_numbers: [ part_number ] }, token: token)
     return [ nil, err ] if err
 
     part_url = presign.dig('parts', 0, 'upload_url')
-    return [ nil, failure("no presigned URL returned for part #{part_number}", code: 'PART_UPLOAD_FAILED') ] unless part_url
+    return [ nil, api_error("no presigned URL returned for part #{part_number}", code: 'PART_UPLOAD_FAILED') ] unless part_url
 
     etag = put_part(part_url, file_path, offset, length)
     return [ etag, nil ] if etag
-    return [ nil, failure("part #{part_number} failed after #{attempts} attempts", code: 'PART_UPLOAD_FAILED') ] if attempts >= PART_MAX_ATTEMPTS
+    return [ nil, api_error("part #{part_number} failed after #{attempts} attempts", code: 'PART_UPLOAD_FAILED') ] if attempts >= PART_MAX_ATTEMPTS
   end
 end
 
@@ -483,8 +607,337 @@ def put_part(upload_url, file_path, offset, length)
   req = Net::HTTP::Put.new(uri)
   req.content_length = length
   req.body = bytes
-  res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') { |http| http.request(req) }
+  res = http_request(req, uri)
   res.code.to_i.between?(200, 299) ? res['etag'] : nil
+rescue *NETWORK_ERRORS
+  nil
+end
+
+# -----------------------------------------------------------------------------
+# v2 helpers: upload, push, wait-preview, check
+# -----------------------------------------------------------------------------
+
+def sha256_file(path) = Digest::SHA256.file(path).hexdigest
+
+# One line of JSON per file, so a caller can map a local path to the digest it
+# has to `save`. Four at a time; exit 1 if any file failed.
+def cmd_upload(slug, files)
+  return failure("upload requires SLUG FILE [FILE...]", code: 'USAGE') if files.empty?
+
+  missing = files.reject { |f| File.file?(f) }
+  return failure("no such file(s): #{missing.join(' ')}", code: 'NO_FILE') if missing.any?
+
+  token = token_for(slug)
+  return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+
+  results = upload_files(slug, files, token: token)
+  results.each { |r| emit(r) }
+  results.all? { |r| r[:status] == 'ready' } ? 0 : 1
+end
+
+def upload_files(slug, files, token:)
+  results = Array.new(files.size)
+  queue = Queue.new
+  files.each_index { |i| queue << i }
+
+  workers = [ UPLOAD_CONCURRENCY, files.size ].min.times.map do
+    Thread.new do
+      loop do
+        index = begin queue.pop(true) rescue nil end
+        break unless index
+        results[index] = upload_one_file(slug, files[index], token: token)
+      end
+    end
+  end
+  workers.each(&:join)
+  results
+end
+
+def upload_one_file(slug, file_path, token:)
+  content_type = UPLOAD_CONTENT_TYPES[File.extname(file_path).downcase]
+  unless content_type
+    return { path: file_path, status: 'failed', code: 'BAD_TYPE',
+             error: "unsupported file extension #{File.extname(file_path)} -- accepts #{UPLOAD_CONTENT_TYPES.keys.join(' ')}" }
+  end
+
+  digest = sha256_file(file_path)
+  # `label` is omitted on a versioned site: bytes are bound to a logical path
+  # later by `save`, not now. `digest` is the type-conflict hint slice B added.
+  data, err = media_upload(slug, file_path, content_type,
+                           { filename: File.basename(file_path), digest: digest }, token: token)
+  if err
+    return { path: file_path, status: 'failed', code: err[:code], error: err[:error],
+             http_status: err[:status], body: err[:body] }.compact
+  end
+
+  { path: file_path, digest: data['digest'] || digest, url: data['url'],
+    media_type: data['media_type'] || data['content_type'], byte_size: data['byte_size'] || data['bytes'],
+    status: data['status'] }
+end
+
+# Dir.glob rather than `find` (which walks huge trees and hangs): '**/*' skips
+# dotfiles and never descends into a dot directory, which is the same set
+# `rg --files` lists for a tree with no .gitignore.
+def walk_tree(dir)
+  Dir.glob('**/*', base: dir)
+     .reject { |rel| rel.split('/').any? { |segment| segment.start_with?('.') } }
+     .select { |rel| File.file?(File.join(dir, rel)) }
+     .sort
+end
+
+def push_entries(dir, prefix)
+  walk_tree(dir).map do |rel|
+    absolute = File.join(dir, rel)
+    # A tree that already contains assets/ is not prefixed twice.
+    key = rel.start_with?(prefix) ? rel : "#{prefix}#{rel}"
+    { 'file' => absolute, 'key' => key, 'digest' => sha256_file(absolute),
+      'media_type' => UPLOAD_CONTENT_TYPES[File.extname(rel).downcase], 'byte_size' => File.size(absolute) }
+  end
+end
+
+def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:)
+  return failure("no such directory: #{dir}", code: 'NO_DIR') unless File.directory?(dir)
+
+  entries = push_entries(dir, prefix)
+  return failure("no files under #{dir} (dotfiles are skipped)", code: 'EMPTY_TREE') if entries.empty?
+
+  unsupported = entries.reject { |e| e['media_type'] }
+  if unsupported.any?
+    return failure("unsupported extension(s) in #{dir} -- accepts #{UPLOAD_CONTENT_TYPES.keys.join(' ')}",
+                   code: 'BAD_TYPE', body: { 'files' => unsupported.map { |e| e['file'] } })
+  end
+
+  changes = entries.map { |e| { 'op' => 'put', 'kind' => 'asset', 'key' => e['key'], 'digest' => e['digest'] } }
+  if dry_run
+    return success('site' => slug, 'branch' => branch, 'dry_run' => true, 'prefix' => prefix,
+                   'files' => entries.size, 'changes' => changes)
+  end
+
+  expected, err = resolve_expected(slug, branch, expected)
+  return fail_with(err) if err
+
+  token = token_for(slug)
+  return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+
+  # Identical bytes anywhere in the tree are one upload; the API is content
+  # addressed, so two logical paths can share one digest.
+  by_digest = entries.group_by { |e| e['digest'] }
+  results = upload_files(slug, by_digest.values.map { |group| group.first['file'] }, token: token)
+
+  failed = results.reject { |r| r[:status] == 'ready' }
+  if failed.any?
+    failed.each { |r| emit(r) }
+    return failure("#{failed.size} of #{results.size} upload(s) failed; nothing was saved", code: 'UPLOAD_FAILED')
+  end
+
+  mismatched = results.reject { |r| by_digest.key?(r[:digest]) }
+  if mismatched.any?
+    return failure("the server returned a digest that does not match the local bytes", code: 'DIGEST_MISMATCH',
+                   body: { 'files' => mismatched.map { |r| r[:path] } })
+  end
+
+  tool_call(slug, 'save', { 'branch' => branch, 'expected' => expected,
+                            'idempotency_key' => SecureRandom.uuid,
+                            'message' => "push #{File.basename(dir)} (#{entries.size} assets)",
+                            'changes' => changes }, token: token)
+end
+
+PREVIEW_POLL_INTERVAL = 2
+PREVIEW_TERMINAL = %w[ready invalid failed].freeze
+
+# Polls describe_site until the branch's preview build settles. "unavailable"
+# is slice A's honest placeholder for a server with no build pipeline yet, so
+# it is an error rather than something to wait out.
+def cmd_wait_preview(slug, branch, timeout)
+  deadline = Time.now + timeout
+
+  loop do
+    data, err = api_call(slug, 'describe_site', { 'branch' => branch })
+    return fail_with(err) if err
+    remember_expected(slug, data)
+
+    entry = Array(data['branches']).find { |b| b.is_a?(Hash) && b['name'] == branch } || {}
+    status = entry['preview_status'] || data['preview_status']
+    payload = { 'site' => slug, 'branch' => branch, 'preview_status' => status,
+                'preview_url' => entry['preview_url'] || data['preview_url'],
+                'diagnostics' => entry['diagnostics'] || data['diagnostics'] || [],
+                'review' => entry['review'] }
+
+    return success(payload) if status == 'ready'
+    if %w[invalid failed].include?(status)
+      return failure("preview #{status} for #{slug}/#{branch}", code: status.upcase, body: payload)
+    end
+    if status.nil? || status == 'unavailable'
+      return failure("this server reports preview_status #{status.inspect} for #{slug}/#{branch} -- previews arrive with slice D",
+                     code: 'PREVIEW_UNAVAILABLE', body: payload)
+    end
+    if Time.now >= deadline
+      return failure("preview still #{status} for #{slug}/#{branch} after #{timeout}s", code: 'PREVIEW_TIMEOUT', body: payload)
+    end
+
+    sleep PREVIEW_POLL_INTERVAL
+  end
+end
+
+# -----------------------------------------------------------------------------
+# check: load a URL in agent-browser and report what broke
+# -----------------------------------------------------------------------------
+
+AGENT_BROWSER = ENV.fetch('SITES_CLI_BROWSER', 'agent-browser')
+
+def agent_browser(session, *args)
+  out, err, status = Open3.capture3(AGENT_BROWSER, '--session', session, *args, '--json')
+  parsed = begin
+    JSON.parse(out.lines.find { |l| l.start_with?('{') } || out)
+  rescue JSON::ParserError
+    nil
+  end
+
+  if parsed.nil?
+    return [nil, api_error("#{AGENT_BROWSER} #{args.first} produced no JSON (exit #{status.exitstatus}): #{err.strip.empty? ? out.strip : err.strip}",
+                           code: 'BROWSER_ERROR')]
+  end
+  return [nil, api_error("#{AGENT_BROWSER} #{args.first} failed: #{parsed['error']}", code: 'BROWSER_ERROR')] unless parsed['success']
+
+  [parsed['data'] || {}, nil]
+rescue Errno::ENOENT
+  [nil, api_error("#{AGENT_BROWSER} is not on PATH -- see ~/notes/web-browsing.md", code: 'NO_BROWSER')]
+end
+
+# agent-browser reports console messages (`console`) and uncaught page errors
+# (`errors`) separately; both are console errors as far as a page check is
+# concerned, so they are merged into one list.
+def collect_console_errors(console, errors)
+  messages = Array(console['messages']).select { |m| m.is_a?(Hash) && m['type'] == 'error' }.map { |m| m['text'].to_s }
+  messages + Array(errors['errors']).map { |e| e.is_a?(Hash) ? e['text'].to_s : e.to_s }
+end
+
+def collect_failed_requests(requests, ignore)
+  Array(requests['requests']).filter_map do |r|
+    next unless r.is_a?(Hash)
+    status = r['status']
+    failed = status.nil? || status.to_i >= 400
+    next unless failed
+    next if ignore.any? { |needle| r['url'].to_s.include?(needle) }
+    { 'url' => r['url'], 'status' => status, 'error' => r['errorText'] || r['failure'] }.compact
+  end
+end
+
+def cmd_check(url, width:, height:, screenshot:, ignore:)
+  session = "sites-cli-#{SecureRandom.hex(4)}"
+  result = nil
+
+  begin
+    _blank, err = agent_browser(session, 'open')
+    return fail_with(err) if err
+
+    agent_browser(session, 'set', 'viewport', width.to_s, height.to_s)
+
+    nav, err = agent_browser(session, 'open', url)
+    return fail_with(err) if err
+
+    # Best effort: a page that never goes idle still gets checked on whatever
+    # it managed to load, rather than failing the whole command.
+    agent_browser(session, 'wait', '--load', 'networkidle')
+
+    console, = agent_browser(session, 'console')
+    errors, = agent_browser(session, 'errors')
+    requests, = agent_browser(session, 'network', 'requests')
+
+    if screenshot
+      FileUtils.mkdir_p(File.dirname(File.expand_path(screenshot)))
+      agent_browser(session, 'screenshot', screenshot)
+    end
+
+    final_url = nav['url'] || url
+    document = Array(requests&.dig('requests')).select { |r| r.is_a?(Hash) && r['url'] == final_url }.last
+    result = {
+      'status' => document && document['status'],
+      'console_errors' => collect_console_errors(console || {}, errors || {}),
+      'failed_requests' => collect_failed_requests(requests || {}, ignore),
+      'title' => nav['title'],
+      'url' => final_url
+    }
+    result['screenshot'] = File.expand_path(screenshot) if screenshot
+  ensure
+    # Every orphan agent-browser session is a full Chrome that lives until
+    # reboot (~/notes/web-browsing.md), so this closes even on an early return.
+    agent_browser(session, 'close')
+  end
+
+  return 1 unless result
+  emit(result)
+  ok = result['console_errors'].empty? && result['failed_requests'].empty? &&
+       (result['status'].nil? || result['status'].to_i < 400)
+  ok ? 0 : 1
+end
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+
+def opt(argv, flag)
+  i = argv.index(flag)
+  return nil unless i
+  argv.delete_at(i)
+  argv.delete_at(i)
+end
+
+def opt_all(argv, flag)
+  values = []
+  while (value = opt(argv, flag))
+    values << value
+  end
+  values
+end
+
+def flag?(argv, flag)
+  i = argv.index(flag)
+  return false unless i
+  argv.delete_at(i)
+  true
+end
+
+def unknown_flags(argv, command)
+  leftover = argv.select { |a| a.start_with?('--') }
+  return nil if leftover.empty?
+  api_error("unknown option(s) for #{command}: #{leftover.join(' ')}", code: 'USAGE')
+end
+
+# --json FILE (or --json - for stdin) supplies the whole arguments object for
+# a tool; explicit flags override individual keys on top of it.
+def json_arguments(argv)
+  source = opt(argv, '--json')
+  return [{}, nil] unless source
+
+  raw = if source == '-'
+          $stdin.read
+        elsif File.file?(source)
+          File.read(source)
+        end
+  return [nil, api_error("no such file: #{source}", code: 'NO_FILE')] unless raw
+
+  parsed = JSON.parse(raw)
+  return [nil, api_error('--json must contain a JSON object', code: 'BAD_JSON')] unless parsed.is_a?(Hash)
+  [parsed, nil]
+rescue JSON::ParserError => e
+  [nil, api_error("--json is not valid JSON: #{e.message}", code: 'BAD_JSON')]
+end
+
+def json_file(source, what)
+  raw = if source == '-'
+          $stdin.read
+        elsif File.file?(source)
+          File.read(source)
+        end
+  return [nil, api_error("no such file: #{source}", code: 'NO_FILE')] unless raw
+  [JSON.parse(raw), nil]
+rescue JSON::ParserError => e
+  [nil, api_error("#{what} is not valid JSON: #{e.message}", code: 'BAD_JSON')]
+end
+
+def split_list(values)
+  values.flat_map { |v| v.to_s.split(',') }.map(&:strip).reject(&:empty?)
 end
 
 # -----------------------------------------------------------------------------
@@ -493,19 +946,55 @@ end
 
 def usage
   puts <<~USAGE
-    sites-cli — GXB tenant site management
+    sites-cli #{VERSION} — GXB tenant site management
 
-    Site folder commands (runner-based, staff-only):
+    Runner commands (staff credentials, not a site token):
       sites-cli list [--prod]              List tenant sites
       sites-cli show SLUG [--prod]         Show a tenant site
       sites-cli open SLUG [--prod]         Print URL; with --prod, open it
       sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]
                                             Staff-only: create an empty site
 
-    Text file tools (HTTP, via a site token in #{TOKENS_PATH}):
-      sites-cli describe_site SLUG [PATH]           alias: describe
+    Versioned sites (plan 30) -- each posts the same-named MCP tool to
+    POST /api/v1/tools and prints the raw {ok, data} envelope:
+      sites-cli describe SLUG [--branch B]
+      sites-cli read SLUG KIND [KEY] [--branch B] [--fields metadata,body]
+                               [--lines 1,40] [--at SNAPSHOT]
+      sites-cli save SLUG --changes FILE|- [--branch B] [--expected TOKEN]
+                          [--message M] [--idempotency-key K]
+      sites-cli create-branch SLUG NAME [--from live|BRANCH]
+      sites-cli diff SLUG [--branch B] [--against live|BRANCH]
+      sites-cli publish SLUG --review TOKEN [--idempotency-key K]
+      sites-cli publish SLUG --expected TOKEN --keys page:/about,asset:assets/x.js
+      sites-cli merge-live SLUG [--branch B] --expected TOKEN --expected-live ID
+      sites-cli resolve-merge SLUG --proposal TOKEN --resolutions FILE
+      sites-cli history SLUG [--branch B] [--limit N]
+      sites-cli revoke-preview SLUG URL_OR_TOKEN
+      sites-cli wait-preview SLUG [--branch B] [--timeout 120]
+      sites-cli list-sites [SLUG]
+      sites-cli create-site SLUG --name NAME     (see note below)
+
+      sites-cli upload SLUG FILE [FILE...]       4 at a time; one JSON line each
+      sites-cli push SLUG DIR [--branch B] [--prefix assets/] [--dry-run]
+      sites-cli check URL [--width 1440] [--screenshot PATH] [--ignore SUBSTR]
+
+    Every tool subcommand also takes --json FILE (or --json -) to supply the
+    whole arguments object; explicit flags override individual keys.
+
+    --expected defaults to the branch head token this CLI last saw for that
+    slug+branch (#{STATE_PATH}), written after every describe/read/save/
+    create-branch/diff/merge-live response. A 409 branch_changed is never
+    retried and never updates that cache -- rerun describe and look at it.
+    --idempotency-key defaults to a fresh UUID.
+
+    create-site posts the platform create_site tool, but /api/v1/tools only
+    authenticates site-bound tokens, so it always answers 403 there. Use the
+    runner command `sites-cli create SLUG --name NAME` instead.
+
+    Legacy file-API sites (plan 24):
+      sites-cli describe_site SLUG [PATH]           alias: describe SLUG PATH
       sites-cli list_files SLUG [--prefix P]        alias: list SLUG
-      sites-cli read_file SLUG PATH [--view live]   alias: read
+      sites-cli read_file SLUG PATH [--view live]
       sites-cli write_file SLUG PATH --content C --expected-version V
                                                      alias: write
       sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg [--expected-version V]
@@ -520,37 +1009,176 @@ def usage
       sites-cli publish SLUG PATH --expected-version V
 
     read_file caches {slug, path, version} in #{STATE_PATH}, so
-    write/edit/publish can omit --expected-version right after a read. A
-    write never preceded by a read still fails, and a 409 is never silently
-    retried -- rerun read_file/describe_site and look at it before retrying.
+    write/edit/publish can omit --expected-version right after a read.
 
     Environment:
-      SITES_ROOT            Path to sites Rails app (default: ~/projects/sites)
+      SITES_ROOT             Path to sites Rails app (default: ~/projects/sites)
       SITES_CLI_HOST         Site-token gateway host (default: https://sites.gxb.vc)
       SITES_CLI_CONFIG_DIR   Token/state directory (default: ~/.config/sites-cli)
+      SITES_CLI_TOKEN        Bearer for the platform tools (list-sites, create-site)
+      SITES_CLI_BROWSER      agent-browser binary for `check`
 
     Examples:
       sites-cli create metrolocksmith --name "Metro Locksmith"
-      sites-cli describe_site acme
-      sites-cli read_file acme about.md
-      sites-cli write_file acme about.md --content "$(cat about.md)"
-      sites-cli write_file acme assets/hero.jpg --file ./hero.jpg
-      sites-cli publish acme about.md
+      sites-cli upload onyx public/assets/onyx-core-motion.js
+      sites-cli push onyx ./public --dry-run
+      sites-cli save onyx --changes changes.json
+      sites-cli wait-preview onyx
+      sites-cli check https://xxxxxxxxxxxxxx-onyx.gxbsites.com --screenshot onyx.png
+      sites-cli publish onyx --review "$REVIEW"
   USAGE
   0
 end
 
-def opt(argv, flag)
-  i = argv.index(flag)
-  return nil unless i
-  argv.delete_at(i)
-  argv.delete_at(i)
+# Versioned tools whose arguments are all flags, so one table drives them.
+def run_v2(command, argv)
+  slug = argv.shift
+  return failure("#{command} requires SLUG", code: 'USAGE') unless slug
+
+  base, err = json_arguments(argv)
+  return fail_with(err) if err
+
+  case command
+  when 'read'
+    branch = opt(argv, '--branch')
+    fields = opt_all(argv, '--fields')
+    lines = opt(argv, '--lines')
+    at = opt(argv, '--at')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    kind = argv.shift || base['kind']
+    key = argv.shift || base['key']
+    return failure('read requires SLUG KIND [KEY]', code: 'USAGE') unless kind
+
+    args = base.merge('kind' => kind)
+    args['key'] = key if key
+    args['branch'] = branch if branch
+    args['fields'] = split_list(fields) if fields.any?
+    if lines
+      parsed = split_list([lines])
+      return failure('--lines takes two integers, e.g. --lines 1,40', code: 'USAGE') unless parsed.size == 2 && parsed.all? { |n| n.match?(/\A\d+\z/) }
+      args['lines'] = parsed.map(&:to_i)
+    end
+    args['at'] = at if at
+    tool_call(slug, 'read', args)
+
+  when 'save'
+    branch = opt(argv, '--branch') || base['branch'] || DEFAULT_BRANCH
+    expected_flag = opt(argv, '--expected') || base['expected']
+    idempotency = opt(argv, '--idempotency-key') || base['idempotency_key'] || SecureRandom.uuid
+    message = opt(argv, '--message') || base['message']
+    changes_file = opt(argv, '--changes')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    changes = base['changes']
+    if changes_file
+      loaded, err = json_file(changes_file, '--changes')
+      return fail_with(err) if err
+      changes = loaded.is_a?(Hash) ? loaded['changes'] : loaded
+    end
+    return failure('save requires --changes FILE|- (a JSON array of change objects)', code: 'USAGE') unless changes.is_a?(Array)
+
+    expected, err = resolve_expected(slug, branch, expected_flag)
+    return fail_with(err) if err
+
+    args = base.merge('branch' => branch, 'expected' => expected,
+                      'idempotency_key' => idempotency, 'changes' => changes)
+    args['message'] = message if message
+    tool_call(slug, 'save', args)
+
+  when 'create-branch'
+    from = opt(argv, '--from') || base['from']
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    name = argv.shift || base['name']
+    return failure('create-branch requires SLUG NAME', code: 'USAGE') unless name
+
+    args = base.merge('name' => name)
+    args['from'] = from if from
+    tool_call(slug, 'create_branch', args)
+
+  when 'diff'
+    branch = opt(argv, '--branch')
+    against = opt(argv, '--against')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    args = base.dup
+    args['branch'] = branch if branch
+    args['against'] = against if against
+    tool_call(slug, 'diff', args)
+
+  when 'merge-live'
+    branch = opt(argv, '--branch') || base['branch'] || DEFAULT_BRANCH
+    expected_flag = opt(argv, '--expected') || base['expected']
+    expected_live = opt(argv, '--expected-live') || base['expected_live']
+    idempotency = opt(argv, '--idempotency-key') || base['idempotency_key'] || SecureRandom.uuid
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return failure('merge-live requires --expected-live ID (describe_site.live.publication, or "absent")', code: 'USAGE') unless expected_live
+
+    expected, err = resolve_expected(slug, branch, expected_flag)
+    return fail_with(err) if err
+
+    tool_call(slug, 'merge_live', base.merge('branch' => branch, 'expected' => expected,
+                                             'expected_live' => expected_live, 'idempotency_key' => idempotency))
+
+  when 'resolve-merge'
+    proposal = opt(argv, '--proposal') || base['merge_proposal']
+    resolutions_file = opt(argv, '--resolutions')
+    idempotency = opt(argv, '--idempotency-key') || base['idempotency_key'] || SecureRandom.uuid
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return failure('resolve-merge requires --proposal TOKEN', code: 'USAGE') unless proposal
+
+    resolutions = base['resolutions']
+    if resolutions_file
+      loaded, err = json_file(resolutions_file, '--resolutions')
+      return fail_with(err) if err
+      resolutions = loaded.is_a?(Hash) ? loaded['resolutions'] : loaded
+    end
+    return failure('resolve-merge requires --resolutions FILE|- (a JSON array)', code: 'USAGE') unless resolutions.is_a?(Array)
+
+    tool_call(slug, 'resolve_merge', base.merge('merge_proposal' => proposal, 'resolutions' => resolutions,
+                                                'idempotency_key' => idempotency))
+
+  when 'history'
+    branch = opt(argv, '--branch')
+    limit = opt(argv, '--limit')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    args = base.dup
+    args['branch'] = branch if branch
+    args['limit'] = limit.to_i if limit
+    tool_call(slug, 'history', args)
+
+  when 'revoke-preview'
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    target = argv.shift || base['preview_url'] || base['token']
+    return failure('revoke-preview requires SLUG URL_OR_TOKEN', code: 'USAGE') unless target
+
+    args = base.merge(target.include?('://') ? { 'preview_url' => target } : { 'token' => target })
+    tool_call(slug, 'revoke_preview', args)
+
+  when 'wait-preview'
+    branch = opt(argv, '--branch') || base['branch'] || DEFAULT_BRANCH
+    timeout = (opt(argv, '--timeout') || 120).to_i
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    cmd_wait_preview(slug, branch, timeout)
+  end
 end
 
 def run(argv)
   command = argv.shift
   case command
   when '-h', '--help', 'help', nil then return usage
+  when '-v', '--version' then return success(version: VERSION)
 
   # -- runner-based site folder commands --
   when 'list'
@@ -573,19 +1201,32 @@ def run(argv)
     return failure("create requires SLUG", code: 'USAGE') unless slug
     return cmd_create(slug, name, team, prod: prod)
 
-  # -- text file tools (HTTP) --
+  # -- describe_site is one tool on both contracts: the server answers in the
+  #    legacy shape for a legacy site and the v2 shape for a versioned one, so
+  #    one subcommand takes both the legacy PATH and the v2 --branch. --
   when 'describe_site', 'describe'
     slug = argv.shift
     return failure("#{command} requires SLUG", code: 'USAGE') unless slug
-    return cmd_describe_site(slug, argv.shift)
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    branch = opt(argv, '--branch')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    path = argv.shift
+    args = base.dup
+    args['path'] = path if path
+    args['branch'] = branch if branch
+    return cmd_describe_site(slug, args)
+
+  # -- legacy file tools (HTTP) --
   when 'list_files'
     slug = argv.shift
     return failure("list_files requires SLUG", code: 'USAGE') unless slug
     return cmd_list_files(slug, opt(argv, '--prefix'))
-  when 'read_file', 'read'
+  when 'read_file'
     slug = argv.shift
     path = argv.shift
-    return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
+    return failure("read_file requires SLUG PATH", code: 'USAGE') unless slug && path
     return cmd_read_file(slug, path, view: opt(argv, '--view') || 'current')
   when 'write_file', 'write'
     slug = argv.shift
@@ -603,13 +1244,106 @@ def run(argv)
     return failure("#{command} requires SLUG PATH", code: 'USAGE') unless slug && path
     edits_file = opt(argv, '--edits-file')
     return failure("#{command} requires --edits-file", code: 'USAGE') unless edits_file
-    edits = JSON.parse(File.read(edits_file))
+    edits, err = json_file(edits_file, '--edits-file')
+    return fail_with(err) if err
     return cmd_edit_file(slug, path, edits, opt(argv, '--expected-version'))
+
+  # -- publish is one tool on both contracts too: a PATH is the legacy form,
+  #    --review / --keys is the versioned one (plan 30 section 5.2). --
   when 'publish'
     slug = argv.shift
+    return failure("publish requires SLUG", code: 'USAGE') unless slug
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    review = opt(argv, '--review') || base['review']
+    keys = split_list(opt_all(argv, '--keys'))
+    keys = Array(base['keys']) if keys.empty? && base['keys']
+    branch = opt(argv, '--branch') || base['branch']
+    expected_flag = opt(argv, '--expected') || base['expected']
+    idempotency = opt(argv, '--idempotency-key') || base['idempotency_key']
+    expected_version = opt(argv, '--expected-version')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
     path = argv.shift
-    return failure("publish requires SLUG PATH", code: 'USAGE') unless slug && path
-    return cmd_publish(slug, path, opt(argv, '--expected-version'))
+
+    if review
+      args = base.merge('review' => review, 'idempotency_key' => idempotency || SecureRandom.uuid)
+      return tool_call(slug, 'publish', args)
+    end
+    if keys.any? || expected_flag
+      expected, err = resolve_expected(slug, branch || DEFAULT_BRANCH, expected_flag)
+      return fail_with(err) if err
+      args = base.merge('expected' => expected, 'idempotency_key' => idempotency || SecureRandom.uuid)
+      args['keys'] = keys if keys.any?
+      args['branch'] = branch if branch
+      return tool_call(slug, 'publish', args)
+    end
+    return failure("publish requires PATH (legacy), --review TOKEN, or --expected TOKEN --keys ...", code: 'USAGE') unless path
+    return cmd_publish_legacy(slug, path, expected_version)
+
+  # -- versioned tools --
+  when 'read', 'save', 'create-branch', 'diff', 'merge-live', 'resolve-merge',
+       'history', 'revoke-preview', 'wait-preview'
+    return run_v2(command, argv)
+
+  when 'list-sites'
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    slug = argv.shift
+    token = slug ? token_for(slug) : platform_token
+    unless token
+      return failure("list-sites needs a token: pass a SLUG configured in #{TOKENS_PATH}, or set SITES_CLI_TOKEN",
+                     code: 'NO_TOKEN')
+    end
+    return tool_call(slug || '_platform', 'list_sites', base, token: token)
+
+  when 'create-site'
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    name = opt(argv, '--name') || base['name']
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    slug = argv.shift || base['slug']
+    return failure("create-site requires SLUG --name NAME", code: 'USAGE') unless slug && name
+    token = platform_token
+    unless token
+      return failure("create-site needs a non-site-bound bearer in SITES_CLI_TOKEN. /api/v1/tools only authenticates site tokens, which always get 403 here -- use `sites-cli create #{slug} --name #{name.inspect}` instead",
+                     code: 'NO_TOKEN')
+    end
+    return tool_call(slug, 'create_site', base.merge('slug' => slug, 'name' => name), token: token)
+
+  when 'upload'
+    slug = argv.shift
+    return failure("upload requires SLUG FILE [FILE...]", code: 'USAGE') unless slug
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return cmd_upload(slug, argv)
+
+  when 'push'
+    slug = argv.shift
+    branch = opt(argv, '--branch') || DEFAULT_BRANCH
+    prefix = opt(argv, '--prefix') || 'assets/'
+    expected = opt(argv, '--expected')
+    dry_run = flag?(argv, '--dry-run')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    dir = argv.shift
+    return failure("push requires SLUG DIR", code: 'USAGE') unless slug && dir
+    return cmd_push(slug, dir, branch: branch, prefix: prefix, expected: expected, dry_run: dry_run)
+
+  when 'check'
+    width = (opt(argv, '--width') || 1440).to_i
+    height = (opt(argv, '--height') || 900).to_i
+    screenshot = opt(argv, '--screenshot')
+    ignore = split_list(opt_all(argv, '--ignore'))
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    url = argv.shift
+    return failure("check requires URL", code: 'USAGE') unless url
+    return cmd_check(url, width: width, height: height, screenshot: screenshot, ignore: ignore)
+
   else
     return failure("Unknown command: #{command}", code: 'USAGE')
   end
