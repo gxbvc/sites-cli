@@ -10,9 +10,9 @@
 #   2. Legacy file tools (describe_site/list_files/read_file/write_file/
 #      edit_file/publish) -- HTTP to the site-token gateway, for sites still on
 #      the file API (plans/24-agent-sites.md).
-#   3. v2 tools (describe/read/save/create-branch/diff/publish/merge-live/
-#      resolve-merge/history/revoke-preview, plus the upload/push/wait-preview/
-#      check helpers) -- the same HTTP gateway, for versioned sites
+#   3. v2 tools (describe/read/save/create-branch/archive-branch/diff/publish/
+#      merge-live/resolve-merge/history/revoke-preview, plus the upload/push/
+#      wait-preview/check helpers) -- the same HTTP gateway, for versioned sites
 #      (plans/30-agent-first-sites.md). Each subcommand posts the same-named
 #      MCP tool; the shell is the transport, not a second contract.
 #
@@ -287,23 +287,48 @@ def cached_version(slug, path) = load_json(STATE_PATH)[state_key(slug, path)]
 # never collide with a legacy "slug/path" key in the same flat file.
 def expected_key(slug, branch) = "expected:#{slug}:#{branch}"
 
+# A review is not a CAS token and is never defaulted into a request. It lives
+# under its own key so `publish --review last` has to name it, which keeps
+# spending a stale review a deliberate act rather than something the CLI does
+# on an agent's behalf.
+def review_key(slug, branch) = "last_review:#{slug}:#{branch}"
+
 def cached_expected(slug, branch) = load_json(STATE_PATH)[expected_key(slug, branch)]
+
+def cached_review(slug, branch) = load_json(STATE_PATH)[review_key(slug, branch)]
+
+def forget_review(slug, branch)
+  state = load_json(STATE_PATH)
+  return unless state.delete(review_key(slug, branch))
+  save_json(STATE_PATH, state)
+end
 
 # Called only with a 2xx body. A 409 branch_changed also carries the current
 # `expected`, and deliberately does NOT come through here: learning the new
 # token from the conflict is how a "never retried" conflict turns into a
 # silent overwrite on the very next command.
-def remember_expected(slug, data)
+#
+# `data['name']` is the site's display name on describe_site, so only
+# `data['branch']` names a branch at the top level; inside `branches[]` it is
+# `name`. An explicit `"review": null` (a save whose build is not ready yet)
+# drops the remembered review instead of leaving `--review last` pointed at a
+# candidate that no longer describes this branch.
+def remember_branch_state(slug, data)
   return unless data.is_a?(Hash)
 
-  pairs = []
-  pairs << [data['branch'], data['expected']]
-  Array(data['branches']).each { |b| pairs << [b['name'], b['expected']] if b.is_a?(Hash) }
-  pairs.reject! { |name, expected| name.to_s.empty? || expected.to_s.empty? }
-  return if pairs.empty?
+  entries = [[data['branch'], data]]
+  Array(data['branches']).each { |b| entries << [b['name'], b] if b.is_a?(Hash) }
+
+  updates = {}
+  entries.each do |name, entry|
+    next if name.to_s.empty?
+    updates[expected_key(slug, name)] = entry['expected'] unless entry['expected'].to_s.empty?
+    updates[review_key(slug, name)] = entry['review'].to_s.empty? ? nil : entry['review'] if entry.key?('review')
+  end
+  return if updates.empty?
 
   state = load_json(STATE_PATH)
-  pairs.each { |name, expected| state[expected_key(slug, name)] = expected }
+  updates.each { |key, value| value.nil? ? state.delete(key) : state[key] = value }
   save_json(STATE_PATH, state)
 end
 
@@ -355,10 +380,14 @@ end
 
 # Every v2 subcommand is the same three steps: post the same-named tool,
 # remember whatever branch head token the response carries, print {ok, data}.
-def tool_call(slug, tool, arguments, token: nil)
+#
+# `remember: false` is for `read --at`: a historical read answers with the
+# snapshot token it read under the same `branch`/`expected` keys, so caching it
+# would hand the next `save` a token for a snapshot nobody is on.
+def tool_call(slug, tool, arguments, token: nil, remember: true)
   data, err = api_call(slug, tool, arguments, token: token)
   return fail_with(err) if err
-  remember_expected(slug, data)
+  remember_branch_state(slug, data) if remember
   success(data)
 end
 
@@ -371,7 +400,7 @@ end
 def cmd_describe_site(slug, arguments)
   data, err = api_call(slug, 'describe_site', arguments)
   return fail_with(err) if err
-  remember_expected(slug, data)
+  remember_branch_state(slug, data)
   success(data)
 end
 
@@ -406,6 +435,58 @@ def cmd_edit_file(slug, path, edits, expected_version)
   return fail_with(err) if err
   remember_version(slug, path, data['version'])
   success(data)
+end
+
+# -----------------------------------------------------------------------------
+# publish, the versioned form (plan 30 section 5.2). Two calls, not one:
+# `--expected --keys` proposes a candidate and answers published:false, and the
+# `--review` it hands back is the only thing that moves live.
+# -----------------------------------------------------------------------------
+
+def remember_review(slug, branch, review)
+  return if review.to_s.empty?
+  state = load_json(STATE_PATH)
+  state[review_key(slug, branch)] = review
+  save_json(STATE_PATH, state)
+end
+
+def cmd_publish_review(slug, review, branch, base, idempotency)
+  if review == 'last'
+    review = cached_review(slug, branch)
+    unless review
+      return failure("no review remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` " \
+                     "and pass branches[].review, or take the review a save or a `publish --keys` returned",
+                     code: 'NO_REVIEW')
+    end
+  end
+
+  data, err = api_call(slug, 'publish', base.merge('review' => review,
+                                                   'idempotency_key' => idempotency || SecureRandom.uuid))
+  return fail_with(err) if err
+  # A spent review is not a review any more -- publishing with it again is a
+  # 409 upstream_changed. Only the branch this token was actually remembered
+  # for is cleared, so an explicit token for another branch changes nothing.
+  forget_review(slug, branch) if data['published'] && cached_review(slug, branch) == review
+  remember_branch_state(slug, data)
+  success(data)
+end
+
+def cmd_publish_keys(slug, branch, args)
+  data, err = api_call(slug, 'publish', args)
+  return fail_with(err) if err
+  remember_branch_state(slug, data)
+  code = success(data)
+  return code unless data['published'] == false
+
+  # A proposal is a real 200 and the CLI did exactly what it was asked, so this
+  # exits 0 -- but published:false is never "shipped", and the second call is
+  # the one that flips live.
+  remember_review(slug, branch, data['review'])
+  included = Array(data['included']).size
+  left = Array(data['left_on_branch']).size
+  $stderr.puts("published: false -- live is unchanged. #{included} key(s) in the candidate, #{left} left on #{branch}.")
+  $stderr.puts("next: preview it, then `sites-cli publish #{slug} --review last` (or --review \"<token>\") to flip live.")
+  code
 end
 
 def cmd_publish_legacy(slug, path, expected_version)
@@ -695,6 +776,28 @@ def push_entries(dir, prefix)
   end
 end
 
+# One `read {kind: "asset", keys: [...]}` round trip answers "which of these
+# logical paths are already bound, and to what", so a re-push of a tree that
+# barely moved uploads only what changed (slice E). The batch form is bounded
+# to READ_KEYS_LIMIT keys per call. A server that predates it answers 404
+# (unknown tool) or 422; both mean "ask for nothing", and the digest hint on
+# the upload itself still short-circuits known bytes server-side (slice D), so
+# the fallback costs a round trip per file rather than a wrong answer.
+READ_KEYS_LIMIT = 1000
+
+def bound_digests(slug, branch, keys, token:)
+  bound = {}
+  head = nil
+  keys.each_slice(READ_KEYS_LIMIT) do |slice|
+    data, err = api_call(slug, 'read', { 'kind' => 'asset', 'keys' => slice, 'branch' => branch }, token: token)
+    return [nil, nil, err] if err
+    remember_branch_state(slug, data)
+    bound.merge!(data['digests'] || {})
+    head = data['expected'] if data['expected']
+  end
+  [bound, head, nil]
+end
+
 def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:)
   return failure("no such directory: #{dir}", code: 'NO_DIR') unless File.directory?(dir)
 
@@ -713,15 +816,36 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:)
                    'files' => entries.size, 'changes' => changes)
   end
 
+  given_expected = expected
   expected, err = resolve_expected(slug, branch, expected)
   return fail_with(err) if err
 
   token = token_for(slug)
   return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
 
+  bound, head, read_err = bound_digests(slug, branch, entries.map { |e| e['key'] }, token: token)
+  if read_err
+    # Only "this server has no batch asset read" is survivable. A 401, a 403 or
+    # the 409 a legacy site answers is the same wall the save would hit anyway.
+    return fail_with(read_err) unless [404, 422].include?(read_err[:status])
+    bound = {}
+  end
+  # The read just looked at the branch head, so it is the freshest CAS token
+  # there is -- unless the caller named one, which always wins.
+  expected = head if head && given_expected.nil?
+
+  unchanged, changed = entries.partition { |e| bound[e['key']] == e['digest'] }
+  changes = changed.map { |e| { 'op' => 'put', 'kind' => 'asset', 'key' => e['key'], 'digest' => e['digest'] } }
+  $stderr.puts("push: #{unchanged.size} of #{entries.size} file(s) already bound at the same digest") if unchanged.any?
+
+  if changes.empty?
+    return success('site' => slug, 'branch' => branch, 'expected' => expected, 'prefix' => prefix,
+                   'files' => entries.size, 'unchanged' => unchanged.size, 'saved' => false, 'changes' => [])
+  end
+
   # Identical bytes anywhere in the tree are one upload; the API is content
   # addressed, so two logical paths can share one digest.
-  by_digest = entries.group_by { |e| e['digest'] }
+  by_digest = changed.group_by { |e| e['digest'] }
   results = upload_files(slug, by_digest.values.map { |group| group.first['file'] }, token: token)
 
   failed = results.reject { |r| r[:status] == 'ready' }
@@ -738,23 +862,40 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:)
 
   tool_call(slug, 'save', { 'branch' => branch, 'expected' => expected,
                             'idempotency_key' => SecureRandom.uuid,
-                            'message' => "push #{File.basename(dir)} (#{entries.size} assets)",
+                            'message' => "push #{File.basename(dir)} (#{changes.size} assets)",
                             'changes' => changes }, token: token)
 end
 
 PREVIEW_POLL_INTERVAL = 2
-PREVIEW_TERMINAL = %w[ready invalid failed].freeze
+# The six build states plus the two that say there is no hostname and none is
+# coming (slice D, Mcp::ToolRegistry::V2_CONVENTIONS). Only queued/building are
+# worth waiting on; everything else settles this command one way or the other.
+PREVIEW_PENDING = %w[queued building].freeze
+PREVIEW_FAILED = %w[invalid failed].freeze
 
-# Polls describe_site until the branch's preview build settles. "unavailable"
-# is slice A's honest placeholder for a server with no build pipeline yet, so
-# it is an error rather than something to wait out.
+# Neither of these is a build that will finish. `revoked` means every grant on
+# this snapshot was withdrawn (save again for a new one); `unavailable` means
+# the snapshot predates builds entirely.
+PREVIEW_NO_HOSTNAME = {
+  'revoked' => 'every preview of this snapshot was withdrawn; save again to mint a new hostname',
+  'unavailable' => 'this snapshot predates builds, so it has no preview hostname'
+}.freeze
+
+# `ready` and `provisioning` are both "the build is done and it is good". They
+# differ only in whether the wildcard certificate is installed on the host yet,
+# which is a platform state no amount of polling changes -- so provisioning is
+# terminal and successful, and says why the URL will not open.
+PROVISIONING_NOTE = 'the build is ready, but the preview hostname cannot be opened until the ' \
+                    '*.gxbsites.com wildcard certificate is installed on the host'
+
+# Polls describe_site until the branch's preview build settles.
 def cmd_wait_preview(slug, branch, timeout)
   deadline = Time.now + timeout
 
   loop do
     data, err = api_call(slug, 'describe_site', { 'branch' => branch })
     return fail_with(err) if err
-    remember_expected(slug, data)
+    remember_branch_state(slug, data)
 
     entry = Array(data['branches']).find { |b| b.is_a?(Hash) && b['name'] == branch } || {}
     status = entry['preview_status'] || data['preview_status']
@@ -764,12 +905,17 @@ def cmd_wait_preview(slug, branch, timeout)
                 'review' => entry['review'] }
 
     return success(payload) if status == 'ready'
-    if %w[invalid failed].include?(status)
+    return success(payload.merge('message' => PROVISIONING_NOTE)) if status == 'provisioning'
+
+    if PREVIEW_FAILED.include?(status)
       return failure("preview #{status} for #{slug}/#{branch}", code: status.upcase, body: payload)
     end
-    if status.nil? || status == 'unavailable'
-      return failure("this server reports preview_status #{status.inspect} for #{slug}/#{branch} -- previews arrive with slice D",
-                     code: 'PREVIEW_UNAVAILABLE', body: payload)
+    if (note = PREVIEW_NO_HOSTNAME[status])
+      return failure("preview #{status} for #{slug}/#{branch} -- #{note}", code: status.upcase, body: payload)
+    end
+    unless PREVIEW_PENDING.include?(status)
+      return failure("this server reports preview_status #{status.inspect} for #{slug}/#{branch}",
+                     code: status.nil? ? 'PREVIEW_MISSING' : 'PREVIEW_UNKNOWN', body: payload)
     end
     if Time.now >= deadline
       return failure("preview still #{status} for #{slug}/#{branch} after #{timeout}s", code: 'PREVIEW_TIMEOUT', body: payload)
@@ -960,11 +1106,14 @@ def usage
       sites-cli describe SLUG [--branch B]
       sites-cli read SLUG KIND [KEY] [--branch B] [--fields metadata,body]
                                [--lines 1,40] [--at SNAPSHOT]
+      sites-cli read SLUG asset --keys assets/a.js,assets/b.css
+                                            batch: {key => digest} for the bound ones
       sites-cli save SLUG --changes FILE|- [--branch B] [--expected TOKEN]
                           [--message M] [--idempotency-key K]
       sites-cli create-branch SLUG NAME [--from live|BRANCH]
+      sites-cli archive-branch SLUG NAME
       sites-cli diff SLUG [--branch B] [--against live|BRANCH]
-      sites-cli publish SLUG --review TOKEN [--idempotency-key K]
+      sites-cli publish SLUG --review TOKEN|last [--idempotency-key K]
       sites-cli publish SLUG --expected TOKEN --keys page:/about,asset:assets/x.js
       sites-cli merge-live SLUG [--branch B] --expected TOKEN --expected-live ID
       sites-cli resolve-merge SLUG --proposal TOKEN --resolutions FILE
@@ -976,6 +1125,9 @@ def usage
 
       sites-cli upload SLUG FILE [FILE...]       4 at a time; one JSON line each
       sites-cli push SLUG DIR [--branch B] [--prefix assets/] [--dry-run]
+                                                 one batch read to skip files already
+                                                 bound at the same digest, then upload
+                                                 + one save with the rest
       sites-cli check URL [--width 1440] [--screenshot PATH] [--ignore SUBSTR]
 
     Every tool subcommand also takes --json FILE (or --json -) to supply the
@@ -986,6 +1138,14 @@ def usage
     create-branch/diff/merge-live response. A 409 branch_changed is never
     retried and never updates that cache -- rerun describe and look at it.
     --idempotency-key defaults to a fresh UUID.
+
+    --review never defaults. The last review printed for a slug+branch is
+    remembered separately, and `--review last` is the only thing that spends
+    it, so publishing a stale candidate is always a deliberate act.
+
+    publish --expected --keys proposes a candidate and answers published:false.
+    That is a 200 and exit 0, and live is untouched: the second call,
+    `publish --review`, is the one that flips it.
 
     create-site posts the platform create_site tool, but /api/v1/tools only
     authenticates site-bound tokens, so it always answers 403 there. Use the
@@ -1025,7 +1185,7 @@ def usage
       sites-cli save onyx --changes changes.json
       sites-cli wait-preview onyx
       sites-cli check https://xxxxxxxxxxxxxx-onyx.gxbsites.com --screenshot onyx.png
-      sites-cli publish onyx --review "$REVIEW"
+      sites-cli publish onyx --review last
   USAGE
   0
 end
@@ -1044,15 +1204,25 @@ def run_v2(command, argv)
     fields = opt_all(argv, '--fields')
     lines = opt(argv, '--lines')
     at = opt(argv, '--at')
+    keys = split_list(opt_all(argv, '--keys'))
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
 
     kind = argv.shift || base['kind']
     key = argv.shift || base['key']
+    keys = Array(base['keys']) if keys.empty? && base['keys']
     return failure('read requires SLUG KIND [KEY]', code: 'USAGE') unless kind
+    # The batch form is asset-only and answers {key => digest} for the ones
+    # that are bound, which is how `push` skips files that have not changed.
+    return failure('--keys reads many assets at once, so it only takes kind "asset"', code: 'USAGE') if keys.any? && kind != 'asset'
 
     args = base.merge('kind' => kind)
-    args['key'] = key if key
+    if keys.any?
+      args['keys'] = keys
+      args.delete('key')
+    elsif key
+      args['key'] = key
+    end
     args['branch'] = branch if branch
     args['fields'] = split_list(fields) if fields.any?
     if lines
@@ -1061,7 +1231,10 @@ def run_v2(command, argv)
       args['lines'] = parsed.map(&:to_i)
     end
     args['at'] = at if at
-    tool_call(slug, 'read', args)
+    # A historical read reports the snapshot it read as `expected`, under the
+    # branch it resolved -- remembering that would hand the next save a token
+    # for a snapshot the branch is not on.
+    tool_call(slug, 'read', args, remember: args['at'].nil?)
 
   when 'save'
     branch = opt(argv, '--branch') || base['branch'] || DEFAULT_BRANCH
@@ -1099,6 +1272,16 @@ def run_v2(command, argv)
     args = base.merge('name' => name)
     args['from'] = from if from
     tool_call(slug, 'create_branch', args)
+
+  # Takes a branch out of service. Nothing is deleted and no asset URL stops
+  # working; it stops counting against the site's quota (slice E).
+  when 'archive-branch'
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    name = argv.shift || base['name']
+    return failure('archive-branch requires SLUG NAME', code: 'USAGE') unless name
+    tool_call(slug, 'archive_branch', base.merge('name' => name))
 
   when 'diff'
     branch = opt(argv, '--branch')
@@ -1267,8 +1450,7 @@ def run(argv)
     path = argv.shift
 
     if review
-      args = base.merge('review' => review, 'idempotency_key' => idempotency || SecureRandom.uuid)
-      return tool_call(slug, 'publish', args)
+      return cmd_publish_review(slug, review, branch || DEFAULT_BRANCH, base, idempotency)
     end
     if keys.any? || expected_flag
       expected, err = resolve_expected(slug, branch || DEFAULT_BRANCH, expected_flag)
@@ -1276,14 +1458,14 @@ def run(argv)
       args = base.merge('expected' => expected, 'idempotency_key' => idempotency || SecureRandom.uuid)
       args['keys'] = keys if keys.any?
       args['branch'] = branch if branch
-      return tool_call(slug, 'publish', args)
+      return cmd_publish_keys(slug, branch || DEFAULT_BRANCH, args)
     end
     return failure("publish requires PATH (legacy), --review TOKEN, or --expected TOKEN --keys ...", code: 'USAGE') unless path
     return cmd_publish_legacy(slug, path, expected_version)
 
   # -- versioned tools --
-  when 'read', 'save', 'create-branch', 'diff', 'merge-live', 'resolve-merge',
-       'history', 'revoke-preview', 'wait-preview'
+  when 'read', 'save', 'create-branch', 'archive-branch', 'diff', 'merge-live',
+       'resolve-merge', 'history', 'revoke-preview', 'wait-preview'
     return run_v2(command, argv)
 
   when 'list-sites'

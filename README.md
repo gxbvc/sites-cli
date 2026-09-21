@@ -16,11 +16,11 @@ sites-cli open SLUG --prod              # print + open the URL
 
 # versioned sites, once the site has a token in ~/.config/sites-cli/tokens.json
 sites-cli describe onyx                 # capabilities, live, branches, pending
-sites-cli push onyx ./public            # upload a tree + one save binding it
+sites-cli push onyx ./public            # skip unchanged, upload the rest, one save
 sites-cli save onyx --changes changes.json
-sites-cli wait-preview onyx             # exits 1 on invalid/failed
+sites-cli wait-preview onyx             # 1 on invalid/failed/revoked
 sites-cli check https://<token>-onyx.gxbsites.com --screenshot onyx.png
-sites-cli publish onyx --review "$REVIEW"
+sites-cli publish onyx --review last     # or --review "$REVIEW"
 
 # legacy file-API sites
 sites-cli read_file SLUG about.md
@@ -32,25 +32,41 @@ Every tool subcommand prints the raw `{ok, data}` envelope, or
 `{ok:false, error, code, status, body}` with the server's full structured body
 on a non-2xx. Exit code is 0 or 1.
 
-## The two ergonomics that matter
+## The three ergonomics that matter
 
 - `--expected` (the branch-head CAS token) defaults to the last one this CLI
   saw for that slug+branch, written to `~/.config/sites-cli/state.json` after
   every successful `describe`/`read`/`save`/`create-branch`/`diff`/`merge-live`.
   `--idempotency-key` defaults to a fresh UUID.
-- **A 409 `branch_changed` is never retried and never updates that cache.**
-  It prints the structured body and exits 1. Rerun `describe`, look at what
-  moved, then save again.
+- **A 409 `branch_changed` is never retried and never updates that cache**, and
+  neither does a `read --at` (a historical read answers with the snapshot token
+  it read, not a head). A 409 prints the structured body and exits 1. Rerun
+  `describe`, look at what moved, then save again.
+- **`--review` never defaults.** The last review printed for a slug+branch is
+  remembered separately and only `--review last` spends it, so publishing a
+  stale candidate is always deliberate.
 
-## Pending server support
+## publish is two calls
 
-`publish --review` / `--keys`, `merge-live`, `resolve-merge`, `history`,
-`revoke-preview`, and a real `preview_status` for `wait-preview` are built to
-the slice D and E specs and are not on the server yet. The CLI prints whatever
-the server actually says (`unknown tool`, or
-`preview_status: "unavailable"`) rather than pretending. `describe`, `read`,
-`save`, `create-branch`, `diff`, `upload`, `push`, `check` and `list-sites`
-work today.
+`publish SLUG --keys page:/about` proposes a candidate: live plus those keys
+plus the assets they reach. It answers a 200 carrying `published: false` and
+its own `review` and `preview_url`. Live is untouched. That is exit 0 -- the
+request succeeded -- but it is never "shipped": the second call,
+`publish SLUG --review last`, is the one that flips live. The CLI says so on
+stderr every time it sees `published: false`.
+
+## What the server has
+
+Slice D (builds, preview hostnames, real `preview_status`, `revoke_preview`) is
+deployed. Slice E (`publish` both forms, `merge-live`, `resolve-merge`,
+`history`, `read --at`, the batch asset `read`, `archive-branch`) is on `main`
+and deploys after review; until then a production server answers `unknown tool`
+for those names and the CLI prints that verbatim.
+
+The `*.gxbsites.com` wildcard certificate is not installed yet, so a finished
+build reports `preview_status: "provisioning"` and its hostname cannot complete
+a TLS handshake. `wait-preview` treats that as terminal and successful, and
+says so, rather than spinning out the timeout.
 
 `create-site` posts the platform `create_site` tool, but `/api/v1/tools` only
 authenticates site-bound tokens and the server answers those 403

@@ -49,8 +49,10 @@ uploaded = {}                                  # request path => bytes received
 
 # -- versioned (plan 30) stub state -----------------------------------------
 branch_heads = { 'draft' => 'snap_head0', 'live' => 'snap_live0' }
+bound_assets = {}                              # "branch:key" => digest bound on that branch
 publications = 0
 preview_queue = []                             # statuses wait-preview walks through
+fail_batch_read = false                        # a test arms this to play a pre-slice-E server
 authorized = {}                                # upload id => the authorize payload
 upload_seq = 0
 put_mutex = Mutex.new
@@ -132,20 +134,46 @@ server.mount_proc('/') do |req, res|
         },
         pending: { branch: args['branch'] || 'draft', against: 'live', keys: 1, truncated: false })
     when 'read'
-      head = branch_heads[args['branch'] || 'draft']
+      branch = args['branch'] || 'draft'
+      # A historical read answers with the snapshot it read, not a branch head
+      # CAS token (slice E). The batch asset form answers {key => digest} for
+      # the bound ones and simply omits the rest.
+      expected = args['at'] || branch_heads[branch]
+      if args['kind'] == 'asset' && args['keys']
+        if fail_batch_read
+          res.status = 404
+          res.body = JSON.generate(error: 'not_found', message: 'unknown tool argument: keys')
+        else
+          digests = args['keys'].to_h { |k| [ k, bound_assets["#{branch}:#{k}"] ] }.compact
+          res.status = 200
+          res.body = JSON.generate(kind: 'asset', branch: branch, expected: expected,
+            digests: digests, keys: args['keys'].size)
+        end
+      else
+        res.status = 200
+        res.body = JSON.generate(kind: args['kind'], key: args['key'], branch: branch,
+          at: args['at'], expected: expected, digest: 'a' * 64, format: 'html',
+          metadata: { 'title' => 'Home' }, body: '<p>one</p>')
+      end
+    when 'archive_branch'
       res.status = 200
-      res.body = JSON.generate(kind: args['kind'], key: args['key'], branch: args['branch'] || 'draft',
-        expected: head, digest: 'a' * 64, format: 'html', metadata: { 'title' => 'Home' }, body: '<p>one</p>')
+      res.body = JSON.generate(site: 'onyx', branch: args['name'], archived: true,
+        archived_at: '2026-09-21T04:20:00Z', expected: branch_heads[args['name']] || 'snap_head0')
     when 'save'
       branch = args['branch'] || 'draft'
       current = branch_heads[branch]
       if args['expected'] == current
         branch_heads[branch] = next_head(current)
+        Array(args['changes']).each do |c|
+          bound_assets["#{branch}:#{c['key']}"] = c['digest'] if c['kind'] == 'asset' && c['op'] == 'put'
+        end
         res.status = 200
+        # A fresh snapshot has no ready build yet, so `review` is an explicit
+        # null (slice D's save payload), which must drop any remembered one.
         res.body = JSON.generate(site: 'onyx', branch: branch, expected: branch_heads[branch],
           snapshot_created: true, changed_keys: Array(args['changes']).map { |c| "#{c['kind']}:#{c['key']}" },
           preview_status: 'queued', preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com',
-          review: "rev_#{branch_heads[branch]}")
+          review: nil)
       else
         res.status = 409
         res.body = JSON.generate(error: 'branch_changed', path: nil, version: nil,
@@ -172,8 +200,10 @@ server.mount_proc('/') do |req, res|
         res.body = JSON.generate(published: true, publication: publications,
           live_url: 'https://onyx.gxbsites.com', cache_convergence_seconds: 60)
       elsif args['keys']
+        branch = args['branch'] || 'draft'
         res.status = 200
-        res.body = JSON.generate(published: false, review: 'rev_subset',
+        res.body = JSON.generate(published: false, review: 'rev_subset', site: 'onyx',
+          branch: branch, expected: branch_heads[branch],
           preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com', preview_status: 'queued',
           included: args['keys'], left_on_branch: [ 'page:/' ])
       elsif args['path']
@@ -533,9 +563,33 @@ check('read posts the v2 read tool with kind, key, fields, lines, at and branch'
     "got #{last_args['read'].inspect}")
 end
 
+check('a historical read never becomes the remembered branch head') do
+  run_cli('describe', 'onyx')
+  head = state['expected:onyx:draft']
+  run_cli('read', 'onyx', 'page', '/about', '--at', 'snap_ancient')
+  assert(state['expected:onyx:draft'] == head,
+    "a read --at overwrote the branch head with #{state['expected:onyx:draft'].inspect}")
+end
+
 check('read of config takes no key') do
   run_cli('read', 'onyx', 'config')
   assert(last_args['read'] == { 'kind' => 'config' }, "got #{last_args['read'].inspect}")
+end
+
+check('read --keys posts the batch asset form and answers key => digest') do
+  out, _err, code = run_cli('read', 'onyx', 'asset', '--keys', 'assets/a.js,assets/b.css')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'asset', 'keys' => %w[assets/a.js assets/b.css] },
+    "got #{last_args['read'].inspect}")
+  assert(JSON.parse(out).dig('data', 'digests').is_a?(Hash), "expected a digests map, got #{out}")
+end
+
+check('read --keys with a non-asset kind is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('read', 'onyx', 'page', '--keys', '/about')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a batch read of pages reached the server')
 end
 
 check('--json - supplies the whole arguments object from stdin') do
@@ -625,6 +679,21 @@ check('create-branch posts create_branch and remembers the new branch head') do
   assert(state['expected:onyx:seo'] == branch_heads['seo'], 'expected the seo head remembered')
 end
 
+check('archive-branch posts archive_branch with just the name') do
+  out, _err, code = run_cli('archive-branch', 'onyx', 'seo')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['archive_branch'] == { 'name' => 'seo' }, "got #{last_args['archive_branch'].inspect}")
+  assert(JSON.parse(out).dig('data', 'archived') == true, "expected the raw envelope, got #{out}")
+end
+
+check('archive-branch with no NAME fails locally with no request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('archive-branch', 'onyx')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'an incomplete archive-branch reached the server')
+end
+
 check('diff posts diff with branch and against') do
   run_cli('diff', 'onyx', '--branch', 'seo', '--against', 'draft')
   assert(last_args['diff'] == { 'branch' => 'seo', 'against' => 'draft' }, "got #{last_args['diff'].inspect}")
@@ -639,12 +708,50 @@ check('publish --review posts the review token with a fresh idempotency key') do
 end
 
 check('publish --keys defaults --expected to the remembered head and never treats published:false as success') do
-  out, _err, code = run_cli('publish', 'onyx', '--keys', 'page:/about,asset:assets/x.js')
+  out, err, code = run_cli('publish', 'onyx', '--keys', 'page:/about,asset:assets/x.js')
   assert(code == 0, "a 200 {published:false} is still a 200, got #{code}: #{out}")
   assert(last_args['publish']['keys'] == [ 'page:/about', 'asset:assets/x.js' ], "got #{last_args['publish'].inspect}")
   assert(last_args['publish']['expected'] == branch_heads['draft'], 'expected the remembered draft head')
   assert(JSON.parse(out).dig('data', 'published') == false, 'expected published:false to be printed verbatim')
   assert(JSON.parse(out).dig('data', 'review') == 'rev_subset', 'expected the subset review to be printed')
+  assert(JSON.parse(out).dig('data', 'preview_url').to_s.include?('gxbsites.com'), 'expected the preview URL printed')
+  assert(err.include?('published: false'), "expected a published:false warning on stderr, got #{err.inspect}")
+  assert(err.include?('--review'), "expected the next step to name publish --review, got #{err.inspect}")
+end
+
+check('the review from a published:false is remembered under last_review, never as an expected token') do
+  assert(state['last_review:onyx:draft'] == 'rev_subset', "got #{state['last_review:onyx:draft'].inspect}")
+  assert(state['expected:onyx:draft'] == branch_heads['draft'], 'a review overwrote the branch head token')
+  assert(state.values.count('rev_subset') == 1, 'the review was cached under more than one key')
+end
+
+check('publish --review last spends the remembered review and then forgets it') do
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['publish']['review'] == 'rev_subset', "got #{last_args['publish'].inspect}")
+  assert(JSON.parse(out).dig('data', 'published') == true, 'expected published:true')
+  assert(state['last_review:onyx:draft'].nil?, 'a spent review stayed in the cache')
+end
+
+check('publish --review last with nothing remembered fails locally with no request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'NO_REVIEW', "expected NO_REVIEW, got #{out}")
+  assert(requests.values.sum == before, 'a publish with no review reached the server')
+end
+
+check('a save whose build is not ready drops the remembered review rather than leaving a stale one') do
+  Dir.mktmpdir do |dir|
+    run_cli('describe', 'onyx') # describe offers branches[].review, so one is remembered
+    assert(state['last_review:onyx:draft'], 'expected describe to remember a review')
+
+    changes = File.join(dir, 'changes.json')
+    File.write(changes, JSON.generate([ { op: 'put', kind: 'page', key: '/later', document: { format: 'html', metadata: { title: 'L' }, body: '<p>l</p>' } } ]))
+    out, _err, code = run_cli('save', 'onyx', '--changes', changes)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(state['last_review:onyx:draft'].nil?, "an explicit review:null left #{state['last_review:onyx:draft'].inspect} behind")
+  end
 end
 
 check('publish SLUG PATH still uses the legacy expected_version contract') do
@@ -702,6 +809,41 @@ check('wait-preview exits nonzero on an invalid preview and prints the diagnosti
   parsed = JSON.parse(out)
   assert(parsed['code'] == 'INVALID', "expected code INVALID, got #{parsed['code'].inspect}")
   assert(parsed.dig('body', 'preview_status') == 'invalid', "expected the final payload in the body, got #{out}")
+end
+
+check('wait-preview treats provisioning as terminal success and says why the URL will not open') do
+  preview_queue.replace(%w[queued provisioning])
+  before = requests["#{TOKEN_ONYX} describe_site"]
+  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  assert(code == 0, "expected exit 0 on provisioning, got #{code}: #{out}")
+  parsed = JSON.parse(out)
+  assert(parsed.dig('data', 'preview_status') == 'provisioning', "got #{out}")
+  assert(parsed.dig('data', 'message').to_s.include?('wildcard certificate'),
+    "expected the message to name the wildcard certificate, got #{parsed.dig('data', 'message').inspect}")
+  assert(requests["#{TOKEN_ONYX} describe_site"] == before + 2, 'provisioning must stop the poll, not spin the timeout')
+end
+
+check('wait-preview treats revoked as terminal failure') do
+  preview_queue.replace(%w[revoked])
+  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  assert(code == 1, "expected exit 1 on a revoked preview, got #{code}: #{out}")
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'REVOKED', "expected code REVOKED, got #{parsed['code'].inspect}")
+  assert(parsed['error'].include?('save again'), "expected the recovery named, got #{parsed['error'].inspect}")
+end
+
+check('wait-preview treats unavailable as terminal failure') do
+  preview_queue.replace(%w[unavailable])
+  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  assert(code == 1, "expected exit 1 on an unavailable preview, got #{code}: #{out}")
+  assert(JSON.parse(out)['code'] == 'UNAVAILABLE', "expected code UNAVAILABLE, got #{out}")
+end
+
+check('wait-preview treats a missing preview_status as an error, not something to wait out') do
+  preview_queue.replace([ nil ])
+  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  assert(code == 1, "expected exit 1 when the key is absent, got #{code}: #{out}")
+  assert(JSON.parse(out)['code'] == 'PREVIEW_MISSING', "expected PREVIEW_MISSING, got #{out}")
 end
 
 check('list-sites posts the platform list_sites tool with that slug\'s token') do
@@ -892,6 +1034,53 @@ check('push uploads each distinct digest once and emits exactly one save with ev
     assert(last_args['save']['expected'] == head, 'expected push to use the remembered branch head')
     assert(JSON.parse(out).dig('data', 'snapshot_created') == true, 'expected the save response to be printed')
   end
+end
+
+check('push skips files already bound at the same digest and saves only what changed') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'one.js'), 'const one = 1')
+    File.write(File.join(dir, 'two.js'), 'const two = 2')
+    run_cli('describe', 'onyx')
+
+    out, _err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected the first push to succeed, got: #{out}")
+    assert(last_args['save']['changes'].size == 2, "got #{last_args['save']['changes'].inspect}")
+    assert(last_args['read'] == { 'kind' => 'asset', 'keys' => %w[assets/one.js assets/two.js], 'branch' => 'draft' },
+      "expected push to ask the batch read first, got #{last_args['read'].inspect}")
+
+    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+    before_save = requests["#{TOKEN_ONYX} save"]
+    out, err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected exit 0 on an unchanged tree, got #{code}: #{out}")
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize, 'an unchanged file was uploaded again')
+    assert(requests["#{TOKEN_ONYX} save"] == before_save, 'an unchanged tree still emitted a save')
+    assert(JSON.parse(out).dig('data', 'saved') == false, "got #{out}")
+    assert(JSON.parse(out).dig('data', 'unchanged') == 2, "got #{out}")
+    assert(err.include?('already bound'), "expected a skip note on stderr, got #{err.inspect}")
+
+    File.write(File.join(dir, 'two.js'), 'const two = 22')
+    out, _err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize + 1, 'expected exactly one upload for one changed file')
+    keys = last_args['save']['changes'].map { |c| c['key'] }
+    assert(keys == %w[assets/two.js], "got #{keys.inspect}")
+  end
+end
+
+check('push falls back to uploading everything when the server has no batch asset read') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'solo.js'), 'const solo = 1')
+    run_cli('describe', 'onyx')
+    fail_batch_read = true
+    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+
+    out, _err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected the push to survive a server with no batch read, got #{code}: #{out}")
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize + 1, 'expected the file to be uploaded anyway')
+    assert(last_args['save']['changes'].map { |c| c['key'] } == %w[assets/solo.js], "got #{last_args['save'].inspect}")
+  end
+ensure
+  fail_batch_read = false
 end
 
 check('push uploads nothing to save when an upload fails') do
