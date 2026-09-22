@@ -77,6 +77,7 @@ known_digests = {}                             # digest => {media_type, byte_siz
 authorize_bodies = []                          # every label-less authorize payload, in order
 weird_authorize = nil                          # a test arms this to answer a shape nothing expects
 multipart_named = nil                          # a test arms this to force the multipart transport
+verify_domain_succeeds = false                 # a test flips this to make DNS resolve
 multipart_upa = nil                            # the upload id that took it
 BIG_PART_SIZE = 12
 BIG_PARTS_COUNT = 3
@@ -195,7 +196,31 @@ server.mount_proc('/') do |req, res|
       # CAS token (slice E). The batch asset form answers {key => digest} for
       # the bound ones and simply omits the rest.
       expected = args['at'] || heads[branch]
-      if args['kind'] == 'asset' && args['keys']
+      if args['kind'] == 'schema'
+        # The schema is a resource, generated from the same tables the
+        # validator uses (contract brief item 1).
+        res.status = 200
+        res.body = JSON.generate(
+          config: { type: 'object', additionalProperties: false,
+                    required: %w[name],
+                    properties: {
+                      name: { type: 'string', description: 'the site name; the <title> suffix' },
+                      description: { type: 'string', description: 'WebSite.description' },
+                      title_template: { type: 'string', description: 'takes {title} and {site}' },
+                      tailwind: { type: 'boolean', description: 'ship the Tailwind runtime' },
+                      stylesheets: { type: 'array', items: { type: 'string' }, description: 'asset keys' },
+                      business: { type: 'object', additionalProperties: false,
+                                  properties: { name: { type: 'string' }, phone: { type: 'string' },
+                                                geo: { type: 'object', additionalProperties: false,
+                                                       properties: { latitude: { type: 'string' },
+                                                                     longitude: { type: 'string' } } } } },
+                      robots: { type: 'object', additionalProperties: false,
+                                properties: { content_signal: { type: 'string' } } }
+                    } },
+          page: { type: 'object', properties: { format: { type: 'string', enum: %w[html markdown] } } },
+          collection: { type: 'object' }, redirect: { type: 'object' },
+          changes: { type: 'array', items: { type: 'object' } })
+      elsif args['kind'] == 'asset' && args['keys']
         if fail_batch_read
           res.status = 404
           res.body = JSON.generate(error: 'not_found', message: 'unknown tool argument: keys')
@@ -307,6 +332,34 @@ server.mount_proc('/') do |req, res|
         res.body = JSON.generate(error: 'capability_denied', capability: 'read_submissions',
           site: 'acme', message: 'list_submissions needs the read_submissions capability; this token carries read, draft')
       end
+    # -- domains (domains brief item 1) --------------------------------------
+    when 'list_domains', 'connect_domain', 'verify_domain', 'disconnect_domain'
+      host = args['host']
+      verified = tool == 'verify_domain' ? verify_domain_succeeds : (host.to_s.end_with?('.gxbsites.com') || tool == 'list_domains')
+      body = {
+        canonical_url: 'https://onyx.gxbsites.com',
+        live_prepared_for: 'onyx.gxbsites.com',
+        domains: [
+          { host: 'onyx.gxbsites.com', primary: tool != 'connect_domain', hosted: true, verified: true,
+            verified_at: '2026-09-01T00:00:00Z', dns_mode: 'hosted', instruction: 'nothing to do' },
+          ({ host: host, primary: args['primary'] != false, hosted: false, verified: verified,
+             verified_at: verified ? '2026-09-22T00:00:00Z' : nil, dns_mode: 'external',
+             instruction: "point #{host} at sites.gxb.vc with a CNAME",
+             verification: { record: 'TXT', name: "_gxbsites-verify.#{host}",
+                             value: 'gxbsites-verify=0123456789abcdef0123456789abcdef' } } if host)
+        ].compact
+      }
+      body[:next] = 'publish the TXT record, then call verify_domain' if tool == 'connect_domain'
+      if tool == 'verify_domain'
+        body[:verified] = verified
+        body[:checked] = verified ? [] : [ { lookup: "TXT _gxbsites-verify.#{host}", answer: 'NXDOMAIN' } ]
+      end
+      body[:removed] = host if tool == 'disconnect_domain'
+      res.status = 200
+      res.body = JSON.generate(body)
+    when 'delete_submission'
+      res.status = 200
+      res.body = JSON.generate(site: 'onyx', id: args['id'], deleted: true)
     when 'get_analytics'
       res.status = 200
       res.body = JSON.generate(site: 'onyx', period: args['period'] || '7d', visitors: 12, pageviews: 30)
@@ -354,6 +407,13 @@ server.mount_proc('/') do |req, res|
           tools: %w[create_site list_sites])
       end
     end
+
+  in [ 'GET', '/api/v1/tools' ]
+    requests["#{token} tools:index"] += 1
+    media_sites << req.query['site'] if token.start_with?('sk_user_')
+    res.status = 200
+    res.body = JSON.generate(site: req.query['site'] || 'onyx',
+      tools: %w[describe_site read save publish list_domains connect_domain].map { |name| { name: name } })
 
   in [ 'GET', '/api/v1/platform/tools' ]
     requests["#{token} platform:index"] += 1
@@ -1248,6 +1308,148 @@ check('an unknown flag is refused before any request is made') do
   assert(code == 1, 'expected a nonzero exit')
   assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
   assert(requests.values.sum == before, 'a typo reached the server')
+end
+
+# -- domains: the only thing that sets a site's public URL ---------------------
+
+check('list-domains posts list_domains and reports the canonical URL the shell bakes in') do
+  out, _err, code = run_cli('list-domains', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['list_domains'] == {}, "got #{last_args['list_domains'].inspect}")
+  data = JSON.parse(out)['data']
+  assert(data['canonical_url'] == 'https://onyx.gxbsites.com', "got #{data.inspect}")
+  assert(data['domains'].first['hosted'] == true, "got #{data['domains'].inspect}")
+end
+
+check('connect-domain posts host and primary, and prints the DNS record as one copyable line') do
+  out, err, code = run_cli('connect-domain', 'onyx', 'andysibley.com')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['connect_domain'] == { 'host' => 'andysibley.com', 'primary' => true },
+    "got #{last_args['connect_domain'].inspect}")
+  assert(err.include?('TXT _gxbsites-verify.andysibley.com "gxbsites-verify=0123456789abcdef0123456789abcdef"'),
+    "expected one copyable record line, got #{err.inspect}")
+  assert(err.include?('verify-domain'), "expected the next call named, got #{err.inspect}")
+end
+
+check('connect-domain --no-primary says so in the request') do
+  run_cli('connect-domain', 'onyx', 'old.example.com', '--no-primary')
+  assert(last_args['connect_domain'] == { 'host' => 'old.example.com', 'primary' => false },
+    "got #{last_args['connect_domain'].inspect}")
+end
+
+check('a failed verify-domain is a 200 and exit 0, and says what was looked up') do
+  out, err, code = run_cli('verify-domain', 'onyx', 'andysibley.com')
+  assert(code == 0, "a DNS record that is not published yet is not a failed request, got #{code}: #{out}")
+  assert(last_args['verify_domain'] == { 'host' => 'andysibley.com' }, "got #{last_args['verify_domain'].inspect}")
+  assert(JSON.parse(out).dig('data', 'verified') == false, "got #{out}")
+  assert(err.include?('NXDOMAIN'), "expected what was looked up on stderr, got #{err.inspect}")
+end
+
+check('verify-domain says nothing extra once the record resolves') do
+  verify_domain_succeeds = true
+  out, err, code = run_cli('verify-domain', 'onyx', 'andysibley.com')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(JSON.parse(out).dig('data', 'verified') == true, "got #{out}")
+  assert(!err.include?('not verified yet'), "got #{err.inspect}")
+ensure
+  verify_domain_succeeds = false
+end
+
+check('disconnect-domain posts the host') do
+  out, _err, code = run_cli('disconnect-domain', 'onyx', 'old.example.com')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['disconnect_domain'] == { 'host' => 'old.example.com' },
+    "got #{last_args['disconnect_domain'].inspect}")
+end
+
+# -- delete-submission, schema, validate-config, tools -------------------------
+
+check('delete-submission posts an integer id and refuses anything else locally') do
+  out, _err, code = run_cli('delete-submission', 'onyx', '4')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['delete_submission'] == { 'id' => 4 }, "got #{last_args['delete_submission'].inspect}")
+
+  before = requests.values.sum
+  out, _err, code = run_cli('delete-submission', 'onyx', 'four')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a non-integer id reached the server')
+end
+
+check('schema reads the whole schema, or one part of it by name') do
+  out, _err, code = run_cli('schema', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'schema' }, "got #{last_args['read'].inspect}")
+  assert(JSON.parse(out)['data'].keys.sort == %w[changes collection config page redirect], "got #{out}")
+
+  out, _err, code = run_cli('schema', 'onyx', 'config')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  data = JSON.parse(out)['data']
+  assert(data['properties'].key?('title_template'), "got #{data['properties'].keys.inspect}")
+  assert(data['properties']['title_template']['description'].include?('{title}'),
+    'expected the description to name the placeholders')
+end
+
+check('an unknown schema part is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('schema', 'onyx', 'business')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a typo reached the server')
+end
+
+# pc_dcfc5ce3, pc_4ae6078d, pc_c568e54a: five sequential 422s to learn one
+# document. This says all of it in one pass, before any write.
+check('validate-config names every unknown key, bad type and missing required key in one pass') do
+  Dir.mktmpdir do |dir|
+    file = File.join(dir, 'config.json')
+    File.write(file, JSON.generate(canonical: 'https://x.test', tailwind: 'yes',
+                                   business: { name: 'Andy', website: 'x' }))
+    before_save = requests["#{TOKEN_ONYX} save"]
+
+    out, err, code = run_cli('validate-config', file, '--site', 'onyx')
+    assert(code == 1, "expected a nonzero exit, got #{code}: #{out}")
+    errors = JSON.parse(out).dig('body', 'errors')
+    assert(errors.any? { |e| e.include?('unknown key(s) canonical') }, "got #{errors.inspect}")
+    assert(errors.any? { |e| e.include?('Allowed here:') && e.include?('title_template') },
+      "expected the allowed set named, got #{errors.inspect}")
+    assert(errors.any? { |e| e.include?('config.tailwind must be boolean') }, "got #{errors.inspect}")
+    assert(errors.any? { |e| e.include?('config.business has unknown key(s) website') }, "got #{errors.inspect}")
+    assert(errors.any? { |e| e.include?('config.name is required') }, "got #{errors.inspect}")
+    assert(err.include?('unknown key(s) canonical'), "expected the list on stderr too, got #{err.inspect}")
+    assert(requests["#{TOKEN_ONYX} save"] == before_save, 'validate-config wrote something')
+  end
+end
+
+check('validate-config passes a document the schema accepts') do
+  Dir.mktmpdir do |dir|
+    file = File.join(dir, 'config.json')
+    File.write(file, JSON.generate(name: 'Onyx', tailwind: false, stylesheets: [ 'assets/x.css' ],
+                                   business: { name: 'Onyx', geo: { latitude: '32.7', longitude: '-96.8' } }))
+    out, _err, code = run_cli('validate-config', file, '--site', 'onyx')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(JSON.parse(out).dig('data', 'valid') == true, "got #{out}")
+  end
+end
+
+check('validate-config with no --site is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('validate-config', '/tmp/nope.json')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a missing --site reached the server')
+end
+
+check('tools asks the server for this site\'s own tool index') do
+  out, _err, code = run_cli('tools', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(requests["#{TOKEN_ONYX} tools:index"] == 1, 'expected a GET at the site tools endpoint')
+  names = JSON.parse(out).dig('data', 'tools').map { |t| t['name'] }
+  assert(names.include?('list_domains'), "got #{names.inspect}")
+end
+
+check('tools over a personal token names the site in the query') do
+  media_sites.clear
+  out, _err, code = run_cli('tools', 'ghost', env: PERSONAL_ENV)
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(media_sites == [ 'ghost' ], "expected the site named, got #{media_sites.inspect}")
 end
 
 # -- upload -------------------------------------------------------------------

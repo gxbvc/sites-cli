@@ -506,6 +506,179 @@ def cmd_list_submissions(slug, base, form:, since:, limit:)
 end
 
 # -----------------------------------------------------------------------------
+# Domains: the only thing that sets a site's public URL.
+#
+# Every one of the seven rebuilds hit this wall. The canonical, og:url, sitemap,
+# llms.txt and every JSON-LD @id come from the primary Domain row, `business.url`
+# looks like it sets that and does nothing, and `manage_domains` was a
+# capability with no tool behind it (pc_27dcf63a, pc_c8a7f856, pc_ebfa66f0,
+# pc_b25ed492). These four are that tool set (domains brief item 1).
+# -----------------------------------------------------------------------------
+
+# The line an owner has to publish at their registrar. It is in the response as
+# three fields; one copyable line is what a person actually pastes.
+def print_verification(data)
+  domains = Array(data['domains'])
+  domains.each do |domain|
+    next unless domain.is_a?(Hash)
+    verification = domain['verification']
+    next unless verification.is_a?(Hash) && !domain['verified']
+    $stderr.puts("connect-domain: publish this record, then `sites-cli verify-domain SLUG #{domain['host']}`:")
+    $stderr.puts("  #{verification['record']} #{verification['name']} #{verification['value'].to_s.inspect}")
+    $stderr.puts("connect-domain: #{domain['instruction']}") if domain['instruction']
+  end
+  $stderr.puts("connect-domain: next -- #{data['next']}") if data['next']
+end
+
+def cmd_connect_domain(slug, host, primary)
+  data, err = api_call(slug, 'connect_domain', { 'host' => host, 'primary' => primary })
+  return fail_with(err) if err
+  remember_branch_state(slug, data)
+  code = success(data)
+  print_verification(data)
+  code
+end
+
+def cmd_verify_domain(slug, host)
+  data, err = api_call(slug, 'verify_domain', { 'host' => host })
+  return fail_with(err) if err
+  code = success(data)
+  # A failed check is a 200 and exit 0: nothing is wrong with the request, the
+  # DNS record is not published yet, and a person has to go and publish it.
+  unless data['verified']
+    $stderr.puts("verify-domain: #{host} is not verified yet. What was looked up:")
+    Array(data['checked']).each { |line| $stderr.puts("  #{line.is_a?(Hash) ? line.to_a.map { |k, v| "#{k}=#{v}" }.join(' ') : line}") }
+    $stderr.puts('verify-domain: publish the record list-domains names, wait for DNS to propagate, then run this again.')
+  end
+  code
+end
+
+# -----------------------------------------------------------------------------
+# The schema, as a resource, and a local validator that runs it before a save.
+#
+# Learning the config document by collision cost five sequential 422s on one
+# site and three on another (pc_dcfc5ce3, pc_4ae6078d, pc_c568e54a).
+# -----------------------------------------------------------------------------
+
+SCHEMA_PARTS = %w[config page collection redirect changes].freeze
+
+def cmd_schema(slug, part)
+  data, err = api_call(slug, 'read', { 'kind' => 'schema' })
+  return fail_with(err) if err
+  return success(data) unless part
+  unless data.key?(part)
+    return failure("this server's schema has no #{part.inspect} (it has #{data.keys.join(', ')})",
+                   code: 'NO_SCHEMA_PART', body: data.keys)
+  end
+  success(data[part])
+end
+
+# A bounded JSON Schema check: types, required, unknown keys and enums, which
+# is every rejection the server's validator makes about shape. Anything subtler
+# is still the server's to say, and says it in one pass now.
+def schema_errors(document, schema, path = 'config')
+  return [] unless schema.is_a?(Hash)
+  errors = []
+
+  types = Array(schema['type'])
+  if types.any? && !types.any? { |type| json_type_matches?(document, type) }
+    return ["#{path} must be #{types.join(' or ')}, not #{json_type_name(document)}"]
+  end
+  if schema['enum'].is_a?(Array) && !schema['enum'].include?(document)
+    errors << "#{path} must be one of #{schema['enum'].map(&:inspect).join(', ')}, not #{document.inspect}"
+  end
+
+  if document.is_a?(Hash)
+    properties = schema['properties'].is_a?(Hash) ? schema['properties'] : {}
+    Array(schema['required']).each do |key|
+      errors << "#{path}.#{key} is required" unless document.key?(key)
+    end
+    if schema['additionalProperties'] == false && properties.any?
+      unknown = document.keys - properties.keys
+      unless unknown.empty?
+        errors << "#{path} has unknown key(s) #{unknown.join(', ')}. Allowed here: #{properties.keys.join(', ')}"
+      end
+    end
+    document.each do |key, value|
+      child = properties[key]
+      errors.concat(schema_errors(value, child, "#{path}.#{key}")) if child
+    end
+  elsif document.is_a?(Array) && schema['items'].is_a?(Hash)
+    document.each_with_index { |value, index| errors.concat(schema_errors(value, schema['items'], "#{path}[#{index}]")) }
+  end
+  errors
+end
+
+def json_type_matches?(value, type)
+  case type
+  when 'object' then value.is_a?(Hash)
+  when 'array' then value.is_a?(Array)
+  when 'string' then value.is_a?(String)
+  when 'integer' then value.is_a?(Integer)
+  when 'number' then value.is_a?(Numeric)
+  when 'boolean' then value == true || value == false
+  when 'null' then value.nil?
+  else true
+  end
+end
+
+def json_type_name(value)
+  case value
+  when Hash then 'an object'
+  when Array then 'an array'
+  when String then 'a string'
+  when Integer then 'an integer'
+  when Numeric then 'a number'
+  when true, false then 'a boolean'
+  when nil then 'null'
+  else value.class.name.downcase
+  end
+end
+
+def cmd_validate_config(file, slug)
+  document, err = load_object(file, file)
+  return fail_with(err) if err
+  document = document['document'] if document['document'].is_a?(Hash)
+
+  data, err = api_call(slug, 'read', { 'kind' => 'schema' })
+  if err
+    $stderr.puts('validate-config: this server has no `read {kind: schema}` yet, so there is nothing to check ' \
+                 'against. Rehearse the document instead: `sites-cli save SLUG --config FILE --dry-run`.')
+    return fail_with(err)
+  end
+  schema = data['config']
+  return failure("this server's schema carries no config schema (it has #{data.keys.join(', ')})",
+                 code: 'NO_SCHEMA_PART', body: data.keys) unless schema.is_a?(Hash)
+
+  errors = schema_errors(document, schema)
+  if errors.any?
+    errors.each { |line| $stderr.puts("validate-config: #{line}") }
+    return failure("#{file} does not match #{slug}'s config schema: #{errors.size} problem(s)",
+                   code: 'INVALID_DOCUMENT', body: { 'file' => file, 'errors' => errors })
+  end
+  success('file' => file, 'site' => slug, 'valid' => true, 'keys' => document.keys.sort)
+end
+
+# The server's own index of the tools this site has, so "what does this server
+# have" is one command rather than a paragraph in a manual that goes stale
+# (pc_d227330d, pc_6b2ffb91).
+def cmd_tools(slug)
+  credential = credential_for(slug)
+  return fail_with(no_credential_error(slug)) unless credential
+
+  path = TOOLS_PATH
+  path = "#{path}?site=#{credential.site}" if credential.site
+  uri = URI.join(API_HOST, path)
+  req = Net::HTTP::Get.new(uri)
+  req['Authorization'] = "Bearer #{credential.token}"
+  data, err = parse_api_response(http_request(req, uri))
+  return fail_with(err) if err
+  success(data)
+rescue *NETWORK_ERRORS => e
+  failure("tools request failed: #{e.class}: #{e.message}", code: 'HTTP_ERROR')
+end
+
+# -----------------------------------------------------------------------------
 # Legacy file tools: describe_site, list_files, read_file, write_file,
 # edit_file, publish (plans/24-agent-sites.md slice 3 item 18). A site token is
 # scoped to exactly one site, unlike the runner credentials above.
@@ -2820,6 +2993,79 @@ def run(argv)
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     return cmd_list_submissions(slug, base, form: form, since: since, limit: limit)
+
+  # -- domains: the public URL an agent could not set (domains brief item 1) --
+  when 'list-domains'
+    slug = argv.shift
+    return failure('list-domains requires SLUG', code: 'USAGE') unless slug
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return tool_call(slug, 'list_domains', base)
+
+  when 'connect-domain'
+    slug = argv.shift
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    primary = !flag?(argv, '--no-primary')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    host = argv.shift || base['host']
+    return failure('connect-domain requires SLUG HOST', code: 'USAGE') unless slug && host
+    return cmd_connect_domain(slug, host, primary)
+
+  when 'verify-domain', 'disconnect-domain'
+    slug = argv.shift
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    host = argv.shift || base['host']
+    return failure("#{command} requires SLUG HOST", code: 'USAGE') unless slug && host
+    return cmd_verify_domain(slug, host) if command == 'verify-domain'
+    return tool_call(slug, 'disconnect_domain', base.merge('host' => host))
+
+  # -- the inbox: a test row you did make comes back out this way --
+  when 'delete-submission'
+    slug = argv.shift
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    id = argv.shift || base['id']
+    return failure('delete-submission requires SLUG ID (the id from list-submissions)', code: 'USAGE') unless slug && id
+    unless id.to_s.match?(/\A\d+\z/)
+      return failure("delete-submission takes the integer id from list-submissions, not #{id.inspect}", code: 'USAGE')
+    end
+    return tool_call(slug, 'delete_submission', base.merge('id' => id.to_i))
+
+  # -- the config document, as a schema rather than as a guessing game --
+  when 'schema'
+    slug = argv.shift
+    return failure("schema requires SLUG [#{SCHEMA_PARTS.join('|')}]", code: 'USAGE') unless slug
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    part = argv.shift
+    if part && !SCHEMA_PARTS.include?(part)
+      return failure("schema takes one of #{SCHEMA_PARTS.join(', ')}, not #{part.inspect}", code: 'USAGE')
+    end
+    return cmd_schema(slug, part)
+
+  when 'validate-config'
+    slug = opt(argv, '--site')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    file = argv.shift
+    return failure('validate-config requires FILE --site SLUG', code: 'USAGE') unless file && slug
+    return cmd_validate_config(file, slug)
+
+  when 'tools'
+    slug = argv.shift
+    return failure('tools requires SLUG', code: 'USAGE') unless slug
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return cmd_tools(slug)
 
   when 'analytics'
     slug = argv.shift
