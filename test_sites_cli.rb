@@ -218,7 +218,14 @@ server.mount_proc('/') do |req, res|
     when 'save'
       branch = args['branch'] || 'draft'
       current = heads[branch]
-      if args['expected'] == current
+      if args['dry_run']
+        # Validates and resolves, creates no snapshot and no build (contract
+        # brief item 1), so the head it echoes is the one the branch is on.
+        res.status = 200
+        res.body = JSON.generate(site: payload['site'] || 'onyx', branch: branch, expected: current,
+          dry_run: true, snapshot_created: false, diagnostics: [],
+          would_change_keys: Array(args['changes']).map { |c| "#{c['kind']}:#{c['key']}" })
+      elsif args['expected'] == current
         heads[branch] = next_head(current)
         Array(args['changes']).each do |c|
           bound_assets["#{branch}:#{c['key']}"] = c['digest'] if c['kind'] == 'asset' && c['op'] == 'put'
@@ -1912,13 +1919,170 @@ check('fragment warns about the things that only break later: forms-1.js, an SVG
   end
 end
 
-check('fragment reports its change list on stderr and stdout stays one JSON envelope') do
+check('fragment reports what it did as notes on stderr, and stdout stays one JSON envelope') do
   with_page_file do |_dir, path|
     out, err, = run_cli('fragment', path)
     assert(out.lines.size == 1, "expected exactly one line on stdout, got #{out.lines.size}")
     assert(JSON.parse(out)['ok'] == true, 'expected the envelope')
     assert(err.include?('fragment: dropped the document shell'), "got #{err.inspect}")
-    assert(JSON.parse(out).dig('data', 'changes').size >= 8, 'expected the change list in the payload too')
+    assert(JSON.parse(out).dig('data', 'notes').size >= 8, 'expected the sentences under notes')
+  end
+end
+
+# pc_b36b3b9f: `changes` used to be English sentences, so nothing could be
+# assembled into one save. It is the ops array now.
+check('fragment --page emits the real put page change, not a sentence') do
+  with_page_file do |_dir, path|
+    out, _err, code = run_cli('fragment', path, '--page', '/about')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    changes = JSON.parse(out).dig('data', 'changes')
+    assert(changes.size == 1, "got #{changes.inspect}")
+    assert(changes[0]['op'] == 'put' && changes[0]['kind'] == 'page' && changes[0]['key'] == '/about',
+      "got #{changes[0].reject { |k, _| k == 'document' }.inspect}")
+    assert(changes[0]['document']['body'].include?('{{ asset:'), 'expected the converted body in the change')
+    assert(changes[0]['document']['metadata']['title'] == 'Onyx — A new way to build the grid.', 'expected the title')
+  end
+end
+
+check('fragment with no --page emits an empty changes array and says why') do
+  with_page_file do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    assert(JSON.parse(out).dig('data', 'changes') == [], "got #{out}")
+    assert(err.include?('--page KEY'), "expected the reason on stderr, got #{err.inspect}")
+  end
+end
+
+check('fragment --append-changes builds one changes file across many documents, saved in one call') do
+  Dir.mktmpdir do |dir|
+    changes_file = File.join(dir, 'changes.json')
+    %w[/ /about /contact].each_with_index do |route, n|
+      page = File.join(dir, "p#{n}.html")
+      File.write(page, "<!doctype html><html><head><title>Page #{n}</title></head><body><p>#{n}</p></body></html>")
+      _out, _err, code = run_cli('fragment', page, '--page', route, '--append-changes', changes_file)
+      assert(code == 0, "expected exit 0 for #{route}")
+    end
+
+    appended = JSON.parse(File.read(changes_file))
+    assert(appended.map { |c| c['key'] } == %w[/ /about /contact], "got #{appended.map { |c| c['key'] }.inspect}")
+
+    run_cli('describe', 'onyx')
+    before_save = requests["#{TOKEN_ONYX} save"]
+    out, _err, code = run_cli('save', 'onyx', '--changes', changes_file)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before_save + 1, 'expected exactly one save for three pages')
+    assert(last_args['save']['changes'].size == 3, "got #{last_args['save']['changes'].size}")
+  end
+end
+
+# -- what fragment used to drop silently ---------------------------------------
+
+ANDY_PAGE = <<~HTML
+  <!doctype html>
+  <html lang="en">
+  <head>
+    <title>Andy Sibley</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">
+    <link rel="stylesheet" href="https://cdn.example.com/other.css">
+    <script src="https://analytics.gxb.vc/tag.js"></script>
+    <script src="https://cdn.example.com/widget.js"></script>
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"Andy"}</script>
+  </head>
+  <body class="bg-sand-50 text-ink antialiased" data-theme="sand">
+    <main id="main" class="wrap">
+      <form action="/f/contact" method="post"><input name="email"></form>
+      <script type="application/ld+json">{"@type":"FAQPage","name":"Questions"}</script>
+    </main>
+  </body>
+  </html>
+HTML
+
+check('fragment names the <body> attributes it has nowhere to put') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    assert(err.include?('bg-sand-50 text-ink antialiased'), "expected the class listed, got #{err.inspect}")
+    assert(err.include?('data-theme'), "expected every body attribute listed, got #{err.inspect}")
+    assert(err.include?('--wrap-body'), "expected the way out named, got #{err.inspect}")
+    assert(!JSON.parse(out).dig('data', 'body').include?('bg-sand-50'), 'expected the body untouched without --wrap-body')
+  end
+end
+
+check('fragment --wrap-body re-wraps the fragment and warns about negative z-index children') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path, '--wrap-body')
+    body = JSON.parse(out).dig('data', 'body')
+    assert(body.start_with?('<div class="bg-sand-50 text-ink antialiased" data-theme="sand">'), "got #{body[0, 90]}")
+    assert(body.end_with?('</div>'), "got #{body[-20..].inspect}")
+    assert(err.include?('negative z-index'), "expected the wrapper caveat, got #{err.inspect}")
+  end
+end
+
+check('fragment says which <main> attributes it carried onto the div and which id it dropped') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    _out, err, = run_cli('fragment', path)
+    assert(err.include?('carrying class onto the div'), "got #{err.inspect}")
+    assert(err.include?('dropping id="main"'), "got #{err.inspect}")
+  end
+end
+
+check('fragment warns that a /f/ form with no result element shows the visitor nothing') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    _out, err, = run_cli('fragment', path)
+    assert(err.include?('/f/contact'), "expected the form named, got #{err.inspect}")
+    assert(err.include?('form-contact-result'), "expected the id form named, got #{err.inspect}")
+    assert(err.include?('data-form-result'), "expected the attribute form named, got #{err.inspect}")
+    assert(err.include?('--add-form-result'), "expected the way out named, got #{err.inspect}")
+  end
+end
+
+check('fragment --add-form-result inserts the element after the form') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path, '--add-form-result')
+    body = JSON.parse(out).dig('data', 'body')
+    assert(body.include?('</form>'), 'expected the form kept')
+    assert(body[body.index('</form>')..].include?('<p data-form-result hidden></p>'),
+      "expected the result element after the form, got #{body.inspect}")
+    assert(!err.include?('shows the visitor'), 'expected no warning once it was inserted')
+  end
+end
+
+check('fragment moves a head JSON-LD script into metadata.schema and names a body one') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    data = JSON.parse(out)['data']
+    assert(data['metadata']['schema'] == [ { '@type' => 'WebPage', 'name' => 'Andy' } ],
+      "expected the head node with no @context, got #{data['metadata']['schema'].inspect}")
+    assert(data['body'].include?('FAQPage'), 'expected the body script left alone without --lift-json-ld')
+    assert(err.include?('metadata.schema'), "expected the body script named, got #{err.inspect}")
+    assert(err.include?('--lift-json-ld'), "expected the way out named, got #{err.inspect}")
+  end
+end
+
+check('fragment --lift-json-ld moves the body node into metadata.schema too') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, _err, = run_cli('fragment', path, '--lift-json-ld')
+    data = JSON.parse(out)['data']
+    types = data['metadata']['schema'].map { |node| node['@type'] }
+    assert(types == %w[WebPage FAQPage], "got #{types.inspect}")
+    assert(!data['body'].include?('ld+json'), 'expected the body script gone')
+  end
+end
+
+check('fragment puts a Google Fonts sheet in metadata.font_stylesheet and lists other third parties') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    data = JSON.parse(out)['data']
+    assert(data['metadata']['font_stylesheet'].to_s.start_with?('https://fonts.googleapis.com/'),
+      "got #{data['metadata'].inspect}")
+    assert(err.include?('cdn.example.com/other.css'), "expected the other stylesheet listed, got #{err.inspect}")
+    assert(err.include?('cdn.example.com/widget.js'), "expected the third-party script listed, got #{err.inspect}")
+  end
+end
+
+check('fragment drops an analytics.gxb.vc tag and says the shell emits it') do
+  with_page_file(ANDY_PAGE) do |_dir, path|
+    out, err, = run_cli('fragment', path)
+    assert(!JSON.parse(out).dig('data', 'body').include?('analytics.gxb.vc'), 'expected the tag dropped')
+    assert(err.include?("the shell emits the site's own"), "got #{err.inspect}")
   end
 end
 
@@ -2003,6 +2167,143 @@ check('save --html of a titleless fragment refuses locally until --title is give
     assert(code == 0, 'expected --title to be enough')
     assert(last_args['save']['changes'][0]['document']['metadata'] == { 'title' => 'Hello' },
       "got #{last_args['save']['changes'][0]['document']['metadata'].inspect}")
+  end
+end
+
+# -- one save, many documents (pc_b36b3b9f) ------------------------------------
+
+check('save takes repeated --page --html and sends one changes array in declaration order') do
+  Dir.mktmpdir do |dir|
+    %w[a b c].each_with_index do |name, n|
+      File.write(File.join(dir, "#{name}.html"),
+        "<!doctype html><html><head><title>Page #{name.upcase}</title></head><body><p>#{n}</p></body></html>")
+    end
+    run_cli('describe', 'onyx')
+    before_save = requests["#{TOKEN_ONYX} save"]
+
+    out, _err, code = run_cli('save', 'onyx',
+      '--page', '/', '--html', File.join(dir, 'a.html'),
+      '--page', '/about', '--html', File.join(dir, 'b.html'),
+      '--page', '/contact', '--html', File.join(dir, 'c.html'))
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before_save + 1, 'expected exactly one save for three pages')
+
+    changes = last_args['save']['changes']
+    assert(changes.map { |c| c['key'] } == %w[/ /about /contact], "got #{changes.map { |c| c['key'] }.inspect}")
+    assert(changes.map { |c| c['document']['metadata']['title'] } == [ 'Page A', 'Page B', 'Page C' ],
+      'expected each page to keep its own title')
+  end
+end
+
+check('--title and --metadata bind to the --page they follow, not to the whole command') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'a.html'), '<p>a</p>')
+    File.write(File.join(dir, 'b.html'), '<p>b</p>')
+    File.write(File.join(dir, 'meta.json'), JSON.generate(description: 'about us'))
+    run_cli('describe', 'onyx')
+
+    out, _err, code = run_cli('save', 'onyx',
+      '--page', '/', '--html', File.join(dir, 'a.html'), '--title', 'Home',
+      '--page', '/about', '--html', File.join(dir, 'b.html'), '--title', 'About',
+      '--metadata', File.join(dir, 'meta.json'))
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    metadata = last_args['save']['changes'].map { |c| c['document']['metadata'] }
+    assert(metadata[0] == { 'title' => 'Home' }, "got #{metadata[0].inspect}")
+    assert(metadata[1] == { 'description' => 'about us', 'title' => 'About' }, "got #{metadata[1].inspect}")
+  end
+end
+
+check('save mixes pages, a markdown page, a collection, a redirect, a delete and an asset in one array') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'a.html'), '<p>a</p>')
+    File.write(File.join(dir, 'post.md'), "# A Post\n\nbody text\n")
+    File.write(File.join(dir, 'blog.json'), JSON.generate(name: 'Blog', path_prefix: '/blog/'))
+    asset = File.join(dir, 'app.js')
+    File.write(asset, 'export const x = 1')
+    run_cli('describe', 'onyx')
+
+    out, _err, code = run_cli('save', 'onyx',
+      '--page', '/', '--html', File.join(dir, 'a.html'), '--title', 'Home',
+      '--page', '/blog/first', '--markdown', File.join(dir, 'post.md'),
+      '--collection', 'blog', File.join(dir, 'blog.json'),
+      '--redirect', '/old', '/new',
+      '--delete', 'page', '/gone',
+      '--asset', 'assets/app.js', asset)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+
+    changes = last_args['save']['changes']
+    assert(changes.map { |c| [ c['op'], c['kind'], c['key'] ] } ==
+      [ %w[put page /], %w[put page /blog/first], %w[put collection blog], %w[put redirect /old],
+        %w[delete page /gone], [ 'put', 'asset', 'assets/app.js' ] ], "got #{changes.map { |c| [c['op'], c['kind'], c['key']] }.inspect}")
+    assert(changes[1]['document'] == { 'format' => 'markdown', 'metadata' => { 'title' => 'A Post' },
+                                       'body' => "# A Post\n\nbody text\n" }, "got #{changes[1]['document'].inspect}")
+    assert(changes[2]['document'] == { 'name' => 'Blog', 'path_prefix' => '/blog/' }, "got #{changes[2].inspect}")
+    assert(changes[3]['document'] == { 'to' => '/new' }, "got #{changes[3].inspect}")
+    assert(changes[5]['digest'] == Digest::SHA256.hexdigest('export const x = 1'), "got #{changes[5].inspect}")
+  end
+end
+
+check('--asset takes a bare sha256 as well as a file') do
+  Dir.mktmpdir do |_dir|
+    run_cli('describe', 'onyx')
+    digest = 'a' * 64
+    run_cli('save', 'onyx', '--asset', 'assets/x.js', digest)
+    assert(last_args['save']['changes'] == [ { 'op' => 'put', 'kind' => 'asset', 'key' => 'assets/x.js',
+                                               'digest' => digest } ], "got #{last_args['save']['changes'].inspect}")
+  end
+end
+
+check('one --config carries the union of every converted head, and the config still wins') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'a.html'),
+      '<html><head><title>A</title><link rel="stylesheet" href="assets/a.css"></head><body><p>a</p></body></html>')
+    File.write(File.join(dir, 'b.html'),
+      '<html><head><title>B</title><link rel="stylesheet" href="assets/b.css">' \
+      '<script type="module" src="assets/b.js"></script></head><body><p>b</p></body></html>')
+    config = File.join(dir, 'config.json')
+    File.write(config, JSON.generate(name: 'Two Pages'))
+    run_cli('describe', 'onyx')
+
+    out, _err, code = run_cli('save', 'onyx', '--config', config,
+      '--page', '/a', '--html', File.join(dir, 'a.html'),
+      '--page', '/b', '--html', File.join(dir, 'b.html'))
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    changes = last_args['save']['changes']
+    assert(changes[0]['kind'] == 'config', 'expected the config put first')
+    assert(changes[0]['document']['stylesheets'] == %w[assets/a.css assets/b.css],
+      "expected both sheets, got #{changes[0]['document']['stylesheets'].inspect}")
+    assert(changes[0]['document']['modules'] == %w[assets/b.js], "got #{changes[0]['document'].inspect}")
+    assert(changes.map { |c| c['key'] }.compact == %w[/a /b], "got #{changes.map { |c| c['key'] }.inspect}")
+  end
+end
+
+check('a --page with no document, and a document flag with no --page, are refused before any request') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'a.html'), '<p>a</p>')
+    before = requests["#{TOKEN_ONYX} save"]
+
+    out, _err, code = run_cli('save', 'onyx', '--page', '/lonely')
+    assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE for a page with no document, got #{out}")
+    assert(JSON.parse(out)['error'].include?('--html'), 'expected the fix named')
+
+    out, _err, code = run_cli('save', 'onyx', '--html', File.join(dir, 'a.html'))
+    assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE for --html with no --page, got #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before, 'a malformed save reached the server')
+  end
+end
+
+check('save --dry-run sends dry_run and leaves the remembered head alone') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'a.html'), '<p>a</p>')
+    run_cli('describe', 'onyx')
+    head = state['expected:onyx:draft']
+
+    out, _err, code = run_cli('save', 'onyx', '--page', '/dry', '--html', File.join(dir, 'a.html'),
+                              '--title', 'Dry', '--dry-run')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(last_args['save']['dry_run'] == true, "got #{last_args['save'].inspect}")
+    assert(JSON.parse(out).dig('data', 'would_change_keys') == [ 'page:/dry' ], "got #{out}")
+    assert(state['expected:onyx:draft'] == head, 'a rehearsal moved the remembered head')
   end
 end
 

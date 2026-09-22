@@ -1418,18 +1418,40 @@ def read_text(source)
   [raw, nil]
 end
 
+Parts = Struct.new(:head, :body, :full, :body_attributes)
+
 def document_parts(html)
   head_match = html.match(%r{<head\b[^>]*>(.*?)</head>}mi)
-  body_match = html.match(%r{<body\b[^>]*>(.*?)</body>}mi)
+  body_match = html.match(%r{<body\b([^>]*)>(.*?)</body>}mi)
   full = !!(head_match || body_match || html.match(/<!doctype/i) || html.match(/<html\b/i))
 
   body =
-    if body_match then body_match[1]
+    if body_match then body_match[2]
     elsif head_match then html[head_match.end(0)..].to_s.sub(%r{</html>\s*\z}i, '')
     else html
     end
-  [head_match ? head_match[1] : '', body, full]
+  Parts.new(head_match ? head_match[1] : '', body, full, body_match ? body_match[1].to_s.strip : '')
 end
+
+# Attribute names in source order, with their values. Good enough for the
+# handful of things a <body> or <main> carries; this is a converter, not a
+# parser, and anything it cannot read it reports rather than swallows.
+def parse_attributes(text)
+  text.to_s.scan(/([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/)
+      .to_h { |name, dq, sq, bare| [name.downcase, dq || sq || bare] }
+end
+
+def attributes_to_s(attributes)
+  attributes.map { |name, value| value.nil? ? " #{name}" : %( #{name}="#{value}") }.join
+end
+
+# The one font host the shell links (SiteDocument::FONT_STYLESHEET_ORIGIN), so
+# a Google Fonts sheet has a home -- metadata.font_stylesheet -- rather than
+# being dropped with the rest of the head.
+GOOGLE_FONTS_ORIGIN = 'https://fonts.googleapis.com/'
+# The platform emits its own analytics tag from the site's analytics key, so a
+# hand-placed one is a second copy that double counts.
+ANALYTICS_HOST = 'analytics.gxb.vc'
 
 def scan_stylesheets_and_icons(markup, prefix, config, external)
   markup.scan(/<link\b[^>]*>/i) do |tag|
@@ -1447,6 +1469,25 @@ def scan_stylesheets_and_icons(markup, prefix, config, external)
       local = local_asset(href, prefix)
       config['favicon'] = { 'url' => local } if local && !config.key?('favicon')
     end
+  end
+end
+
+LD_JSON_TAG = %r{<script\b[^>]*\btype=["']application/ld\+json["'][^>]*>(.*?)</script>}mi
+
+# metadata.schema is an array of plain nodes: the shell owns the @context and
+# merges these into its own @graph, so a document that arrives as
+# {"@context":…, "@graph":[…]} contributes its graph and nothing else
+# (contract brief item 3).
+def ld_json_nodes(inner, warnings, where)
+  parsed = begin JSON.parse(inner) rescue nil end
+  if parsed.nil?
+    warnings << "a <script type=\"application/ld+json\"> in the #{where} is not valid JSON, so it was left alone"
+    return []
+  end
+  nodes = parsed.is_a?(Array) ? parsed : (parsed['@graph'].is_a?(Array) ? parsed['@graph'] : [parsed])
+  nodes.filter_map do |node|
+    next warnings << "a JSON-LD node in the #{where} is not an object and was left alone" unless node.is_a?(Hash)
+    node.reject { |key, _| key == '@context' }
   end
 end
 
@@ -1495,19 +1536,51 @@ def scan_scripts(markup, prefix, config, warnings)
   end
 end
 
+# A form posts to /f/<name>, /platform/forms-1.js writes the answer into
+# [data-form-result] or #form-<name>-result, and a page with neither shows the
+# visitor nothing at all and leaves the submit button disabled. Nothing said so
+# anywhere: the build had no diagnostic, the checks were clean, and the form
+# looked broken on a live practice's site (pc_0e2afbdd).
+FORM_RESULT_ELEMENT = '<p data-form-result hidden></p>'
+
+def form_names(body)
+  body.scan(%r{<form\b[^>]*\baction=["']/f/([^"'?#/]+)}i).flatten
+end
+
+def form_result_missing(body, name)
+  !body.match?(/\bdata-form-result\b/i) && !body.match?(/\bid=["']form-#{Regexp.escape(name)}-result["']/i)
+end
+
+# Inserted after the </form> that closes this form, because that is where the
+# script looks and where a person reads it. Forms do not nest.
+def insert_form_result(body, name)
+  open_at = body.index(%r{<form\b[^>]*\baction=["']/f/#{Regexp.escape(name)}}i)
+  return body unless open_at
+  close_at = body.index(%r{</form>}i, open_at)
+  return body unless close_at
+  after = close_at + body[close_at..][/\A<\/form>/i].length
+  body[0...after] + "\n" + FORM_RESULT_ELEMENT + body[after..]
+end
+
+Conversion = Struct.new(:prefix, :wrap_body, :add_form_result, :lift_json_ld, keyword_init: true)
+
 # rubocop:disable Metrics/AbcSize
-def html_to_fragment(html, prefix: 'assets/')
-  changes = []
+def html_to_fragment(html, prefix: 'assets/', wrap_body: false, add_form_result: false, lift_json_ld: false)
+  options = Conversion.new(prefix: prefix, wrap_body: wrap_body, add_form_result: add_form_result,
+                           lift_json_ld: lift_json_ld)
+  notes = []
   warnings = []
   config = { 'stylesheets' => [], 'modules' => [], 'imports' => {} }
   metadata = {}
 
-  head, body, full = document_parts(html)
-  changes << 'dropped the document shell (<!doctype>, <html>, <head>, <body>) -- the site shell owns it' if full
+  parts = document_parts(html)
+  head = parts.head
+  body = parts.body
+  notes << 'dropped the document shell (<!doctype>, <html>, <head>, <body>) -- the site shell owns it' if parts.full
 
   if (m = html.match(%r{<title[^>]*>(.*?)</title>}mi))
     metadata['title'] = collapse(decode_entities(m[1]))
-    changes << "<title> -> metadata.title (#{metadata['title'].inspect})"
+    notes << "<title> -> metadata.title (#{metadata['title'].inspect})"
   end
   head.scan(/<meta\b[^>]*>/i) do |tag|
     name = tag[/\bname=["']([^"']+)["']/i, 1].to_s.downcase
@@ -1516,24 +1589,30 @@ def html_to_fragment(html, prefix: 'assets/')
     case name
     when 'description'
       metadata['description'] = collapse(decode_entities(content))
-      changes << '<meta name="description"> -> metadata.description'
+      notes << '<meta name="description"> -> metadata.description'
     when 'robots'
       next unless content.downcase.include?('noindex')
       metadata['noindex'] = true
-      changes << '<meta name="robots" content="noindex"> -> metadata.noindex'
+      notes << '<meta name="robots" content="noindex"> -> metadata.noindex'
     end
   end
 
   external_styles = []
   scan_stylesheets_and_icons("#{head}\n#{body}", prefix, config, external_styles)
   scan_scripts("#{head}\n#{body}", prefix, config, warnings)
-  changes << "<link rel=\"stylesheet\"> -> config.stylesheets (#{config['stylesheets'].join(', ')})" if config['stylesheets'].any?
-  changes << "<script type=\"module\" src> -> config.modules (#{config['modules'].join(', ')})" if config['modules'].any?
-  changes << "<script type=\"importmap\"> -> config.imports (#{config['imports'].keys.join(', ')}) -- the shell emits the one import map" if config['imports'].any?
-  changes << "<link rel=\"icon\"> -> config.favicon.url (#{config.dig('favicon', 'url')})" if config['favicon']
+  notes << "<link rel=\"stylesheet\"> -> config.stylesheets (#{config['stylesheets'].join(', ')})" if config['stylesheets'].any?
+  notes << "<script type=\"module\" src> -> config.modules (#{config['modules'].join(', ')})" if config['modules'].any?
+  notes << "<script type=\"importmap\"> -> config.imports (#{config['imports'].keys.join(', ')}) -- the shell emits the one import map" if config['imports'].any?
+  notes << "<link rel=\"icon\"> -> config.favicon.url (#{config.dig('favicon', 'url')})" if config['favicon']
   external_styles.each do |href|
-    warnings << "external stylesheet #{href} was dropped: config.stylesheets must name an asset in the same snapshot. " \
-                'Upload it, or put a font CSS URL in metadata.font_stylesheet.'
+    if href.start_with?(GOOGLE_FONTS_ORIGIN)
+      metadata['font_stylesheet'] = href
+      notes << "Google Fonts stylesheet -> metadata.font_stylesheet (#{href}) -- the one font host the shell links"
+    else
+      warnings << "external stylesheet #{href} was dropped: config.stylesheets must name an asset in the same " \
+                  "snapshot, and metadata.font_stylesheet takes #{GOOGLE_FONTS_ORIGIN} URLs only. Upload it, or " \
+                  'accept that the page ships without it.'
+    end
   end
   warnings.concat(config_warnings(config))
 
@@ -1544,45 +1623,94 @@ def html_to_fragment(html, prefix: 'assets/')
   body = body.gsub(%r{<style\b[^>]*>(.*?)</style>}mi) { css << Regexp.last_match(1) << "\n"; '' }
   head.scan(SCRIPT_TAG) do |tag, inner|
     type = tag[/\btype=["']([^"']+)["']/i, 1].to_s.downcase
-    next if type == 'importmap' || tag.match?(/\bsrc=/i) || inner.strip.empty?
+    next if %w[importmap application/ld+json].include?(type) || tag.match?(/\bsrc=/i) || inner.strip.empty?
     warnings << 'an inline <script> in <head> was dropped with the rest of the head. ' \
                 'Put it in the body, or upload it and name it in config.modules.'
   end
+
+  # Structured data has a home now: metadata.schema, merged into the shell's
+  # own @graph (contract brief item 3). The head's copy moves without being
+  # asked; the body's is the agent's own tag, so it is named and only moved on
+  # request (pc_c8a45696, andysibley section 6 item 5).
+  schema = []
+  head.scan(LD_JSON_TAG) { |inner,| schema.concat(ld_json_nodes(inner, warnings, 'head')) }
+  notes << "<script type=\"application/ld+json\"> in <head> -> metadata.schema (#{schema.size} node(s))" if schema.any?
+  body_schema_count = 0
+  body = body.gsub(LD_JSON_TAG) do
+    nodes = ld_json_nodes(Regexp.last_match(1), warnings, 'body')
+    if options.lift_json_ld
+      schema.concat(nodes)
+      body_schema_count += nodes.size
+      ''
+    else
+      warnings << "this page carries #{nodes.size} JSON-LD node(s) in its body as a <script>. Page structured " \
+                  'data belongs in metadata.schema, where the shell merges it into the one @graph; ' \
+                  'rerun with --lift-json-ld to move it there.'
+      Regexp.last_match(0)
+    end
+  end
+  notes << "<script type=\"application/ld+json\"> in the body -> metadata.schema (#{body_schema_count} node(s))" if body_schema_count.positive?
+  metadata['schema'] = schema if schema.any?
+
   if css.strip.empty?
     css = nil
   else
     css = css.strip
-    changes << "inline <style> -> the page document's css (#{css.bytesize} bytes)"
+    notes << "inline <style> -> the page document's css (#{css.bytesize} bytes)"
     if css.bytesize > 8192
       warnings << "that is #{css.bytesize} bytes of CSS on one page. Site-wide styling belongs in an uploaded " \
                   'asset named by config.stylesheets, not in every page document.'
     end
   end
 
+  # The platform emits the analytics tag itself from the site's own key, so a
+  # carried-over one counts every visit twice (pc_8a7753c8). A head one goes
+  # with the head; a body one has to be taken out by name.
+  analytics = head.scan(/<script\b[^>]*\bsrc=["'][^"']*#{Regexp.escape(ANALYTICS_HOST)}/i).size
   body = body.gsub(SCRIPT_TAG) do |whole|
     tag = Regexp.last_match(1)
     type = tag[/\btype=["']([^"']+)["']/i, 1].to_s.downcase
     src = tag[/\bsrc=["']([^"']+)["']/i, 1]
-    if type == 'importmap' || (type == 'module' && src && local_asset(src, prefix))
+    if src.to_s.include?(ANALYTICS_HOST)
+      analytics += 1
+      ''
+    elsif type == 'importmap' || (type == 'module' && src && local_asset(src, prefix))
       ''
     else
       whole
     end
   end
+  notes << "dropped #{analytics} #{ANALYTICS_HOST} tag(s) -- the shell emits the site's own" if analytics.positive?
   body = body.gsub(/<link\b[^>]*>/i) do |tag|
     rel = tag[/\brel=["']([^"']+)["']/i, 1].to_s.downcase.split(/\s+/)
     (rel & %w[stylesheet icon preconnect preload dns-prefetch manifest]).any? ? '' : tag
   end
 
+  head_scripts, body_scripts = [head, body].map do |markup|
+    markup.scan(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/i).flatten
+          .reject { |src| local_asset(src, prefix) || src.include?(ANALYTICS_HOST) }.uniq
+  end
+  if head_scripts.any?
+    warnings << "third-party script(s) in <head> went with the head: #{head_scripts.join(', ')}. The shell owns " \
+                'the head, so put one in the body if the page needs it.'
+  end
+  if body_scripts.any?
+    warnings << "third-party script(s) left in the body, which will load from someone else's origin on every " \
+                "page view: #{body_scripts.join(', ')}"
+  end
+
   before_skip = body
   body = body.sub(%r{<a\b[^>]*href=["']#main["'][^>]*>.*?</a>}mi, '')
-  changes << 'dropped the skip link -- the shell emits its own' unless body == before_skip
+  notes << 'dropped the skip link -- the shell emits its own' unless body == before_skip
 
   if (open_tag = body[/<main\b[^>]*>/i])
-    attributes = open_tag[/\A<main\b(.*?)>\z/mi, 1].to_s.sub(/\s*\bid=["'][^"']*["']/i, '')
-    body = body.sub(open_tag) { "<div#{attributes}>" }
+    main_attributes = parse_attributes(open_tag[/\A<main\b(.*?)>\z/mi, 1])
+    dropped_id = main_attributes.delete('id')
+    body = body.sub(open_tag) { "<div#{attributes_to_s(main_attributes)}>" }
     body = body.sub(%r{</main>(?!.*</main>)}mi, '</div>')
-    changes << '<main> -> <div> -- the shell already emits <main id="main">'
+    notes << '<main> -> <div> -- the shell already emits <main id="main">' \
+             "#{main_attributes.any? ? ", carrying #{main_attributes.keys.join(', ')} onto the div" : ''}" \
+             "#{dropped_id ? " and dropping id=#{dropped_id.inspect}" : ''}"
   end
 
   referenced = []
@@ -1594,7 +1722,26 @@ def html_to_fragment(html, prefix: 'assets/')
     %(#{attribute}="{{ asset:#{path} }}")
   end
   referenced.uniq!
-  changes << "rewrote #{referenced.size} reference(s) to {{ asset: }} (#{referenced.join(', ')})" if referenced.any?
+  notes << "rewrote #{referenced.size} reference(s) to {{ asset: }} (#{referenced.join(', ')})" if referenced.any?
+
+  # Everything the source's <body> tag carried. Losing a body class changed
+  # font smoothing, the page background and the default text colour on twelve
+  # pages of a real site, and every check was clean (pc_b5376189).
+  body_attributes = parse_attributes(parts.body_attributes)
+  if body_attributes.any?
+    listed = body_attributes.map { |name, value| value.nil? ? name : "#{name}=#{value.inspect}" }.join(' ')
+    if options.wrap_body
+      body = "<div#{attributes_to_s(body_attributes)}>\n#{body.strip}\n</div>"
+      notes << "<body #{listed}> -> a wrapper <div> carrying the same attributes"
+      warnings << 'a background utility on the wrapper paints over any descendant at a negative z-index, ' \
+                  'which <body> did not. If the page has decorative layers behind the content, put the ' \
+                  "background on the body element through the page's own css instead."
+    else
+      warnings << "the <body> carried #{listed}, and a fragment has no <body> to put it on -- those styles are " \
+                  'lost on every page. Rerun with --wrap-body to re-wrap the fragment in a <div> carrying them, ' \
+                  "or move them onto the body element through the page's own css."
+    end
+  end
 
   if body.match?(/\bsrcset=["'][^"']*#{Regexp.escape(prefix)}/i)
     warnings << 'srcset is not rewritten: bind each candidate by hand, or use one src.'
@@ -1605,87 +1752,310 @@ def html_to_fragment(html, prefix: 'assets/')
                 '/platform/forms-1.js, which binds a document-level submit listener too, so one click ' \
                 'posts twice. Call event.stopPropagation() next to event.preventDefault().'
   end
+  form_names(body).uniq.each do |name|
+    next unless form_result_missing(body, name)
+    if options.add_form_result
+      body = insert_form_result(body, name)
+      notes << "inserted #{FORM_RESULT_ELEMENT} after the /f/#{name} form -- /platform/forms-1.js writes its answer there"
+    else
+      warnings << "this page posts to /f/#{name} and carries no [data-form-result] and no " \
+                  "#form-#{name}-result element. /platform/forms-1.js writes the server's answer into one of " \
+                  'those and does nothing without one, so the visitor sees no message and a submit button ' \
+                  "left disabled. Add an element with either marker, or rerun with --add-form-result to put " \
+                  "#{FORM_RESULT_ELEMENT} after the form."
+    end
+  end
 
   assets = (referenced + config['stylesheets'] + config['modules'] + config['imports'].values +
             [config.dig('favicon', 'url')]).compact.uniq.sort
 
   { 'format' => 'html', 'metadata' => metadata, 'body' => body.strip, 'css' => css,
     'config' => config.reject { |_, v| v.respond_to?(:empty?) && v.empty? },
-    'assets' => assets, 'changes' => changes, 'warnings' => warnings }.compact
+    'assets' => assets, 'notes' => notes, 'warnings' => warnings }.compact
 end
 # rubocop:enable Metrics/AbcSize
 
-# The change list and the warnings go to stderr so stdout stays exactly one
-# JSON envelope, whether this ran as `fragment` or inside `save --html`.
+# The notes and the warnings go to stderr so stdout stays exactly one JSON
+# envelope, whether this ran as `fragment` or inside `save --html`.
 def report_fragment(result, label = 'fragment')
-  Array(result['changes']).each { |line| $stderr.puts("#{label}: #{line}") }
+  Array(result['notes']).each { |line| $stderr.puts("#{label}: #{line}") }
   Array(result['warnings']).each { |line| $stderr.puts("#{label}: warning: #{line}") }
 end
 
-def cmd_fragment(file, prefix)
+# The page put a conversion turns into. `changes` is this array now rather than
+# a list of English sentences, so twelve documents can be appended into one
+# file and saved in one call (pc_b36b3b9f); the sentences moved to `notes`.
+def fragment_page_change(fragment, page_key, title: nil, extra_metadata: nil)
+  metadata = fragment['metadata'].dup
+  metadata.merge!(extra_metadata) if extra_metadata
+  metadata['title'] = title if title
+  if metadata['title'].to_s.strip.empty?
+    return [nil, api_error("the document for #{page_key} has no <title>, and a page needs metadata.title: " \
+                           'pass --title, or --metadata a JSON object carrying one', code: 'USAGE')]
+  end
+
+  document = { 'format' => 'html', 'metadata' => metadata, 'body' => fragment['body'] }
+  document['css'] = fragment['css'] if fragment['css']
+  [{ 'op' => 'put', 'kind' => 'page', 'key' => page_key, 'document' => document }, nil]
+end
+
+def cmd_fragment(file, prefix:, page_key:, title:, append_to:, wrap_body:, add_form_result:, lift_json_ld:)
   html, err = read_text(file)
   return fail_with(err) if err
-  result = html_to_fragment(html, prefix: prefix)
+  result = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body,
+                            add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+
+  changes = []
+  if page_key
+    change, err = fragment_page_change(result, page_key, title: title)
+    return fail_with(err) if err
+    changes << change
+  elsif title
+    return failure('--title needs --page KEY: without a route there is no page document to title', code: 'USAGE')
+  end
+  result['changes'] = changes
   report_fragment(result)
+  $stderr.puts('fragment: pass --page KEY to emit the `put page` change save takes; without it `changes` is empty') if changes.empty?
+
+  if append_to
+    total, err = append_changes(append_to, changes)
+    return fail_with(err) if err
+    $stderr.puts("fragment: appended #{changes.size} change(s) to #{append_to} (#{total} in the file) -- " \
+                 "`sites-cli save SLUG --changes #{append_to}` saves them all in one call")
+  end
   success(result)
 end
 
-# `save --page KEY --html FILE --config FILE`: the changes JSON, built here
-# rather than by hand. A config document the conversion found keys for gets
-# them, but only for keys the file does not declare at all -- an explicit
-# "stylesheets": [] is a declaration and wins.
-def build_page_changes(page_key:, html_file:, config_file:, metadata_file:, title:, prefix:)
+# One file a loop appends to, so converting twelve documents and saving once is
+# a shell loop rather than twelve snapshots and twelve builds.
+def append_changes(path, changes)
+  existing = []
+  if File.file?(path)
+    loaded, err = json_file(path, '--append-changes')
+    return [nil, err] if err
+    existing = loaded.is_a?(Hash) ? Array(loaded['changes']) : Array(loaded)
+  end
+  merged = existing + changes
+  File.write(path, JSON.pretty_generate(merged))
+  [merged.size, nil]
+end
+
+# -----------------------------------------------------------------------------
+# save builds one changes array out of as many documents as the command names.
+#
+# Twelve pages used to be twelve commands, twelve snapshots and twelve builds,
+# because `--page KEY --html FILE` took one page and `--changes` wanted an array
+# whose envelope lived only in the Ruby registry (pc_b36b3b9f). These flags
+# carry their own operands and keep their order, which opt() cannot do: it
+# plucks a flag out of argv wherever it is, and then nothing says which --html
+# belongs to which --page.
+# -----------------------------------------------------------------------------
+
+SAVE_DOCUMENT_FLAGS = {
+  '--page' => 1, '--html' => 1, '--markdown' => 1, '--title' => 1, '--metadata' => 1,
+  '--config' => 1, '--collection' => 2, '--redirect' => 2, '--delete' => 2, '--asset' => 2
+}.freeze
+
+# Site::Versioned::OPS and Mcp::ToolRegistry::KINDS. Checked locally so a typo
+# costs no round trip, the same rule an unknown --flag gets.
+CHANGE_KINDS = %w[page layout include collection redirect config asset].freeze
+DIGEST_SHAPE = /\A[0-9a-f]{64}\z/i
+
+def scan_save_documents(argv)
+  taken = []
+  index = 0
+  while index < argv.length
+    arity = SAVE_DOCUMENT_FLAGS[argv[index]]
+    unless arity
+      index += 1
+      next
+    end
+    operands = argv[index + 1, arity] || []
+    if operands.size < arity || operands.any? { |value| SAVE_DOCUMENT_FLAGS.key?(value) }
+      return [nil, api_error("#{argv[index]} takes #{arity} value(s): #{save_flag_usage(argv[index])}", code: 'USAGE')]
+    end
+    taken << [argv[index], operands]
+    argv.slice!(index, arity + 1)
+  end
+  [taken, nil]
+end
+
+def save_flag_usage(flag)
+  { '--page' => '--page KEY', '--html' => '--html FILE', '--markdown' => '--markdown FILE',
+    '--title' => '--title TEXT', '--metadata' => '--metadata FILE', '--config' => '--config FILE',
+    '--collection' => '--collection KEY FILE', '--redirect' => '--redirect FROM TO',
+    '--delete' => '--delete KIND KEY', '--asset' => '--asset KEY FILE-or-DIGEST' }.fetch(flag, flag)
+end
+
+# A markdown page is its own body: no conversion, no shell to drop, and the
+# title comes from --title or the document's own first H1.
+def markdown_page_change(file, page_key, title, extra_metadata)
+  text, err = read_text(file)
+  return [nil, err] if err
+  metadata = {}
+  metadata.merge!(extra_metadata) if extra_metadata
+  metadata['title'] = title if title
+  metadata['title'] ||= collapse(text[/^\#\s+(.+)$/, 1].to_s)
+  if metadata['title'].to_s.strip.empty?
+    return [nil, api_error("#{File.basename(file)} has no leading # heading, and a page needs metadata.title: " \
+                           'pass --title', code: 'USAGE')]
+  end
+  [{ 'op' => 'put', 'kind' => 'page', 'key' => page_key,
+     'document' => { 'format' => 'markdown', 'metadata' => metadata, 'body' => text } }, nil]
+end
+
+def load_object(file, what)
+  loaded, err = json_file(file, what)
+  return [nil, err] if err
+  return [nil, api_error("#{what} must contain a JSON object", code: 'BAD_JSON')] unless loaded.is_a?(Hash)
+  [loaded, nil]
+end
+
+# rubocop:disable Metrics/AbcSize
+def build_save_changes(taken, prefix:, wrap_body: false, add_form_result: false, lift_json_ld: false)
+  pages = []
+  items = []
+  config_file = nil
+  current = nil
+
+  taken.each do |flag, operands|
+    case flag
+    when '--page'
+      current = { 'key' => operands[0] }
+      pages << current
+      items << [:page, current]
+    when '--html', '--markdown', '--title', '--metadata'
+      unless current
+        return [nil, api_error("#{flag} needs a --page KEY before it, the route to put the document at " \
+                               '(e.g. --page / --html index.html)', code: 'USAGE')]
+      end
+      key = flag.delete_prefix('--')
+      if current.key?(key)
+        return [nil, api_error("--page #{current['key']} was given #{flag} twice", code: 'USAGE')]
+      end
+      current[key] = operands[0]
+    when '--config'
+      return [nil, api_error('save takes one --config document, not two', code: 'USAGE')] if config_file
+      config_file = operands[0]
+    when '--collection', '--redirect', '--delete', '--asset'
+      items << [flag.delete_prefix('--').to_sym, operands]
+    end
+  end
+
+  missing = pages.find { |page| !page.key?('html') && !page.key?('markdown') }
+  if missing
+    return [nil, api_error("--page #{missing['key']} has no document: give it --html FILE or --markdown FILE",
+                           code: 'USAGE')]
+  end
+
+  # Convert first, because the config carry needs every page's head.
+  pages.each do |page|
+    next unless page['html']
+    html, err = read_text(page['html'])
+    return [nil, err] if err
+    page['fragment'] = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body,
+                                        add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+    report_fragment(page['fragment'], "save #{page['key']}")
+  end
+
   changes = []
-  fragment = nil
+  config_change, err = build_config_change(config_file, pages)
+  return [nil, err] if err
+  changes << config_change if config_change
 
-  if html_file
-    return [nil, api_error('--html needs --page KEY, the route to put it at (e.g. --page /)', code: 'USAGE')] unless page_key
-    html, err = read_text(html_file)
+  items.each do |type, payload|
+    change, err = render_save_item(type, payload)
     return [nil, err] if err
-    fragment = html_to_fragment(html, prefix: prefix)
-    report_fragment(fragment, 'save')
+    changes << change
   end
-
-  if config_file
-    loaded, err = json_file(config_file, '--config')
-    return [nil, err] if err
-    return [nil, api_error('--config must contain a JSON object', code: 'BAD_JSON')] unless loaded.is_a?(Hash)
-    config = loaded['document'].is_a?(Hash) ? loaded['document'] : loaded
-
-    added = []
-    fragment&.fetch('config')&.each do |key, value|
-      next if config.key?(key)
-      config[key] = value
-      added << key
-    end
-    $stderr.puts("save: carried #{added.join(', ')} from #{File.basename(html_file)} into the config document") if added.any?
-    already_said = Array(fragment && fragment['warnings'])
-    config_warnings(config).each { |line| $stderr.puts("save: warning: #{line}") unless already_said.include?(line) }
-    changes << { 'op' => 'put', 'kind' => 'config', 'document' => config }
-  elsif fragment && fragment['config'].any?
-    $stderr.puts("save: #{File.basename(html_file)} declares #{fragment['config'].keys.join(', ')}, and no --config " \
-                 'was given -- those stylesheets, modules and imports will not load until a config document names them.')
-  end
-
-  if fragment
-    metadata = fragment['metadata'].dup
-    if metadata_file
-      loaded, err = json_file(metadata_file, '--metadata')
-      return [nil, err] if err
-      return [nil, api_error('--metadata must contain a JSON object', code: 'BAD_JSON')] unless loaded.is_a?(Hash)
-      metadata.merge!(loaded)
-    end
-    metadata['title'] = title if title
-    if metadata['title'].to_s.strip.empty?
-      return [nil, api_error('a page needs metadata.title: pass --title, or give a document with a <title>', code: 'USAGE')]
-    end
-
-    document = { 'format' => 'html', 'metadata' => metadata, 'body' => fragment['body'] }
-    document['css'] = fragment['css'] if fragment['css']
-    changes << { 'op' => 'put', 'kind' => 'page', 'key' => page_key, 'document' => document }
-  end
-
   [changes, nil]
+end
+# rubocop:enable Metrics/AbcSize
+
+def render_save_item(type, payload)
+  case type
+  when :page
+    extra = nil
+    if payload['metadata']
+      extra, err = load_object(payload['metadata'], '--metadata')
+      return [nil, err] if err
+    end
+    if payload['markdown']
+      markdown_page_change(payload['markdown'], payload['key'], payload['title'], extra)
+    else
+      fragment_page_change(payload['fragment'], payload['key'], title: payload['title'], extra_metadata: extra)
+    end
+  when :collection
+    document, err = load_object(payload[1], '--collection')
+    return [nil, err] if err
+    [{ 'op' => 'put', 'kind' => 'collection', 'key' => payload[0],
+       'document' => document['document'].is_a?(Hash) ? document['document'] : document }, nil]
+  when :redirect
+    [{ 'op' => 'put', 'kind' => 'redirect', 'key' => payload[0], 'document' => { 'to' => payload[1] } }, nil]
+  when :delete
+    kind = payload[0]
+    unless CHANGE_KINDS.include?(kind)
+      return [nil, api_error("--delete takes one of #{CHANGE_KINDS.join(', ')}, not #{kind.inspect}", code: 'USAGE')]
+    end
+    [{ 'op' => 'delete', 'kind' => kind, 'key' => payload[1] }, nil]
+  when :asset
+    key, value = payload
+    if value.match?(DIGEST_SHAPE)
+      [{ 'op' => 'put', 'kind' => 'asset', 'key' => key, 'digest' => value.downcase }, nil]
+    elsif File.file?(value)
+      # save binds a digest; it never sends bytes. Saying so here is cheaper
+      # than a 422 unknown_asset after the snapshot is made.
+      $stderr.puts("save: #{key} is bound to the sha256 of #{value}. `save` binds digests and uploads nothing -- " \
+                   "if the platform has never seen these bytes, `sites-cli upload SLUG #{value}` (or `push`) first.")
+      [{ 'op' => 'put', 'kind' => 'asset', 'key' => key, 'digest' => sha256_file(value) }, nil]
+    else
+      [nil, api_error("--asset #{key} takes a sha256 or a local file, and #{value.inspect} is neither",
+                      code: 'NO_FILE')]
+    end
+  end
+end
+
+# A config document the conversions found keys for gets them, but only for keys
+# the file does not declare at all -- an explicit "stylesheets": [] is a
+# declaration and wins.
+def build_config_change(config_file, pages)
+  fragments = pages.filter_map { |page| page['fragment'] }
+  unless config_file
+    declaring = fragments.select { |fragment| fragment['config'].any? }
+    if declaring.any?
+      keys = declaring.flat_map { |fragment| fragment['config'].keys }.uniq
+      $stderr.puts("save: the document(s) declare #{keys.join(', ')}, and no --config was given -- those " \
+                   'stylesheets, modules and imports will not load until a config document names them.')
+    end
+    return [nil, nil]
+  end
+
+  loaded, err = load_object(config_file, '--config')
+  return [nil, err] if err
+  config = loaded['document'].is_a?(Hash) ? loaded['document'] : loaded
+
+  # Twelve pages can name twelve different stylesheets, so the union across
+  # every conversion is what a single config document has to hold.
+  found = {}
+  fragments.each do |fragment|
+    fragment['config'].each do |key, value|
+      case value
+      when Array then found[key] = (found[key] || []) | value
+      when Hash then found[key] = (found[key] || {}).merge(value)
+      else found[key] ||= value
+      end
+    end
+  end
+  added = []
+  found.each do |key, value|
+    next if config.key?(key)
+    config[key] = value
+    added << key
+  end
+  $stderr.puts("save: carried #{added.join(', ')} from the converted document(s) into the config document") if added.any?
+  already_said = fragments.flat_map { |fragment| Array(fragment['warnings']) }
+  config_warnings(config).each { |line| $stderr.puts("save: warning: #{line}") unless already_said.include?(line) }
+  [{ 'op' => 'put', 'kind' => 'config', 'document' => config }, nil]
 end
 
 # -----------------------------------------------------------------------------
@@ -1935,36 +2305,44 @@ def run_v2(command, argv)
     tool_call(slug, 'read', args, remember: args['at'].nil?)
 
   when 'save'
+    # The document flags come out first and in order: which --html belongs to
+    # which --page is positional, and opt() would lose it.
+    taken, err = scan_save_documents(argv)
+    return fail_with(err) if err
+
     branch = opt(argv, '--branch') || base['branch'] || DEFAULT_BRANCH
     expected_flag = opt(argv, '--expected') || base['expected']
     idempotency = opt(argv, '--idempotency-key') || base['idempotency_key'] || SecureRandom.uuid
     message = opt(argv, '--message') || base['message']
     changes_file = opt(argv, '--changes')
-    page_key = opt(argv, '--page')
-    html_file = opt(argv, '--html')
-    config_file = opt(argv, '--config')
-    metadata_file = opt(argv, '--metadata')
-    title = opt(argv, '--title')
     prefix = opt(argv, '--prefix') || 'assets/'
+    wrap_body = flag?(argv, '--wrap-body')
+    add_form_result = flag?(argv, '--add-form-result')
+    lift_json_ld = flag?(argv, '--lift-json-ld')
+    dry_run = flag?(argv, '--dry-run')
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
 
     changes = base['changes']
     if changes_file
-      if html_file || config_file
-        return failure('save takes --changes or --html/--config, not both: one of them would have to win', code: 'USAGE')
+      if taken.any?
+        return failure("save takes --changes or the document flags (#{SAVE_DOCUMENT_FLAGS.keys.join(' ')}), " \
+                       'not both: one of them would have to win', code: 'USAGE')
       end
       loaded, err = json_file(changes_file, '--changes')
       return fail_with(err) if err
       changes = loaded.is_a?(Hash) ? loaded['changes'] : loaded
-    elsif html_file || config_file
-      built, err = build_page_changes(page_key: page_key, html_file: html_file, config_file: config_file,
-                                      metadata_file: metadata_file, title: title, prefix: prefix)
+    elsif taken.any?
+      built, err = build_save_changes(taken, prefix: prefix, wrap_body: wrap_body,
+                                      add_form_result: add_form_result, lift_json_ld: lift_json_ld)
       return fail_with(err) if err
       changes = built
     end
     unless changes.is_a?(Array)
-      return failure('save requires --changes FILE|- (a JSON array of change objects), or --page KEY --html FILE [--config FILE]',
+      return failure('save requires --changes FILE|- (a JSON array of change objects), or document flags: ' \
+                     '--page KEY --html FILE, --markdown FILE, --config FILE, --collection KEY FILE, ' \
+                     '--redirect FROM TO, --delete KIND KEY, --asset KEY FILE-or-DIGEST, repeatable and ' \
+                     'in any combination',
                      code: 'USAGE')
     end
 
@@ -1974,7 +2352,10 @@ def run_v2(command, argv)
     args = base.merge('branch' => branch, 'expected' => expected,
                       'idempotency_key' => idempotency, 'changes' => changes)
     args['message'] = message if message
-    tool_call(slug, 'save', args)
+    args['dry_run'] = true if dry_run
+    # A rehearsal makes no snapshot, so it leaves no local state either: the
+    # head it echoes is the one already remembered.
+    tool_call(slug, 'save', args, remember: !dry_run)
 
   when 'create-branch'
     from = opt(argv, '--from') || base['from']
@@ -2249,12 +2630,19 @@ def run(argv)
     return tool_call(slug, 'get_analytics', args)
 
   when 'fragment'
-    file = argv.shift
     prefix = opt(argv, '--prefix') || 'assets/'
+    page_key = opt(argv, '--page')
+    title = opt(argv, '--title')
+    append_to = opt(argv, '--append-changes')
+    wrap_body = flag?(argv, '--wrap-body')
+    add_form_result = flag?(argv, '--add-form-result')
+    lift_json_ld = flag?(argv, '--lift-json-ld')
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
+    file = argv.shift
     return failure("fragment requires FILE (or - for stdin)", code: 'USAGE') unless file
-    return cmd_fragment(file, prefix)
+    return cmd_fragment(file, prefix: prefix, page_key: page_key, title: title, append_to: append_to,
+                        wrap_body: wrap_body, add_form_result: add_form_result, lift_json_ld: lift_json_ld)
 
   when 'upload'
     slug = argv.shift
