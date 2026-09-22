@@ -342,6 +342,18 @@ def forget_review(slug, branch)
   save_json(STATE_PATH, state)
 end
 
+# An archived branch is out of service (nothing is deleted, no asset URL stops
+# working; it just stops counting against the site's quota), so a stale head
+# token or review for it left in state.json is not "remembered", it is a
+# corpse: the next `create-branch` reusing that name would inherit CAS/review
+# state from a branch that no longer exists (pc_6e8f551e).
+def forget_branch_state(slug, branch)
+  state = load_json(STATE_PATH)
+  removed_expected = state.delete(expected_key(slug, branch))
+  removed_review = state.delete(review_key(slug, branch))
+  save_json(STATE_PATH, state) if removed_expected || removed_review
+end
+
 # Called only with a 2xx body. A 409 branch_changed also carries the current
 # `expected`, and deliberately does NOT come through here: learning the new
 # token from the conflict is how a "never retried" conflict turns into a
@@ -2858,7 +2870,14 @@ def run_v2(command, argv)
 
     name = argv.shift || base['name']
     return failure('archive-branch requires SLUG NAME', code: 'USAGE') unless name
-    tool_call(slug, 'archive_branch', base.merge('name' => name))
+    data, err = api_call(slug, 'archive_branch', base.merge('name' => name))
+    return fail_with(err) if err
+    remember_branch_state(slug, data)
+    # The branch itself is what just went out of service; whatever CAS/review
+    # state this CLI held for it would otherwise outlive the branch and be
+    # ready to mislead the next create-branch that reuses the name.
+    forget_branch_state(slug, name)
+    success(data)
 
   when 'diff'
     branch = opt(argv, '--branch')
