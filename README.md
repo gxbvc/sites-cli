@@ -30,6 +30,9 @@ sites-cli list-submissions onyx         # needs a read_submissions token
 sites-cli manual                        # the subcommand table, from the code
 sites-cli tools onyx                    # the server's own tool index for a site
 sites-cli schema onyx config            # the config document's JSON Schema
+sites-cli list-pages onyx               # routes with format, title, digest
+sites-cli guide onyx forms              # server-generated prose; no topic lists topics
+sites-cli heads onyx / /about /contact  # head_preview for many routes in one call
 ```
 
 Every tool subcommand prints the raw `{ok, data}` envelope, or

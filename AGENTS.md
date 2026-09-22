@@ -31,6 +31,9 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `describe SLUG [PATH] [--branch B]` (alias: `describe_site`) | `describe_site` | read | both |
 | `read SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]` | `read` | read | v2 |
 | `schema SLUG [config\|page\|collection\|redirect\|changes]` | `read {kind: schema}` | read | v2 |
+| `list-pages SLUG [--branch B]` | `describe_site + read xN` | read | v2 |
+| `guide SLUG [TOPIC] [--format text\|json]` | `read {kind: guide}` | read | v2 |
+| `heads SLUG ROUTE... [--branch B]` | `read {kind: prepared, keys}` | read | v2 |
 | `save SLUG --changes FILE \| --page KEY --html FILE ... [--dry-run]` | `save` | draft | v2 |
 | `create-branch SLUG NAME [--from live\|BRANCH]` | `create_branch` | draft | v2 |
 | `archive-branch SLUG NAME` | `archive_branch` | draft | v2 |
@@ -118,9 +121,10 @@ has told people a working feature was broken; those two commands can.
   supply the whole arguments object; explicit flags override individual keys.
 - An unknown `--flag` is refused before any request goes out.
 - **stdout is one JSON object, always.** Every note, warning, change list and
-  next step goes to stderr, so `sites-cli <anything> | jq` works. The two
-  deliberate exceptions are `upload`, which prints one JSON line per file, and
-  `manual`, which prints a markdown table.
+  next step goes to stderr, so `sites-cli <anything> | jq` works. The
+  deliberate exceptions are `upload`, which prints one JSON line per file,
+  `manual`, which prints a markdown table, and `guide`, which prints Markdown
+  text when `--format text` is given or stdout is a TTY (JSON otherwise).
 - **Nothing ever prints a Ruby backtrace.** A server answer nobody expected is
   a structured error with the body attached, and a worker thread that raises
   fails one file rather than the command.
@@ -344,6 +348,38 @@ in the body works but the build reports it as `json_ld_in_body`.
 | edit the body | `{op:"edit_body", kind:"page", key:"/", edits:[{old_text, new_text}]}` -- each `old_text` must match exactly once |
 
 `save SLUG` builds that array for you: see "One save, many documents".
+
+**`put` merges what it omits, clears what it nulls.** A `put page` that omits
+`css` keeps the page's existing stylesheet; a `put page` with `css: null`
+removes it. Same rule for `metadata`: omitted keeps what the page already has,
+`null` clears it. `body` and `format` stay required on every `put page`
+either way -- there is no partial put of those two. This is the fix for a
+put silently dropping a page's `css` when a caller only meant to touch the
+body (`pc_a6905fc1`, a blocker: save ok, build ready, diagnostics unchanged,
+`<style>` just gone).
+
+**Ops on one key apply in order, and there is no item cap.** A
+`patch_metadata` followed by an `edit_body` on the same key in one `save`
+applies both, in the order they appear in `changes` -- they used to be
+`overlapping_changes`, so a metadata-plus-body edit could not be one call.
+`overlapping_changes` is still the answer for a genuinely conflicting pair on
+one key (a `delete` followed by anything, or two `put`s). The old 100-item
+cap on `changes` is gone (`pc_0e77d2e1`): a 350-page rebuild is one `save`,
+one snapshot, one build, bounded only by the request body -- large enough now
+that a real site's worth of pages fits in one call; `push`/`save` do not
+batch on the CLI side either.
+
+### list-pages
+
+There is no dedicated route-listing tool, so `sites-cli list-pages SLUG
+[--branch B]` composes one from what already exists: `describe_site`'s own
+`pending.changes` (the same diff against live that `diff` reports) names
+every page and collection key that differs from live, and one `read` per key
+fills in `format`, `title` and `digest`. **A route identical to live -- already
+published, nothing pending -- has no listing primitive yet and will not
+appear here**; that gap is named on stderr rather than hidden (`pc_4ab84e17`:
+"I recovered them from build diagnostics"). `read SLUG page` with no `KEY`
+points here instead of a bare 422.
 
 ### read kinds
 

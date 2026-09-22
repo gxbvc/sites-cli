@@ -723,6 +723,119 @@ rescue *NETWORK_ERRORS => e
 end
 
 # -----------------------------------------------------------------------------
+# list-pages: there is no dedicated route-listing tool yet (pc_4ab84e17: "I
+# recovered them from build diagnostics"). This composes one out of
+# describe_site's own `pending.changes` -- the same map_diff against live
+# `diff` reports -- plus one `read` per key it names, for format/title/digest.
+# A branch that already matches live (published, nothing pending) has nothing
+# pending to name, so it lists nothing; that gap is said on stderr rather than
+# hidden, because it is a real limit of composing this from existing surfaces,
+# not a bug in the composition.
+# -----------------------------------------------------------------------------
+# `read`'s `kind` is singular ("page", "collection"); the namespaces
+# map_diff groups `changes` under (SiteSnapshot::NAMESPACES) are plural
+# ("pages", "collections") -- the same mismatch a hand-rolled composition
+# would silently get wrong and read zero keys from a branch full of them.
+LISTABLE_NAMESPACES = { 'page' => 'pages', 'collection' => 'collections' }.freeze
+
+def cmd_list_pages(slug, branch)
+  args = {}
+  args['branch'] = branch if branch
+  data, err = api_call(slug, 'describe_site', args)
+  return fail_with(err) if err
+  remember_branch_state(slug, data)
+
+  pending = data['pending'].is_a?(Hash) ? data['pending'] : {}
+  changes = pending['changes'].is_a?(Hash) ? pending['changes'] : {}
+  resolved_branch = pending['branch'] || branch || DEFAULT_BRANCH
+
+  wanted = []
+  LISTABLE_NAMESPACES.each do |kind, namespace|
+    group = changes[namespace].is_a?(Hash) ? changes[namespace] : {}
+    (Array(group['added']) + Array(group['changed'])).uniq.each { |key| wanted << [kind, key] }
+  end
+
+  pages = []
+  collections = []
+  wanted.sort.each do |kind, key|
+    read_args = { 'kind' => kind, 'key' => key, 'branch' => resolved_branch }
+    read_args['fields'] = %w[metadata] if kind == 'page'
+    doc, rerr = api_call(slug, 'read', read_args)
+    next if rerr # gone between the two calls above is not fatal to the rest of the listing
+    remember_branch_state(slug, doc)
+    if kind == 'page'
+      pages << { 'key' => key, 'format' => doc['format'], 'title' => doc.dig('metadata', 'title'),
+                'digest' => doc['digest'] }.compact
+    else
+      collections << { 'key' => key, 'digest' => doc['digest'] }.compact
+    end
+  end
+
+  $stderr.puts("list-pages: #{pages.size} page(s), #{collections.size} collection(s) -- built from what " \
+               "differs from live on #{resolved_branch}; a route unchanged since the last publish has no " \
+               'listing primitive yet (pc_4ab84e17) and will not appear here')
+  success('site' => slug, 'branch' => resolved_branch, 'pages' => pages, 'collections' => collections)
+end
+
+# -----------------------------------------------------------------------------
+# guide: prose that used to live only in AGENTS.md (and drifted) is now a
+# server resource, read {kind: "guide", key: TOPIC}. No topic lists topics.
+# Printed as Markdown text on stdout when asked or when stdout is a TTY --
+# manual and upload are the other two deliberate exceptions to "stdout is one
+# JSON object" -- and as the raw envelope otherwise, so `sites-cli guide SLUG
+# forms | jq` still works.
+# -----------------------------------------------------------------------------
+GUIDE_TEXT_FIELDS = %w[markdown text body].freeze
+
+def cmd_guide(slug, topic, format:)
+  args = { 'kind' => 'guide' }
+  args['key'] = topic if topic
+  data, err = api_call(slug, 'read', args)
+  if err
+    note_if_server_predates_round2('read', args, err)
+    return fail_with(err)
+  end
+
+  text = GUIDE_TEXT_FIELDS.filter_map { |field| data[field] }.first
+  if text && (format == 'text' || (format.nil? && $stdout.tty?))
+    puts text
+    return 0
+  end
+  success(data)
+end
+
+# -----------------------------------------------------------------------------
+# heads: read {kind: "prepared", keys: [...]} in one call -- the bulk form a
+# head diff of 128 routes used to spend one browser launch per route to get
+# (pc_8ecfd09c). JSON on stdout, a compact table on stderr.
+# -----------------------------------------------------------------------------
+def cmd_heads(slug, routes, branch:)
+  args = { 'kind' => 'prepared', 'keys' => routes }
+  args['branch'] = branch if branch
+  data, err = api_call(slug, 'read', args)
+  return fail_with(err) if err
+  remember_branch_state(slug, data)
+
+  heads = data['heads']
+  if heads.is_a?(Hash)
+    heads.each do |route, head|
+      if !head.is_a?(Hash) || head['missing']
+        $stderr.puts("heads: #{route} -- missing")
+      else
+        $stderr.puts("heads: #{route} -- #{head['title'].inspect} canonical=#{head['canonical']} " \
+                     "robots=#{head['robots']} lang=#{head['lang']}")
+      end
+    end
+  elsif !$stale_server_warned
+    $stale_server_warned = true
+    $stderr.puts("sites-cli #{VERSION}: read {kind: \"prepared\", keys: [...]} answered with no `heads` map -- " \
+                 'this server may predate bulk head reads and only knows the single-route form. Wait for the ' \
+                 'round-2 deploy and try again.')
+  end
+  success(data)
+end
+
+# -----------------------------------------------------------------------------
 # Legacy file tools: describe_site, list_files, read_file, write_file,
 # edit_file, publish (plans/24-agent-sites.md slice 3 item 18). A site token is
 # scoped to exactly one site, unlike the runner credentials above.
@@ -2543,6 +2656,9 @@ SUBCOMMANDS = [
   [%w[describe describe_site], 'SLUG [PATH] [--branch B]', 'describe_site', 'read', 'both'],
   [%w[read], 'SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]', 'read', 'read', 'v2'],
   [%w[schema], "SLUG [#{SCHEMA_PARTS.join('|')}]", 'read {kind: schema}', 'read', 'v2'],
+  [%w[list-pages], 'SLUG [--branch B]', 'describe_site + read xN', 'read', 'v2'],
+  [%w[guide], 'SLUG [TOPIC] [--format text|json]', 'read {kind: guide}', 'read', 'v2'],
+  [%w[heads], 'SLUG ROUTE... [--branch B]', 'read {kind: prepared, keys}', 'read', 'v2'],
   [%w[save], 'SLUG --changes FILE | --page KEY --html FILE ... [--dry-run]', 'save', 'draft', 'v2'],
   [%w[create-branch], 'SLUG NAME [--from live|BRANCH]', 'create_branch', 'draft', 'v2'],
   [%w[archive-branch], 'SLUG NAME', 'archive_branch', 'draft', 'v2'],
@@ -2615,19 +2731,34 @@ def usage
       sites-cli schema SLUG [config|page|collection|redirect|changes]
       sites-cli validate-config FILE --site SLUG
                                             the fetched schema, run locally, before any write
+      sites-cli list-pages SLUG [--branch B]
+                                            routes with format, title, digest -- built from
+                                            describe_site's own pending diff, since there is
+                                            no dedicated listing tool yet (pc_4ab84e17)
+      sites-cli guide SLUG [TOPIC] [--format text|json]
+                                            prose the server generates from one Ruby
+                                            constant, e.g. `guide SLUG forms`. No TOPIC
+                                            lists topics. Markdown on stdout when --format
+                                            text or when stdout is a TTY, JSON otherwise
+      sites-cli heads SLUG ROUTE... [--branch B]
+                                            head_preview for many routes in one call --
+                                            title, canonical, robots, lang, hreflang,
+                                            json_ld_types, integrations, digest each
       sites-cli save SLUG --changes FILE|- [--branch B] [--expected TOKEN]
                           [--message M] [--idempotency-key K] [--dry-run]
       sites-cli save SLUG --page KEY --html FILE [--title T] [--metadata FILE]
                           [--markdown FILE] [--config FILE] [--collection KEY FILE]
                           [--redirect FROM TO] [--delete KIND KEY]
                           [--asset KEY FILE-or-DIGEST] [--prefix assets/]
-                          [--wrap-body] [--add-form-result] [--lift-json-ld]
+                          [--wrap-body] [--lift-json-ld]
                                             every document flag repeats and keeps its order,
                                             and the whole command is ONE changes array and one
                                             snapshot. --title/--metadata bind to the --page
-                                            they follow. --dry-run validates and saves nothing
+                                            they follow. --dry-run validates and saves nothing.
+                                            ops on one key apply in order; put omits css or
+                                            metadata to keep what the page has, null to clear it
       sites-cli fragment FILE|- [--page KEY] [--append-changes FILE] [--title T]
-                                [--prefix assets/] [--wrap-body] [--add-form-result]
+                                [--prefix assets/] [--wrap-body]
                                 [--lift-json-ld]
                                             the same conversion, printed and not sent;
                                             --page makes it the real `put page` change and
@@ -2785,6 +2916,13 @@ def run_v2(command, argv)
     # The batch form is asset-only and answers {key => digest} for the ones
     # that are bound, which is how `push` skips files that have not changed.
     return failure('--keys reads many assets at once, so it only takes kind "asset"', code: 'USAGE') if keys.any? && kind != 'asset'
+    # A bare `read SLUG page` used to be a 422 invalid_key with nothing to do
+    # about it (pc_4ab84e17: "I recovered them from build diagnostics"). Name
+    # the command that actually answers "what routes does this site have".
+    if kind == 'page' && key.nil? && keys.empty?
+      return failure("read page needs a KEY (a route like / or /about) -- `sites-cli list-pages #{slug}" \
+                     "#{branch ? " --branch #{branch}" : ''}` lists the routes this CLI can see", code: 'USAGE')
+    end
 
     args = base.merge('kind' => kind)
     if keys.any?
@@ -3194,6 +3332,45 @@ def run(argv)
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     return cmd_tools(slug)
+
+  # -- list-pages: composes a route listing out of describe_site's own pending
+  #    diff and one read per key, because there is no dedicated tool yet
+  #    (pc_4ab84e17) --
+  when 'list-pages'
+    slug = argv.shift
+    return failure('list-pages requires SLUG', code: 'USAGE') unless slug
+    branch = opt(argv, '--branch')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return cmd_list_pages(slug, branch)
+
+  # -- guide: prose that used to live only in AGENTS.md (which drifts) is now
+  #    a server resource too, read {kind: guide}. No topic lists topics --
+  when 'guide'
+    slug = argv.shift
+    return failure('guide requires SLUG [TOPIC]', code: 'USAGE') unless slug
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    format = opt(argv, '--format')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    if format && !%w[text json].include?(format)
+      return failure("--format takes text or json, not #{format.inspect}", code: 'USAGE')
+    end
+    topic = argv.shift || base['key']
+    return cmd_guide(slug, topic, format: format)
+
+  # -- heads: read {kind: prepared, keys: [...]} in one call, the bulk form
+  #    128 browser launches used to stand in for (pc_8ecfd09c) --
+  when 'heads'
+    slug = argv.shift
+    return failure('heads requires SLUG ROUTE...', code: 'USAGE') unless slug
+    branch = opt(argv, '--branch')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    routes = argv.dup
+    return failure('heads requires at least one ROUTE', code: 'USAGE') if routes.empty?
+    return cmd_heads(slug, routes, branch: branch)
 
   when 'analytics'
     slug = argv.shift
