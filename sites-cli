@@ -799,6 +799,13 @@ def cmd_publish_review(slug, review, branch, base, idempotency)
   # for is cleared, so an explicit token for another branch changes nothing.
   forget_review(slug, branch) if data['published'] && cached_review(slug, branch) == review
   remember_branch_state(slug, data)
+  # publication is a site-wide sequence, not this site's own count, so a jump
+  # from 12 to 38 is normal -- every other tenant's publish moved it too --
+  # and reads as a missing publication unless something says so.
+  if data['published'] && data['publication']
+    $stderr.puts("publish: publication #{data['publication']} (site-wide sequence; numbers are global " \
+                 'across the platform, so gaps are normal)')
+  end
   success(data)
 end
 
