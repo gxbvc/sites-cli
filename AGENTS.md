@@ -530,7 +530,7 @@ does the conversion and prints it:
 
 ```json
 {"ok":true,"data":{"format":"html","metadata":{...},"body":"...","css":"...",
- "config":{"stylesheets":[...],"modules":[...],"imports":{...},"favicon":{"url":"..."}},
+ "config":{"stylesheets":[...],"scripts":[...],"imports":{...},"favicon":{"url":"..."}},
  "assets":[...],"changes":[...],"notes":[...],"warnings":[...]}}
 ```
 
@@ -555,7 +555,8 @@ sites-cli save onyx --changes /tmp/changes.json --message "twelve pages, one sna
 | `<link rel="stylesheet" href="https://fonts.googleapis.com/...">` | `metadata.font_stylesheet` -- the one font host the shell links |
 | `<link rel="icon" href="assets/x">` | `config.favicon.url` |
 | `<script type="importmap">` | `config.imports` -- the shell emits the one import map |
-| `<script type="module" src="assets/x.js">` | `config.modules` |
+| `<script type="module" src="assets/x.js">` | `config.scripts` as a bare path (a module) |
+| `<script src="assets/x.js" defer>` in `<head>` | `config.scripts` as `{path, mode: "classic", defer}` -- a body one stays in the body |
 | `<script type="application/ld+json">` in `<head>` | `metadata.schema`, with `@context` stripped and `@graph` splatted |
 | `<script src="...analytics.gxb.vc...">` | dropped -- the shell emits the site's own |
 | `<style>` (head or body) | the page document's `css` |

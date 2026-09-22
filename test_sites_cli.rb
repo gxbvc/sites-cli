@@ -2223,6 +2223,9 @@ check('check reports a clean page, exits 0, sets the viewport and always closes 
   log = File.read(BROWSER_LOG)
   assert(log.include?('set viewport 1280 900'), "expected the viewport to be set: #{log}")
   assert(log.include?('wait --load networkidle'), "expected a networkidle wait: #{log}")
+  eval_line = log.lines.index { |l| l.include?(' eval -b ') }
+  requests_line = log.lines.index { |l| l.include?('network requests') }
+  assert(eval_line && eval_line < requests_line, "expected lazy images loaded before requests are read: #{log}")
   assert(log.lines.last.include?('close'), "expected the session to be closed last: #{log}")
   sessions = log.lines.map { |l| l.split(' ').first }.uniq
   assert(sessions.size == 1, "expected one session per run, got #{sessions.inspect}")
@@ -2475,10 +2478,28 @@ check('fragment drops the document shell and carries the head into config and me
     assert(data['metadata']['description'] == 'Stealth hardware.', "got #{data['metadata'].inspect}")
     assert(data['metadata']['noindex'] == true, "got #{data['metadata'].inspect}")
     assert(data['config']['stylesheets'] == %w[assets/stealth.css], "got #{data['config'].inspect}")
-    assert(data['config']['modules'] == %w[assets/onyx-core-motion.js], "got #{data['config'].inspect}")
+    assert(data['config']['scripts'] == %w[assets/onyx-core-motion.js], "got #{data['config'].inspect}")
     assert(data['config']['imports'] == { 'three' => 'assets/vendor/three/three.module.js' }, "got #{data['config'].inspect}")
     assert(data['config']['favicon'] == { 'url' => 'assets/onyx-favicon.svg' }, "got #{data['config'].inspect}")
     assert(data['css'] == '.hero { color: red; }', "got #{data['css'].inspect}")
+  end
+end
+
+check('fragment lifts a local classic script in <head> into config.scripts instead of dropping it') do
+  html = '<html><head><title>JIT</title><script src="assets/js/site.js" defer></script>' \
+         '<script type="module" src="assets/js/app.js"></script>' \
+         '<script src="https://third.party/x.js"></script></head>' \
+         '<body><p>hi</p><script src="assets/js/page.js"></script></body></html>'
+  with_page_file(html) do |_dir, path|
+    out, err, code = run_cli('fragment', path)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    data = JSON.parse(out)['data']
+
+    assert(data['config']['scripts'] == [{ 'path' => 'assets/js/site.js', 'mode' => 'classic', 'defer' => true },
+                                         'assets/js/app.js'], "got #{data['config'].inspect}")
+    assert(data['body'].include?('{{ asset:assets/js/page.js }}'), "expected the body script kept: #{data['body']}")
+    assert(err.include?('config.scripts (classic, defer)'), "expected the lift noted: #{err}")
+    assert(err.include?('https://third.party/x.js'), "expected the third-party head script warned: #{err}")
   end
 end
 
@@ -2704,7 +2725,7 @@ check('save --page --html --config builds the two-change payload by itself') do
   end
 end
 
-check('save carries stylesheets, modules and imports into a config that does not declare them') do
+check('save carries stylesheets, scripts and imports into a config that does not declare them') do
   with_page_file do |dir, path|
     config = File.join(dir, 'config.json')
     File.write(config, JSON.generate(name: 'Onyx'))
@@ -2714,7 +2735,7 @@ check('save carries stylesheets, modules and imports into a config that does not
 
     document = last_args['save']['changes'][0]['document']
     assert(document['stylesheets'] == %w[assets/stealth.css], "got #{document.inspect}")
-    assert(document['modules'] == %w[assets/onyx-core-motion.js], "got #{document.inspect}")
+    assert(document['scripts'] == %w[assets/onyx-core-motion.js], "got #{document.inspect}")
     assert(document['imports'] == { 'three' => 'assets/vendor/three/three.module.js' }, "got #{document.inspect}")
     assert(err.include?('carried'), "expected the carry reported on stderr, got #{err.inspect}")
   end
@@ -2731,7 +2752,7 @@ check('a config that declares a key wins, even when it declares it empty') do
   end
 end
 
-check('save --html with no --config says the stylesheets and modules will not load') do
+check('save --html with no --config says the stylesheets and scripts will not load') do
   with_page_file do |_dir, path|
     run_cli('describe', 'onyx')
     _out, err, code = run_cli('save', 'onyx', '--page', '/', '--html', path)
@@ -2859,7 +2880,7 @@ check('one --config carries the union of every converted head, and the config st
     assert(changes[0]['kind'] == 'config', 'expected the config put first')
     assert(changes[0]['document']['stylesheets'] == %w[assets/a.css assets/b.css],
       "expected both sheets, got #{changes[0]['document']['stylesheets'].inspect}")
-    assert(changes[0]['document']['modules'] == %w[assets/b.js], "got #{changes[0]['document'].inspect}")
+    assert(changes[0]['document']['scripts'] == %w[assets/b.js], "got #{changes[0]['document'].inspect}")
     assert(changes.map { |c| c['key'] }.compact == %w[/a /b], "got #{changes.map { |c| c['key'] }.inspect}")
   end
 end

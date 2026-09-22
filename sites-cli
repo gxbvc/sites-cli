@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.3.1'
+VERSION = '2.4.0'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
@@ -1833,6 +1833,27 @@ def blank_screenshot_reason(path, full:)
   "#{bytes} bytes for a full-page capture is a blank image: the page had not painted when it was captured"
 end
 
+# A loading="lazy" image below the fold is never requested by a headless
+# browser that does not scroll, so a full-page screenshot showed JIT's
+# before/after sliders as black boxes, and a broken lazy image was never a
+# failed request. Make every image eager and give them a few seconds.
+LAZY_IMAGES_JS = <<~JS
+  (async () => {
+    const lazy = [...document.querySelectorAll('img[loading="lazy"]')];
+    lazy.forEach((img) => { img.loading = 'eager'; });
+    const pending = [...document.images].filter((img) => !img.complete);
+    await Promise.race([
+      Promise.all(pending.map((img) => new Promise((done) => { img.addEventListener('load', done); img.addEventListener('error', done); }))),
+      new Promise((done) => setTimeout(done, 5000))
+    ]);
+    return lazy.length;
+  })()
+JS
+
+def load_lazy_images(session)
+  agent_browser(session, 'eval', '-b', [LAZY_IMAGES_JS].pack('m0'))
+end
+
 def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true, against: nil, full: true)
   session = "sites-cli-#{SecureRandom.hex(4)}"
   result = nil
@@ -1847,6 +1868,7 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true, against: 
     page, err = extract_page(session, url, want_html: !against.nil?)
     return fail_with(err) if err
 
+    load_lazy_images(session)
     console, = agent_browser(session, 'console')
     errors, = agent_browser(session, 'errors')
     requests, = agent_browser(session, 'network', 'requests')
@@ -2067,35 +2089,66 @@ def config_warnings(config)
    'declare the .png.']
 end
 
-def scan_scripts(markup, prefix, config, warnings)
-  markup.scan(SCRIPT_TAG) do |tag, inner|
-    type = tag[/\btype=["']([^"']+)["']/i, 1].to_s.downcase
-    src = tag[/\bsrc=["']([^"']+)["']/i, 1]
+# A local script becomes a config.scripts entry: a module as its bare path, a
+# classic script in the <head> as {path, mode: classic} with its own
+# defer/async. The head goes wholesale, and a local classic script there used
+# to go with it, silently. A classic script in the body stays where it is, with
+# its src rewritten to {{ asset: }}, because it only runs on that page.
+CLASSIC_SCRIPT_TYPES = ['', 'text/javascript', 'application/javascript'].freeze
 
-    if type == 'importmap'
-      parsed = begin JSON.parse(inner) rescue nil end
-      if parsed.is_a?(Hash) && parsed['imports'].is_a?(Hash)
-        parsed['imports'].each do |name, target|
-          local = local_asset(target, prefix)
-          if local
-            config['imports'][name] = local
-          else
-            warnings << "import map entry #{name.inspect} points outside #{prefix} and was dropped: #{target}"
-          end
-        end
-      else
-        warnings << 'an inline import map could not be parsed as JSON; its entries were not carried into config.imports'
-      end
-    elsif type == 'module' && src
-      local = local_asset(src, prefix)
-      if local
-        config['modules'] << local unless config['modules'].include?(local)
-      else
-        warnings << "module script points outside #{prefix} and was left in the body: #{src}"
-      end
+def scan_scripts(head, body, prefix, config, warnings, notes)
+  [[head, true], [body, false]].each do |markup, in_head|
+    markup.scan(SCRIPT_TAG) do |tag, inner|
+      scan_script(tag, inner, in_head, prefix, config, warnings, notes)
     end
   end
 end
+
+def script_listed?(config, path)
+  config['scripts'].any? { |entry| (entry.is_a?(Hash) ? entry['path'] : entry) == path }
+end
+
+# rubocop:disable Metrics/ParameterLists
+def scan_script(tag, inner, in_head, prefix, config, warnings, notes)
+  type = tag[/\btype=["']([^"']+)["']/i, 1].to_s.downcase
+  src = tag[/\bsrc=["']([^"']+)["']/i, 1]
+
+  if in_head && src && CLASSIC_SCRIPT_TYPES.include?(type) && (local = local_asset(src, prefix))
+    return if script_listed?(config, local)
+
+    entry = { 'path' => local, 'mode' => 'classic' }
+    entry['defer'] = true if tag.match?(/\sdefer\b/i)
+    entry['async'] = true if tag.match?(/\sasync\b/i)
+    config['scripts'] << entry
+    notes << "<script src=\"#{src}\"> in <head> -> config.scripts (classic#{entry['defer'] ? ', defer' : ''}) -- the " \
+             'shell links it at the end of the body'
+    return
+  end
+
+  if type == 'importmap'
+    parsed = begin JSON.parse(inner) rescue nil end
+    if parsed.is_a?(Hash) && parsed['imports'].is_a?(Hash)
+      parsed['imports'].each do |name, target|
+        local = local_asset(target, prefix)
+        if local
+          config['imports'][name] = local
+        else
+          warnings << "import map entry #{name.inspect} points outside #{prefix} and was dropped: #{target}"
+        end
+      end
+    else
+      warnings << 'an inline import map could not be parsed as JSON; its entries were not carried into config.imports'
+    end
+  elsif type == 'module' && src
+    local = local_asset(src, prefix)
+    if local
+      config['scripts'] << local unless script_listed?(config, local)
+    else
+      warnings << "module script points outside #{prefix} and was left in the body: #{src}"
+    end
+  end
+end
+# rubocop:enable Metrics/ParameterLists
 
 # A page posts to /f/<name> as a plain HTML form -- no script required. The
 # platform renders the success or error page itself now; the old
@@ -2110,7 +2163,7 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
   options = Conversion.new(prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
   notes = []
   warnings = []
-  config = { 'stylesheets' => [], 'modules' => [], 'imports' => {} }
+  config = { 'stylesheets' => [], 'scripts' => [], 'imports' => {} }
   metadata = {}
 
   parts = document_parts(html)
@@ -2139,9 +2192,10 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
 
   external_styles = []
   scan_stylesheets_and_icons("#{head}\n#{body}", prefix, config, external_styles)
-  scan_scripts("#{head}\n#{body}", prefix, config, warnings)
+  scan_scripts(head, body, prefix, config, warnings, notes)
   notes << "<link rel=\"stylesheet\"> -> config.stylesheets (#{config['stylesheets'].join(', ')})" if config['stylesheets'].any?
-  notes << "<script type=\"module\" src> -> config.modules (#{config['modules'].join(', ')})" if config['modules'].any?
+  modules = config['scripts'].grep(String)
+  notes << "<script type=\"module\" src> -> config.scripts (#{modules.join(', ')})" if modules.any?
   notes << "<script type=\"importmap\"> -> config.imports (#{config['imports'].keys.join(', ')}) -- the shell emits the one import map" if config['imports'].any?
   notes << "<link rel=\"icon\"> -> config.favicon.url (#{config.dig('favicon', 'url')})" if config['favicon']
   external_styles.each do |href|
@@ -2165,7 +2219,7 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
     type = tag[/\btype=["']([^"']+)["']/i, 1].to_s.downcase
     next if %w[importmap application/ld+json].include?(type) || tag.match?(/\bsrc=/i) || inner.strip.empty?
     warnings << 'an inline <script> in <head> was dropped with the rest of the head. ' \
-                'Put it in the body, or upload it and name it in config.modules.'
+                'Put it in the body, or upload it and name it in config.scripts.'
   end
 
   # Structured data has a home now: metadata.schema, merged into the shell's
@@ -2287,7 +2341,8 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
     warnings << 'srcset is not rewritten: bind each candidate by hand, or use one src.'
   end
 
-  assets = (referenced + config['stylesheets'] + config['modules'] + config['imports'].values +
+  script_paths = config['scripts'].map { |entry| entry.is_a?(Hash) ? entry['path'] : entry }
+  assets = (referenced + config['stylesheets'] + script_paths + config['imports'].values +
             [config.dig('favicon', 'url')]).compact.uniq.sort
 
   { 'format' => 'html', 'metadata' => metadata, 'body' => body.strip, 'css' => css,
@@ -2544,7 +2599,7 @@ def build_config_change(config_file, pages)
     if declaring.any?
       keys = declaring.flat_map { |fragment| fragment['config'].keys }.uniq
       $stderr.puts("save: the document(s) declare #{keys.join(', ')}, and no --config was given -- those " \
-                   'stylesheets, modules and imports will not load until a config document names them.')
+                   'stylesheets, scripts and imports will not load until a config document names them.')
     end
     return [nil, nil]
   end
