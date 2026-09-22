@@ -477,6 +477,43 @@ the last hosted one.
 prepared for a different host than the current canonical, `live_prepared_for`
 and a `next` saying to wait for the rebuild and republish.
 
+## The reserved /404 page
+
+`/404` is a route a site may author like any other page (`put page key:"/404"`),
+and it goes through the same build and the same site layout as every other
+page. An unknown route on a tenant host serves those prepared bytes with HTTP
+status 404, on live and on a preview alike, no-store. A site that never
+authors `/404` still gets one: the build prepares a generic page in the site's
+own layout (the site name, one line, a link home), so every versioned site has
+a prepared 404 artifact whether or not it wrote one. `/404` is excluded from
+the sitemap and `llms.txt` and carries `robots: noindex` on its own. Requesting
+`/favicon.ico` with no matching asset is a 302 to the config favicon's 32x32
+transform when one is declared, or to the prepared 404 otherwise -- not the
+raw platform 404 page a crawler used to get back for a request that was never
+for HTML in the first place (`pc_0a5d13b9`). A 500 stays the platform's own
+generic page; only 404 is a site's to author.
+
+## Bilingual sites
+
+Ghost's model is the one used here: one collection per language on its own
+path prefix, explicit paths, never `Accept-Language` negotiation (prepared
+bytes are static and cannot vary by request header).
+
+- `config.locales: {default: "en", others: ["es"]}` -- BCP 47 tags. The old
+  single-locale `config.locale` still works and means `locales.default`; nothing
+  that only ever set `config.locale` has to change.
+- A page's `metadata.lang` names a tag from `locales`; `metadata.translation_of`
+  names the route of the page it translates, which must exist in the same
+  snapshot and must itself carry the default language.
+- The shell emits `<html lang>` per page, `og:locale` per page, `<link
+  rel=alternate hreflang>` for every translation pair (including the page
+  itself) plus `x-default` pointing at the default-language page, and sitemap
+  `xhtml:link` alternates. `llms.txt` lists translations under their source
+  page. A page's own `translation_of` is the only pairing needed -- the reverse
+  listing on the source page is derived at build time, not authored by hand.
+- 126 Spanish routes of one real client site could not be represented before
+  this existed (`pc_eede8112`); this is that decision, recorded.
+
 ## fragment, and save --page --html
 
 A versioned page is a JSON document whose `body` is a **fragment**: the shell
