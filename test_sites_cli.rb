@@ -64,6 +64,13 @@ bound_assets = {}                              # "branch:key" => digest bound on
 publications = 0
 preview_queue = []                             # statuses wait-preview walks through
 fail_batch_read = false                        # a test arms this to play a pre-slice-E server
+# list-pages composes itself out of describe_site's own pending diff; a test
+# arms this to control exactly what that diff names.
+pending_changes = { 'pages' => { 'added' => %w[/about], 'changed' => %w[/] },
+                    'collections' => { 'added' => %w[blog] } }
+archived_branches = []                         # branch names archive_branch has taken out of service
+no_guide_kind = false                          # a test arms this to play a pre-round-2 server
+heads_shape = :bulk                            # :bulk, :legacy (pre-round-2 single-route answer), or :missing
 authorized = {}                                # upload id => the authorize payload
 upload_seq = 0
 put_mutex = Mutex.new
@@ -185,11 +192,12 @@ server.mount_proc('/') do |req, res|
         site: 'onyx', name: 'Onyx', versioned: true, restricted: false,
         capabilities: %w[draft publish read],
         live: nil,
-        branches: branch_heads.reject { |name, _| name == 'live' }.map { |name, head|
+        branches: branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' }.map { |name, head|
           { name: name, expected: head, preview_status: status,
             preview_url: "https://abcdefghijklmn-onyx.gxbsites.com", diagnostics: [], review: "rev_#{head}" }
         },
-        pending: { branch: args['branch'] || 'draft', against: 'live', keys: 1, truncated: false })
+        pending: { branch: args['branch'] || 'draft', against: 'live', keys: 1, truncated: false,
+                  changes: pending_changes })
     when 'read'
       branch = args['branch'] || 'draft'
       # A historical read answers with the snapshot it read, not a branch head
@@ -230,6 +238,44 @@ server.mount_proc('/') do |req, res|
           res.body = JSON.generate(kind: 'asset', branch: branch, expected: expected,
             digests: digests, keys: args['keys'].size)
         end
+      elsif args['kind'] == 'guide'
+        # round-2: prose generated from one Ruby constant, kind "guide". A
+        # server that predates the deploy has never heard of this kind and
+        # answers the same 422 an unrelated invalid kind would -- that is the
+        # version handshake's whole signal, not a probe of its own.
+        if no_guide_kind
+          res.status = 422
+          res.body = JSON.generate(error: 'invalid_request',
+            message: 'kind must be one of page, layout, include, collection, redirect, config, asset')
+        elsif args['key']
+          res.status = 200
+          res.body = JSON.generate(kind: 'guide', key: args['key'],
+            markdown: "# #{args['key'].capitalize}\n\nGuide text for #{args['key']}.")
+        else
+          res.status = 200
+          res.body = JSON.generate(kind: 'guide', topics: %w[forms conventions])
+        end
+      elsif args['kind'] == 'prepared' && args['keys']
+        case heads_shape
+        when :missing
+          # A pre-round-2 server ignores `keys` and answers the single-route
+          # shape it has always answered -- no `heads` map at all.
+          res.status = 200
+          res.body = JSON.generate(kind: 'prepared', key: '/', subject: branch, snapshot: expected,
+            build: 'ready', bytes: 12, html: '<p>one</p>', markdown: nil)
+        else
+          entries = args['keys'].to_h do |route|
+            if route == '/missing'
+              [ route, { missing: true } ]
+            else
+              [ route, { title: "Title for #{route}", canonical: "https://onyx.gxbsites.com#{route}",
+                        robots: 'index,follow', lang: 'en', json_ld_types: %w[WebPage], bytes: 128,
+                        digest: 'b' * 64 } ]
+            end
+          end
+          res.status = 200
+          res.body = JSON.generate(kind: 'prepared', branch: branch, expected: expected, heads: entries)
+        end
       else
         res.status = 200
         res.body = JSON.generate(kind: args['kind'], key: args['key'], branch: branch,
@@ -237,6 +283,7 @@ server.mount_proc('/') do |req, res|
           metadata: { 'title' => 'Home' }, body: '<p>one</p>')
       end
     when 'archive_branch'
+      archived_branches << args['name']
       res.status = 200
       res.body = JSON.generate(site: 'onyx', branch: args['name'], archived: true,
         archived_at: '2026-09-21T04:20:00Z', expected: branch_heads[args['name']] || 'snap_head0')
@@ -794,6 +841,17 @@ check('describe posts describe_site and remembers every branch head token') do
     "expected the draft head remembered, state has #{state['expected:onyx:draft'].inspect}")
 end
 
+# pc_72a85f0b: filed against a version of the deployed CLI that echoed the
+# whole envelope on stderr as well as stdout. Not reproducible against this
+# source (describe only ever calls `success`, which only writes stdout), but
+# the invariant is worth locking in with a real check rather than trusting
+# a code read.
+check('describe writes nothing at all to stderr -- stdout is the only envelope') do
+  _out, err, code = run_cli('describe', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}")
+  assert(err == '', "expected empty stderr, got #{err.inspect}")
+end
+
 check('describe still passes a legacy PATH argument through untouched') do
   run_cli('describe_site', 'onyx', 'about.md')
   assert(last_args['describe_site'] == { 'path' => 'about.md' }, "got #{last_args['describe_site'].inspect}")
@@ -835,6 +893,29 @@ check('read --keys with a non-asset kind is refused before any request') do
   assert(code == 1, 'expected a nonzero exit')
   assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
   assert(requests.values.sum == before, 'a batch read of pages reached the server')
+end
+
+# pc_4ab84e17: `read SLUG page` with no KEY used to be a 422 from the server
+# with nothing to do about it. Now it is a local usage error that names the
+# command that actually answers "what routes does this site have".
+check('read page with no KEY names list-pages instead of asking the server') do
+  before = requests.values.sum
+  out, _err, code = run_cli('read', 'onyx', 'page')
+  assert(code == 1, 'expected a nonzero exit')
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(parsed['error'].include?('list-pages onyx'), "expected list-pages named, got #{parsed['error'].inspect}")
+  assert(requests.values.sum == before, 'a bare read page reached the server')
+end
+
+check('read page with no KEY but --branch passes the branch through to the list-pages hint') do
+  out, = run_cli('read', 'onyx', 'page', '--branch', 'seo')
+  assert(JSON.parse(out)['error'].include?('list-pages onyx --branch seo'), "got #{out}")
+end
+
+check('read collection with a KEY is unaffected by the page-only usage check') do
+  out, _err, code = run_cli('read', 'onyx', 'collection', 'blog')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
 end
 
 check('--json - supplies the whole arguments object from stdin') do
@@ -931,6 +1012,28 @@ check('archive-branch posts archive_branch with just the name') do
   assert(JSON.parse(out).dig('data', 'archived') == true, "expected the raw envelope, got #{out}")
 end
 
+# pc_6e8f551e: an archived branch is out of service, but its CAS/review state
+# used to survive in state.json and could mislead a later create-branch that
+# reused the name.
+check('archive-branch removes the branch\'s expected and last_review entries from state.json') do
+  run_cli('create-branch', 'onyx', 'withreview', '--from', 'live')
+  # Fabricate a remembered review for it the way a save or publish --keys
+  # would, so there is something for archive-branch to clean up.
+  run_cli('publish', 'onyx', '--keys', 'page:/about', '--branch', 'withreview')
+  assert(state['last_review:onyx:withreview'], 'expected a review remembered before archiving')
+
+  run_cli('archive-branch', 'onyx', 'withreview')
+  assert(state['expected:onyx:withreview'].nil?, 'expected the archived branch\'s CAS token gone from state.json')
+  assert(state['last_review:onyx:withreview'].nil?, 'expected the archived branch\'s review gone from state.json')
+end
+
+check('archive-branch never leaves the archived branch\'s own state behind, even freshly created') do
+  run_cli('create-branch', 'onyx', 'freshly-archived', '--from', 'live')
+  assert(state['expected:onyx:freshly-archived'], 'expected create-branch to remember a head first')
+  run_cli('archive-branch', 'onyx', 'freshly-archived')
+  assert(state['expected:onyx:freshly-archived'].nil?, 'expected the head forgotten after archiving')
+end
+
 check('archive-branch with no NAME fails locally with no request') do
   before = requests.values.sum
   out, _err, code = run_cli('archive-branch', 'onyx')
@@ -944,12 +1047,140 @@ check('diff posts diff with branch and against') do
   assert(last_args['diff'] == { 'branch' => 'seo', 'against' => 'draft' }, "got #{last_args['diff'].inspect}")
 end
 
+# =============================================================================
+# round 2: list-pages, guide, heads, the version handshake
+# =============================================================================
+
+check('list-pages composes a listing out of describe_site\'s pending.changes plus one read per key') do
+  out, err, code = run_cli('list-pages', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  data = JSON.parse(out)['data']
+  assert(data['pages'].map { |p| p['key'] }.sort == %w[/ /about], "got #{data['pages'].inspect}")
+  assert(data['pages'].all? { |p| p['digest'] == 'a' * 64 && p['format'] == 'html' }, "got #{data['pages'].inspect}")
+  assert(data['collections'].map { |c| c['key'] } == %w[blog], "got #{data['collections'].inspect}")
+  assert(err.include?('2 page(s), 1 collection(s)'), "expected the count on stderr, got #{err.inspect}")
+  # kind is singular in the read requests list-pages issues, matching what
+  # `read` itself takes, even though describe_site grouped them as plural
+  # namespaces ("pages", "collections").
+  assert(last_args['read']['kind'] == 'page' || last_args['read']['kind'] == 'collection',
+    "got #{last_args['read'].inspect}")
+end
+
+check('list-pages says on stderr that an unchanged-since-publish route will not appear') do
+  _out, err, = run_cli('list-pages', 'onyx')
+  assert(err.include?('pc_4ab84e17'), "expected the known-limitation note, got #{err.inspect}")
+end
+
+check('list-pages --branch is passed through to describe_site') do
+  run_cli('list-pages', 'onyx', '--branch', 'seo')
+  assert(last_args['describe_site'] == { 'branch' => 'seo' }, "got #{last_args['describe_site'].inspect}")
+end
+
+check('guide with no topic lists topics as the raw envelope') do
+  out, _err, code = run_cli('guide', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'guide' }, "got #{last_args['read'].inspect}")
+  assert(JSON.parse(out).dig('data', 'topics') == %w[forms conventions], "got #{out}")
+end
+
+check('guide SLUG TOPIC --format json prints the envelope even though it has Markdown in it') do
+  out, _err, code = run_cli('guide', 'onyx', 'forms', '--format', 'json')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'guide', 'key' => 'forms' }, "got #{last_args['read'].inspect}")
+  assert(JSON.parse(out).dig('data', 'markdown').include?('Guide text for forms'), "got #{out}")
+end
+
+check('guide SLUG TOPIC --format text prints the Markdown alone, not the envelope') do
+  out, _err, code = run_cli('guide', 'onyx', 'forms', '--format', 'text')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(out.strip == "# Forms\n\nGuide text for forms.", "got #{out.inspect}")
+  assert((JSON.parse(out) rescue :not_json) == :not_json, 'expected plain text, not JSON, on stdout')
+end
+
+check('guide --format bogus is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('guide', 'onyx', 'forms', '--format', 'bogus')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'a bad --format reached the server')
+end
+
+check('heads reads many routes in one call and prints a compact table on stderr') do
+  out, err, code = run_cli('heads', 'onyx', '/', '/about', '/missing')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'prepared', 'keys' => %w[/ /about /missing] }, "got #{last_args['read'].inspect}")
+  data = JSON.parse(out)['data']
+  assert(data.dig('heads', '/', 'title') == 'Title for /', "got #{data.inspect}")
+  assert(data.dig('heads', '/missing', 'missing') == true, "got #{data.inspect}")
+  assert(err.include?('heads: / --'), "expected the table on stderr, got #{err.inspect}")
+  assert(err.include?('heads: /missing -- missing'), "expected the missing route flagged, got #{err.inspect}")
+end
+
+check('heads --branch is passed through') do
+  run_cli('heads', 'onyx', '/', '--branch', 'seo')
+  assert(last_args['read'] == { 'kind' => 'prepared', 'keys' => %w[/], 'branch' => 'seo' }, "got #{last_args['read'].inspect}")
+end
+
+check('heads with no ROUTE is refused before any request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('heads', 'onyx')
+  assert(code == 1, 'expected a nonzero exit')
+  assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
+  assert(requests.values.sum == before, 'heads with no routes reached the server')
+end
+
+check('heads against a server that answers the old single-route prepared shape warns instead of misreporting') do
+  heads_shape = :missing
+  begin
+    out, err, code = run_cli('heads', 'onyx', '/')
+    assert(code == 0, "still exits 0 -- the request itself succeeded, got #{code}: #{out}")
+    assert(err.include?('no `heads` map'), "expected the stale-server note, got #{err.inspect}")
+  ensure
+    heads_shape = :bulk
+  end
+end
+
+# pc_e26c86d1: the CLI used to ship ahead of the server with no consistent
+# signal, so two of three new subcommands gave confusing, unrelated 422s.
+# Now the first `read {kind: "guide"}` against an old server turns its own
+# 422 into one clear line instead.
+check('the version handshake turns an old server\'s 422 on kind guide into one clear stderr line') do
+  no_guide_kind = true
+  begin
+    out, err, code = run_cli('guide', 'onyx')
+    assert(code == 1, 'expected the underlying 422 to still fail the command')
+    assert(JSON.parse(out)['status'] == 422, "expected the real 422 preserved, got #{out}")
+    assert(err.include?('predates the round-2 deploy'), "expected the version-handshake note, got #{err.inspect}")
+    assert(err.include?('guide, heads and list-pages'), "expected the affected subcommands named, got #{err.inspect}")
+  ensure
+    no_guide_kind = false
+  end
+end
+
+check('an ordinary error on some other kind, through the same tool_call path, never triggers the stale-server note') do
+  fail_batch_read = true
+  begin
+    out, err, code = run_cli('read', 'onyx', 'asset', '--keys', 'assets/a.js')
+    assert(code == 1, 'expected the batch-read 404 to still fail the command')
+    assert(JSON.parse(out)['status'] == 404, "expected the real 404 preserved, got #{out}")
+    refute = !err.include?('predates the round-2 deploy')
+    assert(refute, "expected no stale-server note for an unrelated kind, got #{err.inspect}")
+  ensure
+    fail_batch_read = false
+  end
+end
+
 check('publish --review posts the review token with a fresh idempotency key') do
-  out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_abc')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'rev_abc')
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
   assert(last_args['publish']['review'] == 'rev_abc', "got #{last_args['publish'].inspect}")
   assert(last_args['publish']['idempotency_key'].match?(/\A[0-9a-f-]{36}\z/), 'expected a UUID idempotency key')
-  assert(JSON.parse(out).dig('data', 'published') == true, 'expected the raw publish envelope')
+  data = JSON.parse(out)['data']
+  assert(data['published'] == true, 'expected the raw publish envelope')
+  # publication is a site-wide sequence, not this site's own count, so a jump
+  # reads like a missing publication unless something says so on the spot.
+  assert(err.include?("publication #{data['publication']}"), "expected the publication number on stderr, got #{err.inspect}")
+  assert(err.include?('site-wide sequence'), "expected the gaps-are-normal note, got #{err.inspect}")
 end
 
 check('publish --keys defaults --expected to the remembered head and never treats published:false as success') do
