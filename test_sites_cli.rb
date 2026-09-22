@@ -1129,6 +1129,13 @@ check('heads --branch is passed through') do
   assert(last_args['read'] == { 'kind' => 'prepared', 'keys' => %w[/], 'branch' => 'seo' }, "got #{last_args['read'].inspect}")
 end
 
+check('read prepared --keys is the same bulk head read, not refused as asset-only') do
+  out, _err, code = run_cli('read', 'onyx', 'prepared', '--keys', '/,/about')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'prepared', 'keys' => %w[/ /about] }, "got #{last_args['read'].inspect}")
+  assert(JSON.parse(out)['data']['keys'].map { |h| h['key'] } == %w[/ /about], "got #{out}")
+end
+
 check('heads with no ROUTE is refused before any request') do
   before = requests.values.sum
   out, _err, code = run_cli('heads', 'onyx')

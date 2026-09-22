@@ -2923,7 +2923,8 @@ def run_v2(command, argv)
     return failure('read requires SLUG KIND [KEY]', code: 'USAGE') unless kind
     # The batch form is asset-only and answers {key => digest} for the ones
     # that are bound, which is how `push` skips files that have not changed.
-    return failure('--keys reads many assets at once, so it only takes kind "asset"', code: 'USAGE') if keys.any? && kind != 'asset'
+    # `prepared` with --keys is the bulk head read `heads` wraps (round 2).
+    return failure('--keys reads many assets or many prepared heads at once, so it only takes kind "asset" or "prepared"', code: 'USAGE') if keys.any? && !%w[asset prepared].include?(kind)
     # A bare `read SLUG page` used to be a 422 invalid_key with nothing to do
     # about it (pc_4ab84e17: "I recovered them from build diagnostics"). Name
     # the command that actually answers "what routes does this site have".
