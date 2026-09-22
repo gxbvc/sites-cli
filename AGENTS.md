@@ -860,7 +860,7 @@ ruby test_sites_cli.rb
 ```
 
 A stub WEBrick server plays the Sites API in-process and drives the real CLI
-binary against it (163 checks): token/site binding, the nonzero 409 exit with
+binary against it (182 checks): token/site binding, the nonzero 409 exit with
 no automatic retry or reread and no cache poisoning from the conflict body,
 from a `read --at` or from a `save --dry-run`, expected-token persistence,
 review caching and forgetting, every v2 subcommand's request shape against
@@ -877,4 +877,11 @@ its config merge, `save --dry-run`, the dry-run contract check, the `check`
 wrapper against a stub browser including the CORS probe, the preview-TLS hint
 on both host shapes, `--against` and the blank-screenshot refusal, that
 `manual` and the dispatch agree, that stdout is one JSON object per command,
-and that no bearer token reaches stdout or state.json.
+that no bearer token reaches stdout or state.json, `list-pages`'s composition
+off `describe_site`'s pending diff (and the plural-namespace/singular-kind
+mapping it depends on), `guide`'s topic listing and its text/JSON output
+modes, `heads`'s bulk request shape and its fallback note against an old
+single-route response, `archive-branch` forgetting a branch's `expected` and
+`last_review` state, the `publish` publication-number note, and that the
+version handshake fires for a genuine round-2 kind mismatch and stays silent
+for an unrelated error on the same code path.

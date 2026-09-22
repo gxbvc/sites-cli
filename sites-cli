@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.2.0'
+VERSION = '2.3.0'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
