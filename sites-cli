@@ -1596,7 +1596,7 @@ end
 # What the browser is asked for once a page has settled. Kept apart from the
 # console/network half so --against can gather it for a second URL without
 # re-running the whole check.
-def extract_page(session, url)
+def extract_page(session, url, want_html: false)
   nav, err = agent_browser(session, 'open', url)
   if err
     hint = tls_hint(url, err[:error])
@@ -1604,7 +1604,8 @@ def extract_page(session, url)
     return [nil, err]
   end
   agent_browser(session, 'wait', '--load', 'networkidle')
-  document, = agent_browser(session, 'get', 'html', 'html')
+  # One more browser round trip, so it is only taken when something compares.
+  document, = agent_browser(session, 'get', 'html', 'html') if want_html
   [{ 'url' => nav['url'] || url, 'title' => nav['title'], 'html' => document&.dig('html').to_s }, nil]
 end
 
@@ -1667,7 +1668,7 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true, against: 
 
     agent_browser(session, 'set', 'viewport', width.to_s, height.to_s)
 
-    page, err = extract_page(session, url)
+    page, err = extract_page(session, url, want_html: !against.nil?)
     return fail_with(err) if err
 
     console, = agent_browser(session, 'console')
@@ -1710,7 +1711,7 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true, against: 
     end
 
     if against
-      other, err = extract_page(session, against)
+      other, err = extract_page(session, against, want_html: true)
       return fail_with(err) if err
       left = page_profile(page['html'])
       right = page_profile(other['html'])
