@@ -8,13 +8,17 @@
 #   1. Runner commands (list/show/open/create) -- SITES_ROOT/bin/rails runner,
 #      or kamal-cli runner with --prod. Staff credentials, not a site token.
 #   2. Legacy file tools (describe_site/list_files/read_file/write_file/
-#      edit_file/publish) -- HTTP to the site-token gateway, for sites still on
-#      the file API (plans/24-agent-sites.md).
+#      edit_file/publish) -- HTTP to the site gateway, for sites still on the
+#      file API (plans/24-agent-sites.md).
 #   3. v2 tools (describe/read/save/create-branch/archive-branch/diff/publish/
 #      merge-live/resolve-merge/history/revoke-preview, plus the upload/push/
 #      wait-preview/check helpers) -- the same HTTP gateway, for versioned sites
 #      (plans/30-agent-first-sites.md). Each subcommand posts the same-named
 #      MCP tool; the shell is the transport, not a second contract.
+#
+# One credential covers all three: a personal token (sk_user_..., minted at
+# /profile) is the platform door's bearer and the fallback for any slug with no
+# site token, in which case each request names the site. See credential_for.
 #
 # Config: SITES_ROOT, SITES_CLI_HOST, SITES_CLI_CONFIG_DIR, SITES_CLI_TOKEN.
 
@@ -214,9 +218,10 @@ def cmd_open(slug, prod:)
 end
 
 # Staff-only create (plans/24-agent-sites.md slice 3 item 19, plan 30 section
-# 1.1). The `create_site` tool exists on the server, but /api/v1/tools only
-# authenticates site-bound tokens, so it always answers 403 there -- this
-# runner path is the one that works. See `create-site` below.
+# 1.1), with no credential at all beyond a shell on the box. `create-site`
+# below is the HTTP form and is what an agent should use; this stays for a
+# machine with the app checked out and no personal token minted yet. It makes
+# a legacy site, not a versioned one.
 def cmd_create(slug, name, team, prod:)
   script = <<~RUBY
     team = Team.find_or_create_by!(name: #{JSON.dump(team || 'GXB')})
@@ -269,6 +274,31 @@ def platform_token
     secure_permissions!(TOKENS_PATH)
     load_json(TOKENS_PATH)['_platform']
   end
+end
+
+# Which bearer opens a slug, and whether the request has to name the site.
+#
+# A site token carries its site inside the token, so those requests are sent
+# exactly as they always were. A personal token carries a person: it opens
+# every site that person can read, and the server resolves which one from a
+# `site` field in the request (plan 30 section 4). So `site` is set only when
+# the credential is the personal one, and one bearer covers create-site ->
+# push -> save -> publish with no token step in the middle.
+Credential = Struct.new(:token, :site)
+
+def credential_for(slug)
+  site_token = token_for(slug)
+  return Credential.new(site_token, nil) if site_token
+
+  personal = platform_token
+  personal ? Credential.new(personal, slug) : nil
+end
+
+def no_credential_error(slug)
+  api_error("no credential for #{slug}: add a site token for it to #{TOKENS_PATH}, or a personal token " \
+            "(sk_user_..., minted at #{API_HOST}/profile) in SITES_CLI_TOKEN or as \"_platform\" there. " \
+            'A personal token opens every site you can read; a site token opens exactly one.',
+            code: 'NO_TOKEN')
 end
 
 # read_file caches {slug, path, version} locally so write/edit/publish can
@@ -367,19 +397,21 @@ def parse_api_response(res)
 end
 
 TOOLS_PATH = '/api/v1/tools'
-# The two tools with no site to be bound to have their own door and their own
-# credential (slice F section 4). A site token here is a 403, printed verbatim.
+# The two tools with no site to be bound to have their own door, and a site
+# token there is a 403, printed verbatim (plan 30 section 4).
 PLATFORM_TOOLS_PATH = '/api/v1/platform/tools'
 
-def api_call(slug, tool, arguments, token: nil, path: TOOLS_PATH)
-  token ||= token_for(slug)
-  return [nil, api_error("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN')] unless token
+def api_call(slug, tool, arguments, credential: nil, path: TOOLS_PATH)
+  credential ||= credential_for(slug)
+  return [nil, no_credential_error(slug)] unless credential
 
   uri = URI.join(API_HOST, path)
   req = Net::HTTP::Post.new(uri)
-  req['Authorization'] = "Bearer #{token}"
+  req['Authorization'] = "Bearer #{credential.token}"
   req['Content-Type'] = 'application/json'
-  req.body = JSON.generate(tool: tool, arguments: arguments)
+  envelope = { tool: tool, arguments: arguments }
+  envelope[:site] = credential.site if credential.site
+  req.body = JSON.generate(envelope)
 
   parse_api_response(http_request(req, uri))
 rescue *NETWORK_ERRORS => e
@@ -392,8 +424,8 @@ end
 # `remember: false` is for `read --at`: a historical read answers with the
 # snapshot token it read under the same `branch`/`expected` keys, so caching it
 # would hand the next `save` a token for a snapshot nobody is on.
-def tool_call(slug, tool, arguments, token: nil, remember: true, path: TOOLS_PATH)
-  data, err = api_call(slug, tool, arguments, token: token, path: path)
+def tool_call(slug, tool, arguments, credential: nil, remember: true, path: TOOLS_PATH)
+  data, err = api_call(slug, tool, arguments, credential: credential, path: path)
   return fail_with(err) if err
   remember_branch_state(slug, data) if remember
   success(data)
@@ -401,9 +433,9 @@ end
 
 # -----------------------------------------------------------------------------
 # Platform tools: list_sites and create_site, over POST /api/v1/platform/tools
-# with a personal bearer. /api/v1/tools authenticates site tokens only, and
-# `create_site` on a site-bound session is 403 by design, so this is the door
-# that works (slice F report section 4).
+# with a personal bearer. These two have no site to name, which is exactly why
+# they have their own door: the site door answers `create_site` with a 403
+# pointing back here.
 # -----------------------------------------------------------------------------
 
 def platform_token_error(what, extra = nil)
@@ -416,7 +448,9 @@ end
 def platform_tool_call(slug, tool, arguments, what, extra = nil)
   token = platform_token
   return fail_with(platform_token_error(what, extra)) unless token
-  tool_call(slug, tool, arguments, token: token, path: PLATFORM_TOOLS_PATH)
+  # No `site` field here: these two tools have no site to be bound to, and
+  # create_site takes the slug as an argument instead.
+  tool_call(slug, tool, arguments, credential: Credential.new(token, nil), path: PLATFORM_TOOLS_PATH)
 end
 
 # The two platform schemas, from the server rather than from this file. Not on
@@ -456,8 +490,9 @@ def cmd_list_submissions(slug, base, form:, since:, limit:)
     if err.dig(:body, 'capability') == 'read_submissions' || err[:error].to_s.include?('read_submissions')
       $stderr.puts("this token does not carry read_submissions, which is its own capability since slice F: " \
                    "reading a site's source is not reading the contact details people typed into its forms.")
-      $stderr.puts("next: mint a new token on the site's admin page with the read_submissions box ticked " \
-                   "(a scope cannot be added to a token that already exists), then put it in #{TOKENS_PATH}.")
+      $stderr.puts("next: mint a token with the read_submissions box ticked -- a personal one at " \
+                   "#{API_HOST}/profile, or the site's own on its admin page (a scope cannot be added to a " \
+                   "token that already exists) -- then put it in SITES_CLI_TOKEN or #{TOKENS_PATH}.")
     end
     return fail_with(err)
   end
@@ -620,15 +655,20 @@ UPLOAD_CONCURRENCY = 4
 UPLOAD_POLL_TIMEOUT = 300
 UPLOAD_POLL_INTERVAL = 1
 
-def media_api_call(slug, method, path, body, token: nil)
-  token ||= token_for(slug)
-  return [nil, api_error("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN')] unless token
+# A personal token names the site in the JSON body, the same field the tools
+# envelope carries. GET and DELETE have no body, so there it rides in the
+# query string instead -- same param, same resolution on the server.
+def media_api_call(slug, method, path, body, credential: nil)
+  credential ||= credential_for(slug)
+  return [nil, no_credential_error(slug)] unless credential
 
+  path = "#{path}?site=#{credential.site}" if credential.site && body.nil?
   uri = URI.join(API_HOST, path)
   req_class = { get: Net::HTTP::Get, delete: Net::HTTP::Delete }.fetch(method, Net::HTTP::Post)
   req = req_class.new(uri)
-  req['Authorization'] = "Bearer #{token}"
+  req['Authorization'] = "Bearer #{credential.token}"
   if body
+    body = body.merge(site: credential.site) if credential.site
     req['Content-Type'] = 'application/json'
     req.body = JSON.generate(body)
   end
@@ -657,17 +697,17 @@ end
 # The whole authorize -> stage -> complete -> poll flow for one file. `target`
 # carries either a legacy {label:, expected_version:} or a versioned
 # {filename:, digest:}. Returns the final upload_status body.
-def media_upload(slug, file_path, content_type, target, token:)
+def media_upload(slug, file_path, content_type, target, credential:)
   byte_size = File.size(file_path)
   data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
-                             target.merge(content_type: content_type, byte_size: byte_size), token: token)
+                             target.merge(content_type: content_type, byte_size: byte_size), credential: credential)
   return [nil, err] if err
   upload_id = data['id']
 
   if data['multipart']
-    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'], token: token)
+    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'], credential: credential)
     if part_err
-      media_api_call(slug, :delete, "/api/v1/media/uploads/#{upload_id}", nil, token: token)
+      media_api_call(slug, :delete, "/api/v1/media/uploads/#{upload_id}", nil, credential: credential)
       return [nil, part_err]
     end
     complete_body = { parts: parts }
@@ -677,14 +717,14 @@ def media_upload(slug, file_path, content_type, target, token:)
     complete_body = {}
   end
 
-  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/complete", complete_body, token: token)
+  data, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/complete", complete_body, credential: credential)
   return [nil, err] if err
 
   deadline = Time.now + UPLOAD_POLL_TIMEOUT
   until %w[ready failed].include?(data['status'])
     return [nil, api_error("upload #{upload_id} still #{data['status']} after #{UPLOAD_POLL_TIMEOUT}s", code: 'UPLOAD_TIMEOUT', body: data)] if Time.now >= deadline
     sleep UPLOAD_POLL_INTERVAL
-    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{upload_id}", nil, token: token)
+    data, err = media_api_call(slug, :get, "/api/v1/media/uploads/#{upload_id}", nil, credential: credential)
     return [nil, err] if err
   end
 
@@ -705,7 +745,7 @@ def cmd_write_file_upload(slug, path, file_path, expected_version)
   return failure("unsupported file extension #{File.extname(file_path)} -- accepts jpg/jpeg/png/webp/gif/mp4", code: 'BAD_TYPE') unless content_type
 
   data, err = media_upload(slug, file_path, content_type,
-                           { label: path, expected_version: version }, token: token_for(slug))
+                           { label: path, expected_version: version }, credential: credential_for(slug))
   return fail_with(err) if err
 
   remember_version(slug, path, data['id'].to_s)
@@ -717,7 +757,7 @@ end
 # retried independently (PART_MAX_ATTEMPTS each, a fresh presign every
 # attempt so an expired one just renews), at most one part's bytes
 # (part_size, 16 MiB) resident per worker regardless of total file size.
-def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, token:)
+def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, credential:)
   total_size = File.size(file_path)
   queue = Queue.new
   (1..parts_count).each { |n| queue << n }
@@ -732,7 +772,7 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, token
         break unless part_number
         mutex.synchronize { break if first_error }
 
-        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, token: token)
+        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential: credential)
         mutex.synchronize do
           if err
             first_error ||= err
@@ -749,7 +789,7 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, token
   [ results, nil ]
 end
 
-def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, token:)
+def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential:)
   offset = (part_number - 1) * part_size
   length = [ part_size, total_size - offset ].min
 
@@ -757,7 +797,7 @@ def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_si
   loop do
     attempts += 1
     presign, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts",
-                                  { part_numbers: [ part_number ] }, token: token)
+                                  { part_numbers: [ part_number ] }, credential: credential)
     return [ nil, err ] if err
 
     part_url = presign.dig('parts', 0, 'upload_url')
@@ -796,15 +836,15 @@ def cmd_upload(slug, files)
   missing = files.reject { |f| File.file?(f) }
   return failure("no such file(s): #{missing.join(' ')}", code: 'NO_FILE') if missing.any?
 
-  token = token_for(slug)
-  return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+  credential = credential_for(slug)
+  return fail_with(no_credential_error(slug)) unless credential
 
-  results = upload_files(slug, files, token: token)
+  results = upload_files(slug, files, credential: credential)
   results.each { |r| emit(r) }
   results.all? { |r| r[:status] == 'ready' } ? 0 : 1
 end
 
-def upload_files(slug, files, token:)
+def upload_files(slug, files, credential:)
   results = Array.new(files.size)
   queue = Queue.new
   files.each_index { |i| queue << i }
@@ -814,7 +854,7 @@ def upload_files(slug, files, token:)
       loop do
         index = begin queue.pop(true) rescue nil end
         break unless index
-        results[index] = upload_one_file(slug, files[index], token: token)
+        results[index] = upload_one_file(slug, files[index], credential: credential)
       end
     end
   end
@@ -822,7 +862,7 @@ def upload_files(slug, files, token:)
   results
 end
 
-def upload_one_file(slug, file_path, token:)
+def upload_one_file(slug, file_path, credential:)
   content_type = content_type_for(file_path)
   unless content_type
     return { path: file_path, status: 'failed', code: 'BAD_TYPE',
@@ -833,7 +873,7 @@ def upload_one_file(slug, file_path, token:)
   # `label` is omitted on a versioned site: bytes are bound to a logical path
   # later by `save`, not now. `digest` is the type-conflict hint slice B added.
   data, err = media_upload(slug, file_path, content_type,
-                           { filename: File.basename(file_path), digest: digest }, token: token)
+                           { filename: File.basename(file_path), digest: digest }, credential: credential)
   if err
     return { path: file_path, status: 'failed', code: err[:code], error: err[:error],
              http_status: err[:status], body: err[:body] }.compact
@@ -873,11 +913,11 @@ end
 # the fallback costs a round trip per file rather than a wrong answer.
 READ_KEYS_LIMIT = 1000
 
-def bound_digests(slug, branch, keys, token:)
+def bound_digests(slug, branch, keys, credential:)
   bound = {}
   head = nil
   keys.each_slice(READ_KEYS_LIMIT) do |slice|
-    data, err = api_call(slug, 'read', { 'kind' => 'asset', 'keys' => slice, 'branch' => branch }, token: token)
+    data, err = api_call(slug, 'read', { 'kind' => 'asset', 'keys' => slice, 'branch' => branch }, credential: credential)
     return [nil, nil, err] if err
     remember_branch_state(slug, data)
     bound.merge!(data['digests'] || {})
@@ -898,13 +938,16 @@ end
 # friction 10). `--offline` is the old behaviour when there is no token to ask
 # with.
 def push_preflight(slug, branch)
-  token = token_for(slug)
-  return [nil, api_error("no token configured for #{slug} -- add it to #{TOKENS_PATH}, or rehearse locally with --offline", code: 'NO_TOKEN')] unless token
+  credential = credential_for(slug)
+  unless credential
+    err = no_credential_error(slug)
+    return [nil, err.merge(error: "#{err[:error]} Or rehearse locally with --offline.")]
+  end
 
   # No `branch` argument: whether this site has branches at all is the question
   # being asked, and a legacy describe_site answers `branch:` with 422
   # invalid_request rather than with its own shape.
-  data, err = api_call(slug, 'describe_site', {}, token: token)
+  data, err = api_call(slug, 'describe_site', {}, credential: credential)
   return [nil, err] if err
   remember_branch_state(slug, data)
 
@@ -953,10 +996,10 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:, offline: false)
   expected, err = resolve_expected(slug, branch, expected)
   return fail_with(err) if err
 
-  token = token_for(slug)
-  return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
+  credential = credential_for(slug)
+  return fail_with(no_credential_error(slug)) unless credential
 
-  bound, head, read_err = bound_digests(slug, branch, entries.map { |e| e['key'] }, token: token)
+  bound, head, read_err = bound_digests(slug, branch, entries.map { |e| e['key'] }, credential: credential)
   if read_err
     # Only "this server has no batch asset read" is survivable. A 401, a 403 or
     # the 409 a legacy site answers is the same wall the save would hit anyway.
@@ -979,7 +1022,7 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:, offline: false)
   # Identical bytes anywhere in the tree are one upload; the API is content
   # addressed, so two logical paths can share one digest.
   by_digest = changed.group_by { |e| e['digest'] }
-  results = upload_files(slug, by_digest.values.map { |group| group.first['file'] }, token: token)
+  results = upload_files(slug, by_digest.values.map { |group| group.first['file'] }, credential: credential)
 
   failed = results.reject { |r| r[:status] == 'ready' }
   if failed.any?
@@ -1007,7 +1050,7 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:, offline: false)
   tool_call(slug, 'save', { 'branch' => branch, 'expected' => expected,
                             'idempotency_key' => SecureRandom.uuid,
                             'message' => "push #{File.basename(dir)} (#{changes.size} assets)",
-                            'changes' => changes }, token: token)
+                            'changes' => changes }, credential: credential)
 end
 
 PREVIEW_POLL_INTERVAL = 2
@@ -1680,7 +1723,7 @@ def usage
 
     Platform tools (a personal token, POST /api/v1/platform/tools):
       sites-cli list-sites                       every site you can read
-      sites-cli list-sites SLUG                  ask that one site's own token instead
+      sites-cli list-sites SLUG                  ask through that site's door instead
       sites-cli create-site SLUG --name NAME     GXB staff only
       sites-cli platform-tools                   the two schemas, from the server
 
@@ -1701,11 +1744,19 @@ def usage
     That is a 200 and exit 0, and live is untouched: the second call,
     `publish --review`, is the one that flips it.
 
-    list-sites (with no SLUG) and create-site take a personal token --
-    sk_user_..., minted at #{API_HOST}/profile -- in SITES_CLI_TOKEN or under
-    "_platform" in #{TOKENS_PATH}. A site token at that door is a 403, printed
-    verbatim. The runner command `sites-cli create SLUG --name NAME` still
-    works without any token.
+    One personal token -- sk_user_..., minted at #{API_HOST}/profile -- opens
+    every door: put it in SITES_CLI_TOKEN or under "_platform" in
+    #{TOKENS_PATH}. list-sites and create-site use it at the platform door;
+    any slug with no site token of its own uses it at that site's door, with
+    "site": SLUG in the request. A site token in #{TOKENS_PATH} under a slug
+    wins for that slug and is sent exactly as before. So create-site -> push ->
+    save -> wait-preview -> check -> publish needs no token step in between,
+    and a site token is for handing one site to someone else.
+
+    A site token at the platform door is a 403, printed verbatim, and so is a
+    site token naming a different site. A site you cannot read is a 404, never
+    a 403. The runner command `sites-cli create SLUG --name NAME` still works
+    without any token.
 
     Legacy file-API sites (plan 24):
       sites-cli describe_site SLUG [PATH]           alias: describe SLUG PATH
@@ -1731,10 +1782,11 @@ def usage
       SITES_ROOT             Path to sites Rails app (default: ~/projects/sites)
       SITES_CLI_HOST         Site-token gateway host (default: https://sites.gxb.vc)
       SITES_CLI_CONFIG_DIR   Token/state directory (default: ~/.config/sites-cli)
-      SITES_CLI_TOKEN        Personal bearer (sk_user_...) for the platform tools
+      SITES_CLI_TOKEN        Personal bearer (sk_user_...): the platform tools, and
+                             the fallback for any slug with no site token
       SITES_CLI_BROWSER      agent-browser binary for `check`
 
-    Examples:
+    Examples (all six on one personal token):
       sites-cli create-site metrolocksmith --name "Metro Locksmith"
       sites-cli push onyx ./public --dry-run
       sites-cli push onyx ./public
@@ -2043,8 +2095,9 @@ def run(argv)
     return run_v2(command, argv)
 
   # -- platform tools: a personal bearer at /api/v1/platform/tools. Naming a
-  #    SLUG instead asks that one site's own token through the site door, which
-  #    answers with just that site. --
+  #    SLUG asks through that site's door instead: with the site's own token
+  #    that answers with just that site, and with a personal token it answers
+  #    the same list the platform door would. --
   when 'list-sites'
     base, err = json_arguments(argv)
     return fail_with(err) if err
@@ -2052,9 +2105,9 @@ def run(argv)
     return fail_with(flag_err) if flag_err
     slug = argv.shift
     if slug
-      token = token_for(slug)
-      return failure("no token configured for #{slug} -- add it to #{TOKENS_PATH}", code: 'NO_TOKEN') unless token
-      return tool_call(slug, 'list_sites', base, token: token)
+      credential = credential_for(slug)
+      return fail_with(no_credential_error(slug)) unless credential
+      return tool_call(slug, 'list_sites', base, credential: credential)
     end
     return platform_tool_call('_platform', 'list_sites', base, 'list-sites',
                               "Or name one site you already hold a token for: `sites-cli list-sites SLUG`")

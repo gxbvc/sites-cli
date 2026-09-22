@@ -102,13 +102,29 @@ out -- see `wait-preview` below.
 
 | Credential | Where it lives | What it opens |
 |---|---|---|
+| Personal token `sk_user_<id>_...` | `SITES_CLI_TOKEN`, or `tokens.json` under `_platform` | everything the person can reach: `POST /api/v1/platform/tools` (`list_sites`, `create_site`), and every site door and upload for a site they can read |
 | Site token `sk_site_<slug>_...` | `tokens.json` under the slug | `POST /api/v1/tools`, `/api/v1/media/uploads` for that one site |
-| Personal token `sk_user_<id>_...` | `SITES_CLI_TOKEN`, or `tokens.json` under `_platform` | `POST /api/v1/platform/tools`: `list_sites`, `create_site` |
 | Staff credentials | the Rails app itself | `list` / `show` / `open` / `create` through the runner |
+
+**One personal credential opens both doors.** A site token is for handing a
+single site to someone else. A slug with no entry in `tokens.json` falls back
+to the personal token, and then every request carries `"site": "<slug>"` --
+the same field Chat sends. The server resolves it through that person's
+viewable sites and checks their capabilities on it, so a site they cannot read
+is a 404 (never 403: "no such site" and "a site you cannot read" have to read
+the same), and a capability they do not hold is 403 `capability_denied` naming
+it. A slug with a site token is sent exactly as it always was, with no `site`
+field at all.
 
 A site token presented at the platform door is 403 `capability_denied`, printed
 verbatim -- it is one tenant's credential at the platform endpoint, not "almost
-right". A personal token at a site door is refused the same way.
+right". A site token that names some *other* site is the same 403: a token
+bound to one tenant cannot reach another by naming it.
+
+A personal token's scopes are a ceiling **on top of** the person's
+capabilities, so the smaller of the two wins. A read-only personal token
+cannot draft on a site its owner administers, and `describe_site` reports the
+intersection rather than the person's full set.
 
 A token's scopes **are** the six capabilities, and they are fixed when it is
 minted. `read` no longer contains `read_submissions`: reading a site's source
@@ -130,8 +146,8 @@ checkout. The CLI tightens each to mode 600 on every read.
 ```
 
 `_platform` (or `SITES_CLI_TOKEN`, which wins) is the personal bearer for
-`list-sites`, `create-site` and `platform-tools`. `state.json` is one flat map
-with two key shapes:
+`list-sites`, `create-site` and `platform-tools`, and the fallback for any slug
+with no entry of its own. `state.json` is one flat map with two key shapes:
 
 | Key | Value | Written by |
 |---|---|---|
@@ -380,7 +396,7 @@ sites-cli check URL [--width 1440] [--screenshot PATH] [--ignore SUBSTR] [--no-p
 
 # platform tools (a personal token: SITES_CLI_TOKEN or tokens.json "_platform")
 sites-cli list-sites                  # every site you can read
-sites-cli list-sites SLUG             # that one site, through its own token
+sites-cli list-sites SLUG             # through that site's door, not the platform one
 sites-cli create-site SLUG --name N   # GXB staff only
 sites-cli platform-tools              # the two schemas, from the server
 
@@ -399,19 +415,24 @@ platform tool instead, and answers for whoever the personal token belongs to.
 
 `create-site` posts `create_site` to `POST /api/v1/platform/tools` with a
 personal bearer and returns the new site's `draft` branch and its first
-`expected` token, which this CLI remembers -- so the very next call can be a
-`save`. It does not mint the site's own API token or set a form recipient;
-neither happens automatically. Mint the token at
-`Admin::ApiTokensController` on the site's admin page and put it in
-`tokens.json` under the slug. The runner command
-`sites-cli create SLUG --name NAME` still works and needs no token at all.
+`expected` token, which this CLI remembers -- so the very next call really is a
+`save`, `push` or `upload` on the same credential, with no token step in
+between. Minting the site's own token is optional now, and is for handing that
+one site to someone else (`Admin::ApiTokensController` on its admin page, then
+`tokens.json` under the slug). `create-site` still sets no form recipient. The
+runner command `sites-cli create SLUG --name NAME` also works and needs no
+token at all.
 
 ## Worked example: an Onyx-shaped site
 
-Six commands, given a directory holding `index.html`, `assets/`, and a
-`config.json` with the site's `name`, `runtime` and `business`:
+Seven commands and one credential, from nothing to live. Given a directory
+holding `index.html`, `assets/`, and a `config.json` with the site's `name`,
+`runtime` and `business`, and a personal token in `SITES_CLI_TOKEN`:
 
 ```bash
+# 0. the site itself. Nothing else is needed: no admin page, no site token.
+sites-cli create-site onyx --name "Onyx"      # remembers the new draft head
+
 # 1. the public tree: contract checked, unchanged files skipped, the rest
 #    uploaded and bound in one save
 sites-cli push onyx ./public --dry-run        # one describe_site: right contract? right branch?
@@ -445,13 +466,10 @@ sites-cli wait-preview onyx                   # the candidate has its own build
 sites-cli publish onyx --review last          # this is what flips live
 ```
 
-A site that does not exist yet is one more command in front of all of it, with
-a personal token in `SITES_CLI_TOKEN`:
-
-```bash
-sites-cli create-site onyx --name "Onyx"      # remembers the new draft head
-# then mint the site's own token on its admin page and add it to tokens.json
-```
+Every command above ran on the one personal token, which is why step 0 sits in
+the same block as the rest. To hand this site to someone who should have only
+it, mint its own token on its admin page and add it to `tokens.json` under the
+slug; this CLI then prefers that token for this slug and sends no `site` field.
 
 A missing static dependency (`BufferGeometryUtils.js`) makes the `save`
 succeed and `wait-preview` exit 1 with `preview_status: "invalid"` and a
@@ -470,7 +488,7 @@ before somebody else published is 409 `upstream_changed` pointing at
 | `SITES_ROOT` | `~/projects/sites` | the sites Rails app, for the runner commands |
 | `SITES_CLI_HOST` | `https://sites.gxb.vc` | the site-token gateway |
 | `SITES_CLI_CONFIG_DIR` | `~/.config/sites-cli` | tokens.json + state.json |
-| `SITES_CLI_TOKEN` | -- | personal bearer (`sk_user_...`) for the platform tools |
+| `SITES_CLI_TOKEN` | -- | personal bearer (`sk_user_...`): the platform tools, and the fallback for any slug with no site token |
 | `SITES_CLI_BROWSER` | `agent-browser` | the browser binary `check` drives |
 
 `--prod` on a runner command requires `kamal-cli` on PATH.
@@ -482,7 +500,7 @@ ruby test_sites_cli.rb
 ```
 
 A stub WEBrick server plays the Sites API in-process and drives the real CLI
-binary against it (103 checks): token/site binding, the nonzero 409 exit with
+binary against it (111 checks): token/site binding, the nonzero 409 exit with
 no automatic retry or reread and no cache poisoning from the conflict body or
 from a `read --at`, expected-token persistence, review caching and forgetting,
 every v2 subcommand's request shape against `Mcp::ToolRegistry`, each terminal
@@ -490,7 +508,10 @@ every v2 subcommand's request shape against `Mcp::ToolRegistry`, each terminal
 multipart), upload content types and bounded parallelism, push change-list
 generation, dedup, the batch-read skip and its fallback, the platform door
 (personal bearer, a site token's 403 printed verbatim, the remembered new-site
-head), `list_submissions` and its `read_submissions` 403, `get_analytics`, the
+head), the personal token at the site doors (the `site` field on every tools,
+upload and status request, none on a site token's, create-site straight into a
+save, and `NO_TOKEN` naming both ways out),
+`list_submissions` and its `read_submissions` 403, `get_analytics`, the
 `fragment` conversion and every warning it raises, `save --page --html
 --config` and its config merge, the dry-run contract check, the `check`
 wrapper against a stub browser including the CORS probe and the preview-TLS

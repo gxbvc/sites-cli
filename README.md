@@ -9,12 +9,13 @@ See `AGENTS.md` for the full reference (subcommand -> tool -> capability
 table, state file keys, the worked Onyx example). Quick start:
 
 ```bash
-# platform: a personal token (sk_user_...) in SITES_CLI_TOKEN
+# one personal token (sk_user_...) in SITES_CLI_TOKEN opens all of this
 sites-cli list-sites                    # every site you can read
 sites-cli create-site SLUG --name "Name"
-sites-cli create SLUG --name "Name"     # the same thing through the runner, no token
+sites-cli create SLUG --name "Name"     # a legacy site through the runner, no token
 
-# versioned sites, once the site has a token in ~/.config/sites-cli/tokens.json
+# versioned sites. A site token in ~/.config/sites-cli/tokens.json is used for
+# its own slug when there is one; otherwise the personal token names the site.
 sites-cli describe onyx                 # capabilities, live, branches, pending
 sites-cli push onyx ./public --dry-run  # right contract? right branch? what changed?
 sites-cli push onyx ./public            # skip unchanged, upload the rest, one save
@@ -59,18 +60,35 @@ request succeeded -- but it is never "shipped": the second call,
 `publish SLUG --review last`, is the one that flips live. The CLI says so on
 stderr every time it sees `published: false`.
 
-## Two doors, two credentials
+## Two doors, one credential
 
-Every site tool goes to `POST /api/v1/tools` with that **site's** token, out of
-`~/.config/sites-cli/tokens.json`. `list_sites` and `create_site` have no site
-to be bound to, so they go to `POST /api/v1/platform/tools` with a **personal**
-token (`sk_user_...`, minted at `https://sites.gxb.vc/profile`, GXB staff only)
-from `SITES_CLI_TOKEN` or the `_platform` entry in the same file. A site token
-at the platform door is a 403, printed verbatim.
+There are still two doors. `list_sites` and `create_site` have no site to be
+bound to, so they go to `POST /api/v1/platform/tools`; every other tool goes to
+`POST /api/v1/tools`, and uploads to `/api/v1/media/uploads`.
 
-`read` stopped containing `read_submissions`, so `list-submissions` needs a
-token minted with that box ticked; a scope cannot be added to a token that
-already exists.
+One **personal** token opens both (`sk_user_...`, minted at
+`https://sites.gxb.vc/profile`, GXB staff only, from `SITES_CLI_TOKEN` or the
+`_platform` entry in `~/.config/sites-cli/tokens.json`). At a site door the
+request names the site, and the server resolves it through the sites that
+person can read and checks their capabilities on it. So
+
+```bash
+sites-cli create-site onyx --name "Onyx" && sites-cli push onyx ./public
+```
+
+works with nothing in between -- no admin page, no second token.
+
+A **site token** (`tokens.json` under the slug) is for handing one site to
+someone who should have only that site. It wins for its own slug, and those
+requests are sent exactly as they always were. A site token at the platform
+door is a 403, printed verbatim, and so is a site token naming a different
+site. A site you cannot read is a 404, never a 403.
+
+A personal token's scopes are a ceiling on top of the person's capabilities:
+the smaller of the two wins, and `describe` reports the intersection. `read`
+stopped containing `read_submissions`, so `list-submissions` needs a token
+minted with that box ticked; a scope cannot be added to a token that already
+exists.
 
 ## What the server has
 
@@ -80,6 +98,12 @@ deployed. Slice E (`publish` both forms, `merge-live`, `resolve-merge`,
 (the platform endpoint, personal tokens, `read_submissions`) are on `main` and
 deploy after review; until then a production server answers `unknown tool` for
 those names and 404 at the platform path, and the CLI prints that verbatim.
+
+A personal token at a site door needs the server change on branch
+`personal-door` (`plans/reviews/30/personal-door-report.md`). Against a server
+without it, a slug with no site token answers 403 `capability_denied` saying a
+personal token can only call the platform endpoint -- printed verbatim, as
+always.
 
 The `*.gxbsites.com` wildcard certificate is not installed yet, so a finished
 build reports `preview_status: "provisioning"` and its hostname cannot complete
@@ -121,12 +145,13 @@ cd ~/tools/sites-cli
 ln -s ~/tools/sites-cli/sites-cli ~/bin/sites-cli
 ```
 
-After `create-site`, mint an API token (`Admin::ApiTokensController` on the
-site's admin page) and put it in `~/.config/sites-cli/tokens.json` as
-`{"SLUG": "sk_site_..."}`. Mint your own personal token at
-`https://sites.gxb.vc/profile` and put it in the same file as `"_platform"`, or
-in `SITES_CLI_TOKEN`. That file lives outside this git checkout; the CLI
-tightens it to mode 600 on every read.
+Mint your own personal token at `https://sites.gxb.vc/profile` and put it in
+`SITES_CLI_TOKEN`, or in `~/.config/sites-cli/tokens.json` as `"_platform"`.
+That is everything one person needs. A per-site token
+(`Admin::ApiTokensController` on the site's admin page, then `{"SLUG":
+"sk_site_..."}` in the same file) is for giving somebody access to that one
+site. The file lives outside this git checkout; the CLI tightens it to mode
+600 on every read.
 
 `SITES_ROOT` (default `~/projects/sites`) points the runner commands at the
 Rails app; `SITES_CLI_HOST` (default `https://sites.gxb.vc`) points the HTTP

@@ -41,16 +41,25 @@ end
 TOKEN_ACME  = "TESTTOKEN-ACME-#{SecureRandom.hex(6)}"
 TOKEN_OTHER = "TESTTOKEN-OTHER-#{SecureRandom.hex(6)}"
 TOKEN_ONYX  = "TESTTOKEN-ONYX-#{SecureRandom.hex(6)}"
-# A personal token is the only credential the platform door takes (slice F).
+# A personal token is the credential the platform door takes (slice F), and
+# since the personal-door change it opens the site doors too, as long as the
+# request names the site.
 TOKEN_USER  = "sk_user_42_#{SecureRandom.hex(6)}"
 
 requests = Hash.new(0)                        # "TOKEN tool" => call count
 last_args = {}                                 # tool => the last arguments hash
+last_envelope = {}                             # tool => the whole request body
+media_sites = []                               # the site field/query on every media request
+site_on_site_token = []                        # site-token requests that carried a site field
 versions = Hash.new { |h, k| h[k] = 'v1' }     # path/label => current "live" version
 uploaded = {}                                  # request path => bytes received
 
 # -- versioned (plan 30) stub state -----------------------------------------
 branch_heads = { 'draft' => 'snap_head0', 'live' => 'snap_live0' }
+# The stub plays one versioned site (onyx) for a site token, plus whatever
+# `create_site` made for a personal one -- so a save right after a create-site
+# CASes against that new site's own draft head, not onyx's.
+new_site_heads = {}                            # slug => {branch => head}
 bound_assets = {}                              # "branch:key" => digest bound on that branch
 publications = 0
 preview_queue = []                             # statuses wait-preview walks through
@@ -104,6 +113,23 @@ server.mount_proc('/') do |req, res|
     args = payload['arguments'] || {}
     requests["#{token} #{tool}"] += 1
     last_args[tool] = args
+    last_envelope[tool] = payload
+    heads = new_site_heads[payload['site']] || branch_heads
+
+    # The contract in both directions. A personal token carries a person, so
+    # the request has to say which site -- naming none is the real server's
+    # 403. A site token carries its site, so a `site` field there would be a
+    # changed request shape; every one is recorded and asserted away at the end.
+    if token.start_with?('sk_user_')
+      if payload['site'].nil?
+        res.status = 403
+        res.body = JSON.generate(error: 'capability_denied', field: 'site',
+          message: 'a personal token needs `site` in the request; site tokens carry their site')
+        next
+      end
+    elsif payload.key?('site')
+      site_on_site_token << "#{tool} #{payload['site'].inspect}"
+    end
 
     case tool
     when 'read_file'
@@ -157,7 +183,7 @@ server.mount_proc('/') do |req, res|
       # A historical read answers with the snapshot it read, not a branch head
       # CAS token (slice E). The batch asset form answers {key => digest} for
       # the bound ones and simply omits the rest.
-      expected = args['at'] || branch_heads[branch]
+      expected = args['at'] || heads[branch]
       if args['kind'] == 'asset' && args['keys']
         if fail_batch_read
           res.status = 404
@@ -180,16 +206,16 @@ server.mount_proc('/') do |req, res|
         archived_at: '2026-09-21T04:20:00Z', expected: branch_heads[args['name']] || 'snap_head0')
     when 'save'
       branch = args['branch'] || 'draft'
-      current = branch_heads[branch]
+      current = heads[branch]
       if args['expected'] == current
-        branch_heads[branch] = next_head(current)
+        heads[branch] = next_head(current)
         Array(args['changes']).each do |c|
           bound_assets["#{branch}:#{c['key']}"] = c['digest'] if c['kind'] == 'asset' && c['op'] == 'put'
         end
         res.status = 200
         # A fresh snapshot has no ready build yet, so `review` is an explicit
         # null (slice D's save payload), which must drop any remembered one.
-        res.body = JSON.generate(site: 'onyx', branch: branch, expected: branch_heads[branch],
+        res.body = JSON.generate(site: payload['site'] || 'onyx', branch: branch, expected: heads[branch],
           snapshot_created: true, changed_keys: Array(args['changes']).map { |c| "#{c['kind']}:#{c['key']}" },
           preview_status: 'queued', preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com',
           review: nil)
@@ -296,6 +322,10 @@ server.mount_proc('/') do |req, res|
           { slug: 'acme', name: 'Acme', url: 'https://acme.gxbsites.com', versioned: false, capabilities: %w[read] }
         ])
       when 'create_site'
+        # The new site's draft head lives in its own map, so the very next
+        # save for that slug CASes against this token and needs no describe in
+        # between -- which is the whole point of one credential for the flow.
+        new_site_heads[args['slug']] = { 'draft' => 'snap_newsite0' }
         res.status = 200
         res.body = JSON.generate(site: args['slug'], name: args['name'],
           url: "https://#{args['slug']}.gxbsites.com", versioned: true,
@@ -328,6 +358,8 @@ server.mount_proc('/') do |req, res|
   in [ 'POST', '/api/v1/media/uploads' ]
     payload = JSON.parse(req.body)
     requests["#{token} media_authorize"] += 1
+    media_sites << payload['site'] if token.start_with?('sk_user_')
+    site_on_site_token << "media_authorize #{payload['site'].inspect}" if !token.start_with?('sk_user_') && payload.key?('site')
 
     if payload['label'].nil?
       # plan 30: no label, no expected_version -- filename and digest only.
@@ -406,6 +438,7 @@ server.mount_proc('/') do |req, res|
   in [ 'POST', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)/complete\z}
     id = Regexp.last_match(1)
     requests["#{token} media_complete"] += 1
+    media_sites << JSON.parse(req.body)['site'] if token.start_with?('sk_user_')
     payload = authorized.fetch(id)
     digest = payload['digest']
     # The platform types bytes from content, not from the filename: a file
@@ -418,6 +451,8 @@ server.mount_proc('/') do |req, res|
 
   in [ 'GET', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)\z}
     id = Regexp.last_match(1)
+    # A GET has no body, so a personal token names the site in the query.
+    media_sites << req.query['site'] if token.start_with?('sk_user_')
     payload = authorized.fetch(id)
     res.status = 200
     res.body = JSON.generate(id: id, status: 'ready', digest: payload['digest'],
@@ -457,7 +492,10 @@ File.chmod(0o644, TOKENS_PATH) # deliberately loose -- the CLI must tighten this
 
 ENV_OVERRIDES = {
   'SITES_CLI_HOST' => "http://127.0.0.1:#{port}",
-  'SITES_CLI_CONFIG_DIR' => CONFIG_DIR
+  'SITES_CLI_CONFIG_DIR' => CONFIG_DIR,
+  # nil unsets it in the child: a personal token in the developer's own shell
+  # would otherwise become a silent fallback and change what these checks mean.
+  'SITES_CLI_TOKEN' => nil
 }.freeze
 
 def run_cli(*args, env: {}, stdin: nil)
@@ -1013,6 +1051,94 @@ check('create-site with no personal bearer refuses locally and names the runner 
   assert(requests.values.sum == before, 'create-site reached the server with no bearer')
 end
 
+# -- one credential for every door (the personal-door change) -----------------
+#
+# A slug with no site token of its own falls back to the personal token, and
+# then every request names the site. A slug that does have one is sent exactly
+# as it always was.
+
+PERSONAL_ENV = { 'SITES_CLI_TOKEN' => TOKEN_USER }.freeze
+
+check('a slug with no site token falls back to the personal token and names the site') do
+  before = requests["#{TOKEN_USER} describe_site"]
+  out, _err, code = run_cli('describe', 'ghost', env: PERSONAL_ENV)
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(requests["#{TOKEN_USER} describe_site"] == before + 1, 'expected the personal bearer at the site door')
+  assert(last_envelope['describe_site']['site'] == 'ghost',
+    "expected the slug in the envelope, got #{last_envelope['describe_site'].inspect}")
+end
+
+check('a site token still sends no site field -- its site is the token') do
+  run_cli('describe', 'onyx')
+  assert(!last_envelope['describe_site'].key?('site'),
+    "a site-token request carried #{last_envelope['describe_site'].inspect}")
+end
+
+check('a slug with neither credential keeps NO_TOKEN and names both ways out') do
+  before = requests.values.sum
+  out, _err, code = run_cli('describe', 'ghost')
+  assert(code == 1, 'expected a nonzero exit')
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'NO_TOKEN', "expected NO_TOKEN, got #{out}")
+  assert(parsed['error'].include?(TOKENS_PATH), 'expected the site-token file to be named')
+  assert(parsed['error'].include?('/profile'), 'expected the place a personal token is minted')
+  assert(parsed['error'].include?('_platform'), 'expected the personal-token entry to be named')
+  assert(requests.values.sum == before, 'a slug with no credential reached the server')
+end
+
+# The gap this closes: create-site used to hand back a draft head that nothing
+# could then write to without a trip to an admin page to mint a site token.
+check('create-site then save works with one credential and no token step in between') do
+  out, _err, code = run_cli('create-site', 'flowsite', '--name', 'Flow Site', env: PERSONAL_ENV)
+  assert(code == 0, "expected exit 0 on create-site, got #{code}: #{out}")
+  assert(state['expected:flowsite:draft'] == 'snap_newsite0', 'expected the new draft head remembered')
+
+  changes = [ { 'op' => 'put', 'kind' => 'page', 'key' => '/',
+                'document' => { 'format' => 'html', 'metadata' => { 'title' => 'Flow' }, 'body' => '<p>hi</p>' } } ]
+  out, _err, code = run_cli('save', 'flowsite', '--changes', '-', env: PERSONAL_ENV, stdin: JSON.generate(changes))
+  assert(code == 0, "expected the save right after create-site to succeed, got #{code}: #{out}")
+  assert(last_envelope['save']['site'] == 'flowsite', "expected the site named, got #{last_envelope['save'].inspect}")
+  assert(last_args['save']['expected'] == 'snap_newsite0', 'expected the create-site head to be the CAS token')
+  assert(JSON.parse(out).dig('data', 'snapshot_created') == true, "expected a snapshot, got #{out}")
+end
+
+check('push over a personal token names the site on the read, the uploads and the save') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'app.js'), "export const flow = #{SecureRandom.hex(4).inspect};")
+    media_sites.clear
+    out, err, code = run_cli('push', 'flowsite', dir, env: PERSONAL_ENV)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
+    assert(last_envelope['read']['site'] == 'flowsite', 'expected the batch asset read to name the site')
+    assert(last_envelope['save']['site'] == 'flowsite', 'expected the save to name the site')
+    assert(media_sites.any?, 'no media request named a site')
+    assert(media_sites.uniq == [ 'flowsite' ], "expected every media request to name flowsite, got #{media_sites.uniq.inspect}")
+  end
+end
+
+check('upload over a personal token names the site on authorize, complete and the status poll') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'solo.css')
+    File.write(path, 'body { color: red }')
+    media_sites.clear
+    out, _err, code = run_cli('upload', 'flowsite', path, env: PERSONAL_ENV)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(media_sites.uniq == [ 'flowsite' ], "expected every media request to name flowsite, got #{media_sites.inspect}")
+  end
+end
+
+# The stub answers a site-less personal request with the server's own 403, so
+# a subcommand that forgot the field fails here rather than in production.
+check('every tools subcommand names the site when the credential is personal') do
+  [ %w[describe ghost], %w[diff ghost], %w[history ghost], %w[analytics ghost],
+    %w[list-submissions ghost], %w[read ghost config] ].each do |args|
+    last_envelope.clear
+    out, = run_cli(*args, env: PERSONAL_ENV)
+    sent = last_envelope.values.last
+    assert(sent, "#{args.first} sent no request at all: #{out}")
+    assert(sent['site'] == 'ghost', "#{args.first} sent #{sent.inspect}")
+  end
+end
+
 # -- list_submissions and get_analytics ---------------------------------------
 
 check('list-submissions posts form_slug, since and an integer limit') do
@@ -1031,7 +1157,8 @@ check('a token without read_submissions gets the 403 verbatim plus how to fix it
   assert(parsed['status'] == 403, "expected the real 403, got #{parsed['status'].inspect}")
   assert(parsed.dig('body', 'capability') == 'read_submissions', "expected the structured body, got #{out}")
   assert(err.include?('read_submissions'), "expected the recovery on stderr, got #{err.inspect}")
-  assert(err.include?('mint a new token'), "expected the recovery to name minting, got #{err.inspect}")
+  assert(err.include?('mint a token'), "expected the recovery to name minting, got #{err.inspect}")
+  assert(err.include?('/profile'), 'expected the personal token to be named as a way out too')
 end
 
 check('analytics posts get_analytics with the period') do
@@ -1720,6 +1847,13 @@ check('every envelope-printing subcommand puts exactly one JSON object on stdout
     assert(out.lines.size == 1, "#{args.first} printed #{out.lines.size} lines on stdout")
     assert(JSON.parse(out).key?('ok'), "#{args.first} printed something that is not the envelope: #{out}")
   end
+end
+
+# -- a site token's requests are unchanged ------------------------------------
+
+check('no site-token request anywhere in this run carried a site field') do
+  assert(site_on_site_token.empty?,
+    "a site token sent a site field: #{site_on_site_token.uniq.join(', ')}")
 end
 
 # -- secret redaction ---------------------------------------------------------
