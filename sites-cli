@@ -424,6 +424,35 @@ rescue *NETWORK_ERRORS => e
   [nil, api_error("#{tool} request failed: #{e.class}: #{e.message}", code: 'HTTP_ERROR')]
 end
 
+# -----------------------------------------------------------------------------
+# Version handshake (pc_86924b9e). guide/heads/list-pages and the removed save
+# change cap/ordered same-key ops need the round-2 deploy. There is no
+# server_version field to poll (plan 30 has never had one), and polling for
+# one on every command would be a second request before the one the caller
+# actually asked for -- so instead of guessing ahead of time, the first
+# request that would tell us anything (asking `read` for a kind this round
+# introduces) is read for the answer already in it: a pre-round-2 server 422s
+# naming its kind enum without "guide" in it, and that 422 is the version
+# check, not a probe of its own. One line, once, however many of these a
+# single run hits (pc_e26c86d1: two of three new subcommands said nothing
+# useful when the CLI shipped ahead of the server).
+# -----------------------------------------------------------------------------
+ROUND2_READ_KINDS = %w[guide].freeze
+$stale_server_warned = false
+
+def note_if_server_predates_round2(tool, arguments, err)
+  return unless err && tool == 'read' && !$stale_server_warned
+  kind = arguments['kind'].to_s
+  return unless ROUND2_READ_KINDS.include?(kind)
+  message = err[:error].to_s
+  return unless message.include?('must be one of') && !message.include?(kind)
+  $stale_server_warned = true
+  $stderr.puts("sites-cli #{VERSION}: this server does not recognize read {kind: #{kind.inspect}} yet -- " \
+               'it predates the round-2 deploy this CLI needs. guide, heads and list-pages will not work, ' \
+               'the save change cap may still be in place, and same-key ops may still conflict. Wait for ' \
+               'the deploy and try again.')
+end
+
 # Every v2 subcommand is the same three steps: post the same-named tool,
 # remember whatever branch head token the response carries, print {ok, data}.
 #
@@ -432,7 +461,10 @@ end
 # would hand the next `save` a token for a snapshot nobody is on.
 def tool_call(slug, tool, arguments, credential: nil, remember: true, path: TOOLS_PATH)
   data, err = api_call(slug, tool, arguments, credential: credential, path: path)
-  return fail_with(err) if err
+  if err
+    note_if_server_predates_round2(tool, arguments, err)
+    return fail_with(err)
+  end
   remember_branch_state(slug, data) if remember
   success(data)
 end

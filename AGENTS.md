@@ -79,6 +79,19 @@ has told people a working feature was broken; those two commands can.
 
 ## Ergonomics
 
+- **The version handshake is reactive, not a probe.** There is no
+  `server_version` field to poll, and polling for one before every command
+  would be a second request ahead of the one actually asked for. So instead:
+  the first `read {kind: "guide"}` (from `guide`, or from anything that hits
+  it) against a server still on the previous deploy 422s naming its kind enum
+  without `"guide"` in it, and that 422 *is* the version check -- the CLI
+  turns it into one stderr line naming what will not work yet (`guide`,
+  `heads`, `list-pages`, the still-possibly-present save change cap, same-key
+  ops that may still conflict) instead of the three unrelated-looking 422s
+  three different new subcommands used to give three different agents
+  (`pc_e26c86d1`). `heads` gets the same treatment when the response comes
+  back shaped like the old single-route `prepared` read instead of the new
+  `heads` map. Printed at most once per run either way.
 - `--expected` defaults to the last branch head token this CLI saw for that
   slug+branch. Every 2xx `describe`/`read`/`save`/`create-branch`/`diff`/
   `merge-live`/`resolve-merge` response writes it. A `save` that was never
