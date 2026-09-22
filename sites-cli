@@ -1115,9 +1115,13 @@ def upload_one_file(slug, file_path, credential:)
              http_status: err[:status], body: err[:body] }.compact
   end
 
+  # uploaded_by and the transform example are the server's, passed through when
+  # it sends them: who put these bytes here, and the cdn-cgi/image prefix that
+  # resizes them in place rather than by a second upload.
   { path: file_path, digest: data['digest'] || digest, url: data['url'],
     media_type: data['media_type'] || data['content_type'], byte_size: data['byte_size'] || data['bytes'],
-    status: data['status'], deduplicated: data['deduplicated'] }.compact
+    status: data['status'], deduplicated: data['deduplicated'],
+    uploaded_by: data['uploaded_by'], width_transform_example: data['width_transform_example'] }.compact
 end
 
 # Dir.glob rather than `find` (which walks huge trees and hangs): '**/*' skips
