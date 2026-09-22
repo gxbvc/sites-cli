@@ -259,22 +259,27 @@ server.mount_proc('/') do |req, res|
         case heads_shape
         when :missing
           # A pre-round-2 server ignores `keys` and answers the single-route
-          # shape it has always answered -- no `heads` map at all.
+          # shape it has always answered -- no `keys` list at all.
           res.status = 200
           res.body = JSON.generate(kind: 'prepared', key: '/', subject: branch, snapshot: expected,
             build: 'ready', bytes: 12, html: '<p>one</p>', markdown: nil)
         else
-          entries = args['keys'].to_h do |route|
+          # The real shape (Site::Versioned#read_prepared_heads): `keys` is a
+          # list in request order, each entry carrying its own `key`; the
+          # envelope names subject/snapshot/build and no branch/expected.
+          entries = args['keys'].map do |route|
             if route == '/missing'
-              [ route, { missing: true } ]
+              { key: route, missing: true }
             else
-              [ route, { title: "Title for #{route}", canonical: "https://onyx.gxbsites.com#{route}",
-                        robots: 'index,follow', lang: 'en', json_ld_types: %w[WebPage], bytes: 128,
-                        digest: 'b' * 64 } ]
+              { key: route, digest: 'b' * 64, bytes: 128, integrations: [],
+                title: "Title for #{route}", description: nil, theme_color: nil,
+                canonical: "https://onyx.gxbsites.com#{route}", robots: nil, favicon: nil,
+                json_ld_types: %w[WebPage], manifest_name: 'Onyx', lang: 'en',
+                og_fields: %w[og:site_name og:locale og:url og:title], hreflang_alternates: [] }
             end
           end
           res.status = 200
-          res.body = JSON.generate(kind: 'prepared', branch: branch, expected: expected, heads: entries)
+          res.body = JSON.generate(kind: 'prepared', subject: branch, snapshot: expected, build: 'ready', keys: entries)
         end
       else
         res.status = 200
@@ -1110,10 +1115,13 @@ check('heads reads many routes in one call and prints a compact table on stderr'
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
   assert(last_args['read'] == { 'kind' => 'prepared', 'keys' => %w[/ /about /missing] }, "got #{last_args['read'].inspect}")
   data = JSON.parse(out)['data']
-  assert(data.dig('heads', '/', 'title') == 'Title for /', "got #{data.inspect}")
-  assert(data.dig('heads', '/missing', 'missing') == true, "got #{data.inspect}")
-  assert(err.include?('heads: / --'), "expected the table on stderr, got #{err.inspect}")
+  entries = data['keys']
+  assert(entries.is_a?(Array) && entries.map { |h| h['key'] } == %w[/ /about /missing], "got #{data.inspect}")
+  assert(entries.find { |h| h['key'] == '/' }['title'] == 'Title for /', "got #{data.inspect}")
+  assert(entries.find { |h| h['key'] == '/missing' }['missing'] == true, "got #{data.inspect}")
+  assert(err.include?('heads: / -- "Title for /"'), "expected the table on stderr, got #{err.inspect}")
   assert(err.include?('heads: /missing -- missing'), "expected the missing route flagged, got #{err.inspect}")
+  assert(!err.include?('predate'), "the real bulk shape must not trip the stale-server note, got #{err.inspect}")
 end
 
 check('heads --branch is passed through') do
@@ -1134,7 +1142,7 @@ check('heads against a server that answers the old single-route prepared shape w
   begin
     out, err, code = run_cli('heads', 'onyx', '/')
     assert(code == 0, "still exits 0 -- the request itself succeeded, got #{code}: #{out}")
-    assert(err.include?('no `heads` map'), "expected the stale-server note, got #{err.inspect}")
+    assert(err.include?('no `keys` list'), "expected the stale-server note, got #{err.inspect}")
   ensure
     heads_shape = :bulk
   end

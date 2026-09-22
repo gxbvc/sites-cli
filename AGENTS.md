@@ -94,7 +94,8 @@ has told people a working feature was broken; those two commands can.
   three different new subcommands used to give three different agents
   (`pc_e26c86d1`). `heads` gets the same treatment when the response comes
   back shaped like the old single-route `prepared` read instead of the new
-  `heads` map. Printed at most once per run either way.
+  `keys` list (one entry per requested route, each carrying its own `key`,
+  or `{key, missing: true}`). Printed at most once per run either way.
 - `--expected` defaults to the last branch head token this CLI saw for that
   slug+branch. Every 2xx `describe`/`read`/`save`/`create-branch`/`diff`/
   `merge-live`/`resolve-merge` response writes it. A `save` that was never

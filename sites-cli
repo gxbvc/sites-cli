@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.3.0'
+VERSION = '2.3.1'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
@@ -816,10 +816,18 @@ def cmd_heads(slug, routes, branch:)
   return fail_with(err) if err
   remember_branch_state(slug, data)
 
-  heads = data['heads']
-  if heads.is_a?(Hash)
-    heads.each do |route, head|
-      if !head.is_a?(Hash) || head['missing']
+  # The server answers `keys`: one entry per requested route, in request
+  # order, each carrying `key` plus the head fields, or {key, missing: true}
+  # for a route this build never prepared (Site::Versioned#read_prepared_heads
+  # in the sites repo). There is no `branch`/`expected` on this response --
+  # it names `subject`, `snapshot` and `build` instead -- so nothing here is
+  # remembered as a branch head.
+  entries = data['keys']
+  if entries.is_a?(Array)
+    entries.each do |head|
+      next unless head.is_a?(Hash)
+      route = head['key']
+      if head['missing']
         $stderr.puts("heads: #{route} -- missing")
       else
         $stderr.puts("heads: #{route} -- #{head['title'].inspect} canonical=#{head['canonical']} " \
@@ -828,7 +836,7 @@ def cmd_heads(slug, routes, branch:)
     end
   elsif !$stale_server_warned
     $stale_server_warned = true
-    $stderr.puts("sites-cli #{VERSION}: read {kind: \"prepared\", keys: [...]} answered with no `heads` map -- " \
+    $stderr.puts("sites-cli #{VERSION}: read {kind: \"prepared\", keys: [...]} answered with no `keys` list -- " \
                  'this server may predate bulk head reads and only knows the single-route form. Wait for the ' \
                  'round-2 deploy and try again.')
   end
