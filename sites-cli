@@ -1175,9 +1175,16 @@ def cmd_wait_preview(slug, branch, timeout)
 
     entry = Array(data['branches']).find { |b| b.is_a?(Hash) && b['name'] == branch } || {}
     status = entry['preview_status'] || data['preview_status']
+    # wait-preview polls describe_site, so it already holds everything the
+    # second describe people ran straight after it was for (pc_6280b825,
+    # pc_f4d60acf): the head the build stored, whether the forms script is in
+    # it, and the URL the shell said the page is canonically at.
     payload = { 'site' => slug, 'branch' => branch, 'preview_status' => status,
                 'preview_url' => entry['preview_url'] || data['preview_url'],
                 'diagnostics' => entry['diagnostics'] || data['diagnostics'] || [],
+                'head_preview' => entry['head_preview'] || data['head_preview'],
+                'integrations' => entry['integrations'] || data['integrations'],
+                'canonical_url' => data['canonical_url'] || entry['canonical_url'],
                 'review' => entry['review'] }
 
     return success(payload) if status == 'ready'
@@ -1300,7 +1307,9 @@ end
 
 # A preview hostname that resolves but cannot finish a handshake is the missing
 # *.gxbsites.com wildcard certificate, not a bad build (slice G, todo 531).
-PREVIEW_HOST = /\A[a-z0-9]+-[a-z0-9-]+\.gxbsites\.com\z/i
+# Both delimiters: the host is <token>--<slug>.gxbsites.com since the domains
+# worker's change, and grants minted before it are still <token>-<slug>.
+PREVIEW_HOST = /\A[a-z2-7]{10,}--?[a-z0-9-]+\.gxbsites\.com\z/i
 
 def tls_hint(url, message)
   return nil unless message.to_s.match?(/ERR_SSL|ERR_CERT|SSL_PROTOCOL|handshake/i)
@@ -1311,9 +1320,171 @@ def tls_hint(url, message)
     '`sites-cli wait-preview SLUG` reports what it is.'
 end
 
-def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true)
+# -----------------------------------------------------------------------------
+# What a page says about itself, read out of its own served bytes. Proving a
+# rebuild matches its source used to be a 35-line extract.js and a normtext.py
+# per agent, then a hand-rolled diff (pc_61361f8f).
+# -----------------------------------------------------------------------------
+
+def head_fields(html)
+  head = document_parts(html).head
+  metas = {}
+  head.scan(/<meta\b[^>]*>/i) do |tag|
+    key = tag[/\b(?:name|property)=["']([^"']+)["']/i, 1].to_s.downcase
+    content = tag[/\bcontent=["']([^"']*)["']/i, 1]
+    metas[key] = collapse(decode_entities(content)) if key && content
+  end
+  links = head.scan(/<link\b[^>]*>/i).map do |tag|
+    [tag[/\brel=["']([^"']+)["']/i, 1].to_s.downcase, tag[/\bhref=["']([^"']+)["']/i, 1].to_s]
+  end
+  types = html.scan(LD_JSON_TAG).flatten.flat_map { |inner| ld_json_nodes(inner, [], 'page') }
+              .map { |node| node['@type'] }.flatten.compact.sort.uniq
+
+  { 'title' => collapse(decode_entities(html[%r{<title[^>]*>(.*?)</title>}mi, 1].to_s)),
+    'description' => metas['description'],
+    'canonical' => links.find { |rel, _| rel.split(/\s+/).include?('canonical') }&.last,
+    'robots' => metas['robots'],
+    'theme-color' => metas['theme-color'],
+    'og:image' => metas['og:image'],
+    'twitter:card' => metas['twitter:card'],
+    'favicon' => links.find { |rel, _| rel.split(/\s+/).include?('icon') }&.last,
+    'json-ld' => types.join(' ') }
+end
+
+def resource_counts(html)
+  { 'images' => html.scan(/<img\b/i).size,
+    'scripts' => html.scan(/<script\b[^>]*\bsrc=/i).size,
+    'stylesheets' => html.scan(/<link\b[^>]*\brel=["'][^"']*stylesheet/i).size }
+end
+
+# Visible text, folded so that a curly quote, an em dash and a run of newlines
+# are not a difference. What is left is what a reader would notice.
+TEXT_FOLDS = { '’' => "'", '‘' => "'", '“' => '"', '”' => '"', '–' => '-', '—' => '-',
+               '…' => '...', ' ' => ' ' }.freeze
+
+# The elements a reader sees as a break. Keeping those breaks is what makes
+# the diff point at one paragraph rather than at the whole page.
+BLOCK_ELEMENTS = %w[p div section article header footer main nav aside blockquote figure figcaption
+                    h1 h2 h3 h4 h5 h6 li dt dd tr td th pre form label button].freeze
+
+def visible_text(html)
+  body = document_parts(html).body
+  stripped = body.gsub(%r{<(script|style|template)\b[^>]*>.*?</\1>}mi, ' ')
+                 .gsub(%r{</(?:#{BLOCK_ELEMENTS.join('|')})>|<br\b[^>]*>}i, "\n")
+                 .gsub(/<[^>]+>/m, ' ')
+  text = decode_entities(stripped)
+  TEXT_FOLDS.each { |from, to| text = text.gsub(from, to) }
+  text.split("\n").map { |line| collapse(line) }.reject(&:empty?).join("\n")
+end
+
+# One block, then one sentence, then a hard wrap: the diff points at a phrase
+# rather than at one very long line that differs somewhere.
+def text_lines(text)
+  text.split("\n").flat_map do |block|
+    block.split(/(?<=[.!?])\s+/).flat_map do |sentence|
+      sentence.scan(/\S.{0,90}(?:\s|\z)/).map(&:strip).reject(&:empty?)
+    end
+  end
+end
+
+# A plain LCS unified diff. No gem, and the only consumer is a person reading
+# two versions of the same page.
+def unified_diff(left, right, from:, to:)
+  lcs = Array.new(left.size + 1) { Array.new(right.size + 1, 0) }
+  left.each_index do |i|
+    right.each_index do |j|
+      lcs[i + 1][j + 1] = left[i] == right[j] ? lcs[i][j] + 1 : [lcs[i][j + 1], lcs[i + 1][j]].max
+    end
+  end
+
+  lines = []
+  i = left.size
+  j = right.size
+  while i.positive? || j.positive?
+    if i.positive? && j.positive? && left[i - 1] == right[j - 1]
+      lines << "  #{left[i - 1]}"
+      i -= 1
+      j -= 1
+    elsif j.positive? && (i.zero? || lcs[i][j - 1] >= lcs[i - 1][j])
+      lines << "+ #{right[j - 1]}"
+      j -= 1
+    else
+      lines << "- #{left[i - 1]}"
+      i -= 1
+    end
+  end
+  lines.reverse!
+  return [[], ''] if lines.none? { |line| line.start_with?('+', '-') }
+  ["--- #{from}", "+++ #{to}", *lines].then { |all| [lines.select { |l| l.start_with?('+', '-') }, all.join("\n")] }
+end
+
+# What the browser is asked for once a page has settled. Kept apart from the
+# console/network half so --against can gather it for a second URL without
+# re-running the whole check.
+def extract_page(session, url)
+  nav, err = agent_browser(session, 'open', url)
+  if err
+    hint = tls_hint(url, err[:error])
+    return [nil, err.merge(code: 'PREVIEW_TLS', error: "#{err[:error]} -- #{hint}")] if hint
+    return [nil, err]
+  end
+  agent_browser(session, 'wait', '--load', 'networkidle')
+  document, = agent_browser(session, 'get', 'html', 'html')
+  [{ 'url' => nav['url'] || url, 'title' => nav['title'], 'html' => document&.dig('html').to_s }, nil]
+end
+
+def page_profile(html)
+  { 'head' => head_fields(html), 'counts' => resource_counts(html), 'text' => visible_text(html) }
+end
+
+def profile_differences(left, right, ignore)
+  lines = []
+  left['head'].each_key do |field|
+    before = left['head'][field].to_s
+    after = right['head'][field].to_s
+    lines << "#{field}: #{before.inspect} -> #{after.inspect}" unless before == after
+  end
+  left['counts'].each_key do |field|
+    next if left['counts'][field] == right['counts'][field]
+    lines << "#{field}: #{left['counts'][field]} -> #{right['counts'][field]}"
+  end
+  lines.reject { |line| ignore.any? { |needle| line.include?(needle) } }
+end
+
+# A PNG whose pixels are all one colour compresses to almost nothing, so bytes
+# per pixel tells a painted page from an unpainted one without a decoder. The
+# case this exists for wrote a 4.9 KB all-background image and reported success
+# (pc_9e0ec6d6).
+BLANK_SCREENSHOT_BYTES = 6 * 1024
+BLANK_BYTES_PER_PIXEL = 1 / 2000.0
+
+def png_dimensions(path)
+  header = File.binread(path, 24)
+  return nil unless header && header[0, 8] == "\x89PNG\r\n\x1A\n".b
+  header[16, 8].unpack('N2')
+rescue StandardError
+  nil
+end
+
+def blank_screenshot_reason(path, full:)
+  bytes = File.size(path)
+  dimensions = png_dimensions(path)
+  if dimensions
+    width, height = dimensions
+    pixels = width * height
+    if pixels.positive? && bytes.to_f / pixels < BLANK_BYTES_PER_PIXEL
+      return "#{bytes} bytes for #{width}x#{height} pixels is one flat colour: the page had not painted when " \
+             'it was captured'
+    end
+  end
+  return nil unless full && bytes < BLANK_SCREENSHOT_BYTES
+  "#{bytes} bytes for a full-page capture is a blank image: the page had not painted when it was captured"
+end
+
+def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true, against: nil, full: true)
   session = "sites-cli-#{SecureRandom.hex(4)}"
   result = nil
+  exit_code = 0
 
   begin
     _blank, err = agent_browser(session, 'open')
@@ -1321,16 +1492,8 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true)
 
     agent_browser(session, 'set', 'viewport', width.to_s, height.to_s)
 
-    nav, err = agent_browser(session, 'open', url)
-    if err
-      hint = tls_hint(url, err[:error])
-      return fail_with(err.merge(code: 'PREVIEW_TLS', error: "#{err[:error]} -- #{hint}")) if hint
-      return fail_with(err)
-    end
-
-    # Best effort: a page that never goes idle still gets checked on whatever
-    # it managed to load, rather than failing the whole command.
-    agent_browser(session, 'wait', '--load', 'networkidle')
+    page, err = extract_page(session, url)
+    return fail_with(err) if err
 
     console, = agent_browser(session, 'console')
     errors, = agent_browser(session, 'errors')
@@ -1338,10 +1501,13 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true)
 
     if screenshot
       FileUtils.mkdir_p(File.dirname(File.expand_path(screenshot)))
-      agent_browser(session, 'screenshot', screenshot)
+      # Full page by default: proving a rebuild matches its source needs the
+      # whole page, and dropping to agent-browser for it cost seven commands
+      # per page and lost this payload (pc_4ac898d8).
+      agent_browser(session, 'screenshot', *(full ? ['--full'] : []), screenshot)
     end
 
-    final_url = nav['url'] || url
+    final_url = page['url']
     document = Array(requests&.dig('requests')).select { |r| r.is_a?(Hash) && r['url'] == final_url }.last
     failed = collect_failed_requests(requests || {}, ignore)
     diagnose_failed_requests(failed, final_url) if probe
@@ -1349,13 +1515,46 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true)
       'status' => document && document['status'],
       'console_errors' => collect_console_errors(console || {}, errors || {}),
       'failed_requests' => failed,
-      'title' => nav['title'],
+      'title' => page['title'],
       'url' => final_url
     }
-    result['screenshot'] = File.expand_path(screenshot) if screenshot
+
+    if screenshot
+      path = File.expand_path(screenshot)
+      result['screenshot'] = path
+      if File.file?(path)
+        result['screenshot_bytes'] = File.size(path)
+        if (reason = blank_screenshot_reason(path, full: full))
+          result['screenshot_blank'] = reason
+          exit_code = 1
+        end
+      else
+        result['screenshot_blank'] = 'the browser wrote no file'
+        exit_code = 1
+      end
+    end
+
+    if against
+      other, err = extract_page(session, against)
+      return fail_with(err) if err
+      left = page_profile(page['html'])
+      right = page_profile(other['html'])
+      differences = profile_differences(left, right, ignore)
+      text_changes, text_diff = unified_diff(text_lines(left['text']), text_lines(right['text']),
+                                             from: final_url, to: other['url'])
+      text_changes = text_changes.reject { |line| ignore.any? { |needle| line.include?(needle) } }
+      result['against'] = { 'url' => other['url'], 'head' => right['head'], 'counts' => right['counts'] }
+      result['head'] = left['head']
+      result['counts'] = left['counts']
+      result['differences'] = differences
+      result['text_diff'] = text_changes.empty? ? '' : text_diff
+      exit_code = 1 if differences.any? || text_changes.any?
+    end
   ensure
     # Every orphan agent-browser session is a full Chrome that lives until
     # reboot (~/notes/web-browsing.md), so this closes even on an early return.
+    # By name, never --all: seven of these run at once and --all is a
+    # cross-agent kill (pc_8fe3d8b8, pc_412bc69b).
     agent_browser(session, 'close')
   end
 
@@ -1367,9 +1566,17 @@ def cmd_check(url, width:, height:, screenshot:, ignore:, probe: true)
     next unless failure['message']
     $stderr.puts("check: #{failure['url']} -- #{failure['message']}")
   end
+  $stderr.puts("check: the screenshot is blank -- #{result['screenshot_blank']}") if result['screenshot_blank']
+  if against
+    Array(result['differences']).each { |line| $stderr.puts("check: #{line}") }
+    $stderr.puts(result['text_diff']) unless result['text_diff'].to_s.empty?
+    $stderr.puts("check: #{url} and #{against} agree on the head, the counts and the visible text") if
+      Array(result['differences']).empty? && result['text_diff'].to_s.empty?
+  end
+
   ok = result['console_errors'].empty? && result['failed_requests'].empty? &&
        (result['status'].nil? || result['status'].to_i < 400)
-  ok ? 0 : 1
+  ok && exit_code.zero? ? 0 : 1
 end
 
 # -----------------------------------------------------------------------------
@@ -2668,13 +2875,16 @@ def run(argv)
     width = (opt(argv, '--width') || 1440).to_i
     height = (opt(argv, '--height') || 900).to_i
     screenshot = opt(argv, '--screenshot')
+    against = opt(argv, '--against')
     ignore = split_list(opt_all(argv, '--ignore'))
     probe = !flag?(argv, '--no-probe')
+    full = !flag?(argv, '--viewport')
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     url = argv.shift
     return failure("check requires URL", code: 'USAGE') unless url
-    return cmd_check(url, width: width, height: height, screenshot: screenshot, ignore: ignore, probe: probe)
+    return cmd_check(url, width: width, height: height, screenshot: screenshot, ignore: ignore,
+                     probe: probe, against: against, full: full)
 
   else
     return failure("Unknown command: #{command}", code: 'USAGE')

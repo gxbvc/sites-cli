@@ -1713,10 +1713,18 @@ File.write(BROWSER_STUB, <<~'STUB')
     exit 0
   end
 
+  # One process per command, so "which page is open" lives next to the log.
+  current = "#{ENV.fetch('STUB_BROWSER_LOG')}.url"
+  File.write(current, url) if args[0] == 'open' && args[1]
+
   out =
     case [args[0], args[1]]
     in ['open', nil] then { title: nil, url: 'about:blank' }
     in ['open', String => u] then { title: 'Stub Page', url: u }
+    in ['get', 'html']
+      opened = File.file?(current) ? File.read(current) : ''
+      key = opened == ENV['STUB_BROWSER_AGAINST'] ? 'STUB_BROWSER_HTML2' : 'STUB_BROWSER_HTML'
+      { html: ENV.fetch(key, '<head><title>Stub Page</title></head><body><p>hello</p></body>') }
     in ['console', _]
       { messages: broken ? [{ type: 'error', text: 'boom one' }, { type: 'log', text: 'noise' }] : [] }
     in ['errors', _]
@@ -1732,9 +1740,17 @@ File.write(BROWSER_STUB, <<~'STUB')
         requests << { url: ENV.fetch('STUB_BROWSER_CORS_URL'), resourceType: 'Script', errorText: 'net::ERR_FAILED' }
       end
       { requests: requests }
-    in ['screenshot', String => path]
-      File.write(path, 'PNG')
-      { path: path }
+    in ['screenshot', _]
+      rest = args[1..]
+      full = rest.delete('--full')
+      path = rest.first
+      # A real PNG header, so the blank-image heuristic has dimensions to read.
+      width = (ENV['STUB_SHOT_WIDTH'] || 1440).to_i
+      height = (ENV['STUB_SHOT_HEIGHT'] || (full ? 5000 : 900)).to_i
+      bytes = (ENV['STUB_SHOT_BYTES'] || 40_000).to_i
+      header = "\x89PNG\r\n\x1A\n".b + [13].pack('N') + 'IHDR'.b + [width, height].pack('N2')
+      File.binwrite(path, header + ('x'.b * [bytes - header.bytesize, 0].max))
+      { path: path, full: !full.nil? }
     else { }
     end
 
@@ -1833,14 +1849,126 @@ check('a live hostname keeps the plain browser error -- the hint is only for pre
   assert(JSON.parse(out)['code'] == 'BROWSER_ERROR', "got #{out}")
 end
 
-check('check writes the screenshot it was asked for') do
+check('check writes the screenshot it was asked for, full page by default') do
   Dir.mktmpdir do |dir|
+    File.write(BROWSER_LOG, '')
     shot = File.join(dir, 'shots', 'home.png')
     out, _err, code = run_cli('check', 'http://stub.test/', '--screenshot', shot, env: BROWSER_ENV)
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
     assert(File.file?(shot), 'expected the screenshot file to exist')
     assert(JSON.parse(out)['screenshot'] == shot, "expected the screenshot path in the report, got #{out}")
+    assert(File.read(BROWSER_LOG).include?('screenshot --full'), "expected a full-page capture: #{File.read(BROWSER_LOG)}")
   end
+end
+
+check('check --viewport goes back to capturing only what fits on screen') do
+  Dir.mktmpdir do |dir|
+    File.write(BROWSER_LOG, '')
+    shot = File.join(dir, 'home.png')
+    _out, _err, code = run_cli('check', 'http://stub.test/', '--screenshot', shot, '--viewport', env: BROWSER_ENV)
+    assert(code == 0, 'expected exit 0')
+    log = File.read(BROWSER_LOG)
+    assert(log.include?('screenshot '), "expected a screenshot: #{log}")
+    assert(!log.include?('--full'), "expected no full-page flag: #{log}")
+  end
+end
+
+# pc_9e0ec6d6: a 4.9 KB all-background PNG was saved and the check reported
+# success, so a fidelity pass that trusted it compared blank images.
+check('check exits 1 on a blank screenshot instead of reporting success') do
+  Dir.mktmpdir do |dir|
+    shot = File.join(dir, 'blank.png')
+    out, err, code = run_cli('check', 'http://stub.test/', '--screenshot', shot,
+                             env: BROWSER_ENV.merge('STUB_SHOT_BYTES' => '4900'))
+    assert(code == 1, "expected exit 1 on a blank capture, got #{code}: #{out}")
+    parsed = JSON.parse(out)
+    assert(parsed['screenshot_blank'].to_s.include?('blank'), "got #{parsed['screenshot_blank'].inspect}")
+    assert(parsed['screenshot_bytes'] == 4900, "got #{parsed['screenshot_bytes'].inspect}")
+    assert(err.include?('the screenshot is blank'), "expected it said so on stderr, got #{err.inspect}")
+  end
+end
+
+check('a one-colour viewport capture is blank too, by bytes per pixel') do
+  Dir.mktmpdir do |dir|
+    shot = File.join(dir, 'flat.png')
+    out, _err, code = run_cli('check', 'http://stub.test/', '--screenshot', shot, '--viewport',
+                              env: BROWSER_ENV.merge('STUB_SHOT_BYTES' => '500'))
+    assert(code == 1, "expected exit 1, got #{code}: #{out}")
+    assert(JSON.parse(out)['screenshot_blank'].to_s.include?('one flat colour'), "got #{out}")
+  end
+end
+
+# -- check --against (pc_61361f8f) --------------------------------------------
+
+SOURCE_PAGE = <<~HTML
+  <head><title>Andy Sibley, LPC</title>
+  <meta name="description" content="Therapy in Dallas.">
+  <meta name="theme-color" content="#2b2a28">
+  <link rel="canonical" href="https://andysibley.com/">
+  <link rel="icon" href="/favicon.png">
+  <script type="application/ld+json">{"@type":"LocalBusiness","name":"Andy"}</script>
+  </head>
+  <body><main><h1>Andy Sibley</h1><p>Therapy in Dallas &mdash; by appointment.</p>
+  <img src="/a.jpg"><script src="/a.js"></script></main></body>
+HTML
+
+check('check --against agrees when the two pages match, and exits 0') do
+  # Curly punctuation and whitespace are folded, so the same words in different
+  # typography are not a difference.
+  same = SOURCE_PAGE.gsub('&mdash;', '—').gsub("\n", "\n  ")
+  out, err, code = run_cli('check', 'http://stub.test/', '--against', 'http://stub.test/next/',
+                           env: BROWSER_ENV.merge('STUB_BROWSER_HTML' => SOURCE_PAGE,
+                                                  'STUB_BROWSER_HTML2' => same,
+                                                  'STUB_BROWSER_AGAINST' => 'http://stub.test/next/'))
+  assert(code == 0, "expected exit 0 for two matching pages, got #{code}: #{out}#{err}")
+  parsed = JSON.parse(out)
+  assert(parsed['differences'] == [], "got #{parsed['differences'].inspect}")
+  assert(parsed['text_diff'] == '', "got #{parsed['text_diff'].inspect}")
+  assert(parsed['head']['canonical'] == 'https://andysibley.com/', "got #{parsed['head'].inspect}")
+  assert(parsed['head']['json-ld'] == 'LocalBusiness', "got #{parsed['head'].inspect}")
+  assert(parsed['counts'] == { 'images' => 1, 'scripts' => 1, 'stylesheets' => 0 }, "got #{parsed['counts'].inspect}")
+  assert(err.include?('agree on the head'), "expected the all-clear on stderr, got #{err.inspect}")
+end
+
+check('check --against names every head, count and text difference and exits 1') do
+  rebuilt = SOURCE_PAGE
+            .sub('https://andysibley.com/', 'https://andysibley-next.gxbsites.com/')
+            .sub('Therapy in Dallas &mdash; by appointment.', 'Therapy in Dallas, by appointment only.')
+            .sub('<img src="/a.jpg">', '')
+  out, err, code = run_cli('check', 'http://stub.test/', '--against', 'http://stub.test/next/',
+                           env: BROWSER_ENV.merge('STUB_BROWSER_HTML' => SOURCE_PAGE,
+                                                  'STUB_BROWSER_HTML2' => rebuilt,
+                                                  'STUB_BROWSER_AGAINST' => 'http://stub.test/next/'))
+  assert(code == 1, "expected exit 1 on a difference, got #{code}: #{out}")
+  parsed = JSON.parse(out)
+  assert(parsed['differences'].any? { |d| d.start_with?('canonical:') }, "got #{parsed['differences'].inspect}")
+  assert(parsed['differences'].any? { |d| d.start_with?('images: 1 -> 0') }, "got #{parsed['differences'].inspect}")
+  assert(parsed['text_diff'].include?('- Therapy in Dallas - by appointment.'), "got #{parsed['text_diff'].inspect}")
+  assert(parsed['text_diff'].include?('+ Therapy in Dallas, by appointment only.'), "got #{parsed['text_diff'].inspect}")
+  assert(err.include?('canonical:'), "expected the differences on stderr, got #{err.inspect}")
+end
+
+check('check --against --ignore drops the differences it names') do
+  rebuilt = SOURCE_PAGE.sub('https://andysibley.com/', 'https://andysibley-next.gxbsites.com/')
+  out, _err, code = run_cli('check', 'http://stub.test/', '--against', 'http://stub.test/next/',
+                            '--ignore', 'canonical',
+                            env: BROWSER_ENV.merge('STUB_BROWSER_HTML' => SOURCE_PAGE,
+                                                   'STUB_BROWSER_HTML2' => rebuilt,
+                                                   'STUB_BROWSER_AGAINST' => 'http://stub.test/next/'))
+  assert(code == 0, "expected the ignored difference not to fail the check, got #{code}: #{out}")
+  assert(JSON.parse(out)['differences'] == [], "got #{out}")
+end
+
+check('check --against closes the one session it opened, by name, and never --all') do
+  File.write(BROWSER_LOG, '')
+  run_cli('check', 'http://stub.test/', '--against', 'http://stub.test/next/',
+          env: BROWSER_ENV.merge('STUB_BROWSER_HTML' => SOURCE_PAGE, 'STUB_BROWSER_HTML2' => SOURCE_PAGE,
+                                 'STUB_BROWSER_AGAINST' => 'http://stub.test/next/'))
+  log = File.read(BROWSER_LOG)
+  sessions = log.lines.map { |l| l.split(' ').first }.uniq
+  assert(sessions.size == 1, "expected one session for both pages, got #{sessions.inspect}")
+  assert(log.lines.last.include?('close'), "expected the session closed last: #{log}")
+  assert(!log.include?('--all'), "the CLI closed every session on the machine: #{log}")
 end
 
 # -- fragment: a full HTML document -> a page body ----------------------------
