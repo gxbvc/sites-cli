@@ -2249,12 +2249,16 @@ check('fragment rewrites every local assets/ reference to {{ asset: }} and leave
   end
 end
 
-check('fragment warns about the things that only break later: forms-1.js, an SVG favicon, an external sheet') do
+check('fragment warns about the things that only break later: an SVG favicon, an external sheet') do
   with_page_file do |_dir, path|
     _out, err, = run_cli('fragment', path)
-    assert(err.include?('stopPropagation'), "expected the double-submit warning, got #{err.inspect}")
     assert(err.include?('favicon_svg_unresizable'), "expected the SVG favicon warning, got #{err.inspect}")
     assert(err.include?('fonts.example.com'), "expected the external stylesheet warning, got #{err.inspect}")
+    # The platform no longer ships a document-level submit listener, so a
+    # page's own /f/ submit handler no longer double-fires -- the warning
+    # (and forms-1.js/stopPropagation itself) is retired, not just quiet.
+    assert(!err.include?('stopPropagation'), "expected no double-submit warning, got #{err.inspect}")
+    assert(!err.include?('forms-1.js'), "expected no mention of the removed script, got #{err.inspect}")
   end
 end
 
@@ -2363,24 +2367,22 @@ check('fragment says which <main> attributes it carried onto the div and which i
   end
 end
 
-check('fragment warns that a /f/ form with no result element shows the visitor nothing') do
+check('fragment no longer warns about a /f/ form with no result element -- the platform renders the response now') do
   with_page_file(ANDY_PAGE) do |_dir, path|
-    _out, err, = run_cli('fragment', path)
-    assert(err.include?('/f/contact'), "expected the form named, got #{err.inspect}")
-    assert(err.include?('form-contact-result'), "expected the id form named, got #{err.inspect}")
-    assert(err.include?('data-form-result'), "expected the attribute form named, got #{err.inspect}")
-    assert(err.include?('--add-form-result'), "expected the way out named, got #{err.inspect}")
+    out, err, = run_cli('fragment', path)
+    assert(!err.include?('data-form-result'), "expected no mention of the retired contract, got #{err.inspect}")
+    assert(!err.include?('form-contact-result'), "expected no mention of the retired contract, got #{err.inspect}")
+    # The form itself is left alone -- a plain HTML form works with zero script.
+    body = JSON.parse(out).dig('data', 'body')
+    assert(body.include?('action="/f/contact"'), 'expected the form kept as-is')
   end
 end
 
-check('fragment --add-form-result inserts the element after the form') do
+check('--add-form-result is refused as an unknown flag now that the feature is retired') do
   with_page_file(ANDY_PAGE) do |_dir, path|
-    out, err, = run_cli('fragment', path, '--add-form-result')
-    body = JSON.parse(out).dig('data', 'body')
-    assert(body.include?('</form>'), 'expected the form kept')
-    assert(body[body.index('</form>')..].include?('<p data-form-result hidden></p>'),
-      "expected the result element after the form, got #{body.inspect}")
-    assert(!err.include?('shows the visitor'), 'expected no warning once it was inserted')
+    out, _err, code = run_cli('fragment', path, '--add-form-result')
+    assert(code != 0, 'expected a nonzero exit')
+    assert(JSON.parse(out)['code'] == 'USAGE', "expected USAGE, got #{out}")
   end
 end
 

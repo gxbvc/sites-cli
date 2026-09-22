@@ -118,11 +118,11 @@ index.html --page /` does that conversion and prints the real `put page` change
 pages are one snapshot.
 
 It warns about what it drops that nothing else catches: the `<body>`
-attributes (`--wrap-body` re-wraps them), a `/f/` form with no
-`[data-form-result]` element (`--add-form-result` inserts one), a JSON-LD
-script in the body (`--lift-json-ld` moves it to `metadata.schema`), a
-third-party stylesheet, an unresizable SVG favicon, and a page that binds its
-own `/f/` submit handler without `stopPropagation()`.
+attributes (`--wrap-body` re-wraps them), a JSON-LD script in the body
+(`--lift-json-ld` moves it to `metadata.schema`), a third-party stylesheet,
+and an unresizable SVG favicon. A `/f/` form needs no script and no result
+element -- the platform renders its own response page now; see
+`sites-cli guide SLUG forms`.
 
 ## check
 

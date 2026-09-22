@@ -1925,38 +1925,17 @@ def scan_scripts(markup, prefix, config, warnings)
   end
 end
 
-# A form posts to /f/<name>, /platform/forms-1.js writes the answer into
-# [data-form-result] or #form-<name>-result, and a page with neither shows the
-# visitor nothing at all and leaves the submit button disabled. Nothing said so
-# anywhere: the build had no diagnostic, the checks were clean, and the form
-# looked broken on a live practice's site (pc_0e2afbdd).
-FORM_RESULT_ELEMENT = '<p data-form-result hidden></p>'
-
-def form_names(body)
-  body.scan(%r{<form\b[^>]*\baction=["']/f/([^"'?#/]+)}i).flatten
-end
-
-def form_result_missing(body, name)
-  !body.match?(/\bdata-form-result\b/i) && !body.match?(/\bid=["']form-#{Regexp.escape(name)}-result["']/i)
-end
-
-# Inserted after the </form> that closes this form, because that is where the
-# script looks and where a person reads it. Forms do not nest.
-def insert_form_result(body, name)
-  open_at = body.index(%r{<form\b[^>]*\baction=["']/f/#{Regexp.escape(name)}}i)
-  return body unless open_at
-  close_at = body.index(%r{</form>}i, open_at)
-  return body unless close_at
-  after = close_at + body[close_at..][/\A<\/form>/i].length
-  body[0...after] + "\n" + FORM_RESULT_ELEMENT + body[after..]
-end
-
-Conversion = Struct.new(:prefix, :wrap_body, :add_form_result, :lift_json_ld, keyword_init: true)
+# A page posts to /f/<name> as a plain HTML form -- no script required. The
+# platform renders the success or error page itself now; the old
+# /platform/forms-1.js and its [data-form-result]/#form-<name>-result contract
+# are gone (pc_8781d8fc: the script wrote the message but never unhid the
+# element, so the one thing that contract bought nobody actually got). The
+# full contract is `sites-cli guide SLUG forms`.
+Conversion = Struct.new(:prefix, :wrap_body, :lift_json_ld, keyword_init: true)
 
 # rubocop:disable Metrics/AbcSize
-def html_to_fragment(html, prefix: 'assets/', wrap_body: false, add_form_result: false, lift_json_ld: false)
-  options = Conversion.new(prefix: prefix, wrap_body: wrap_body, add_form_result: add_form_result,
-                           lift_json_ld: lift_json_ld)
+def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: false)
+  options = Conversion.new(prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
   notes = []
   warnings = []
   config = { 'stylesheets' => [], 'modules' => [], 'imports' => {} }
@@ -2135,25 +2114,6 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, add_form_result:
   if body.match?(/\bsrcset=["'][^"']*#{Regexp.escape(prefix)}/i)
     warnings << 'srcset is not rewritten: bind each candidate by hand, or use one src.'
   end
-  if body.match?(%r{<form\b[^>]*action=["']/f/}i) && body.match?(/addEventListener\(\s*["']submit["']/i) &&
-     !body.match?(/stopPropagation\s*\(/)
-    warnings << 'this page binds its own submit handler on a /f/ form. The platform injects ' \
-                '/platform/forms-1.js, which binds a document-level submit listener too, so one click ' \
-                'posts twice. Call event.stopPropagation() next to event.preventDefault().'
-  end
-  form_names(body).uniq.each do |name|
-    next unless form_result_missing(body, name)
-    if options.add_form_result
-      body = insert_form_result(body, name)
-      notes << "inserted #{FORM_RESULT_ELEMENT} after the /f/#{name} form -- /platform/forms-1.js writes its answer there"
-    else
-      warnings << "this page posts to /f/#{name} and carries no [data-form-result] and no " \
-                  "#form-#{name}-result element. /platform/forms-1.js writes the server's answer into one of " \
-                  'those and does nothing without one, so the visitor sees no message and a submit button ' \
-                  "left disabled. Add an element with either marker, or rerun with --add-form-result to put " \
-                  "#{FORM_RESULT_ELEMENT} after the form."
-    end
-  end
 
   assets = (referenced + config['stylesheets'] + config['modules'] + config['imports'].values +
             [config.dig('favicon', 'url')]).compact.uniq.sort
@@ -2188,11 +2148,10 @@ def fragment_page_change(fragment, page_key, title: nil, extra_metadata: nil)
   [{ 'op' => 'put', 'kind' => 'page', 'key' => page_key, 'document' => document }, nil]
 end
 
-def cmd_fragment(file, prefix:, page_key:, title:, append_to:, wrap_body:, add_form_result:, lift_json_ld:)
+def cmd_fragment(file, prefix:, page_key:, title:, append_to:, wrap_body:, lift_json_ld:)
   html, err = read_text(file)
   return fail_with(err) if err
-  result = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body,
-                            add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+  result = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
 
   changes = []
   if page_key
@@ -2301,7 +2260,7 @@ def load_object(file, what)
 end
 
 # rubocop:disable Metrics/AbcSize
-def build_save_changes(taken, prefix:, wrap_body: false, add_form_result: false, lift_json_ld: false)
+def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false)
   pages = []
   items = []
   config_file = nil
@@ -2342,8 +2301,7 @@ def build_save_changes(taken, prefix:, wrap_body: false, add_form_result: false,
     next unless page['html']
     html, err = read_text(page['html'])
     return [nil, err] if err
-    page['fragment'] = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body,
-                                        add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+    page['fragment'] = html_to_fragment(html, prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
     report_fragment(page['fragment'], "save #{page['key']}")
   end
 
@@ -2557,7 +2515,7 @@ SUBCOMMANDS = [
   [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
   [%w[upload], 'SLUG FILE [FILE...]', 'POST /api/v1/media/uploads', 'draft', 'v2'],
   [%w[push], 'SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]', 'read + upload xN + save', 'draft', 'v2'],
-  [%w[fragment], 'FILE|- [--page KEY] [--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]', '--', 'none', 'none'],
+  [%w[fragment], 'FILE|- [--page KEY] [--append-changes FILE] [--wrap-body] [--lift-json-ld]', '--', 'none', 'none'],
   [%w[validate-config], 'FILE --site SLUG', 'read {kind: schema}', 'read', 'v2'],
   [%w[check], 'URL [--against URL] [--screenshot PATH] [--viewport] [--ignore S] [--no-probe]', '--', 'none', 'none'],
   [%w[manual], '', '--', 'none', 'none'],
@@ -2738,7 +2696,7 @@ def usage
       sites-cli save onyx --config ./config.json \\
         --page /        --html ./public/index.html \\
         --page /about   --html ./public/about.html \\
-        --page /contact --html ./public/contact.html --add-form-result \\
+        --page /contact --html ./public/contact.html \\
         --message "onyx, three pages"
       sites-cli wait-preview onyx
       sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
@@ -2810,7 +2768,6 @@ def run_v2(command, argv)
     changes_file = opt(argv, '--changes')
     prefix = opt(argv, '--prefix') || 'assets/'
     wrap_body = flag?(argv, '--wrap-body')
-    add_form_result = flag?(argv, '--add-form-result')
     lift_json_ld = flag?(argv, '--lift-json-ld')
     dry_run = flag?(argv, '--dry-run')
     flag_err = unknown_flags(argv, command)
@@ -2826,8 +2783,7 @@ def run_v2(command, argv)
       return fail_with(err) if err
       changes = loaded.is_a?(Hash) ? loaded['changes'] : loaded
     elsif taken.any?
-      built, err = build_save_changes(taken, prefix: prefix, wrap_body: wrap_body,
-                                      add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+      built, err = build_save_changes(taken, prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
       return fail_with(err) if err
       changes = built
     end
@@ -3202,14 +3158,13 @@ def run(argv)
     title = opt(argv, '--title')
     append_to = opt(argv, '--append-changes')
     wrap_body = flag?(argv, '--wrap-body')
-    add_form_result = flag?(argv, '--add-form-result')
     lift_json_ld = flag?(argv, '--lift-json-ld')
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     file = argv.shift
     return failure("fragment requires FILE (or - for stdin)", code: 'USAGE') unless file
     return cmd_fragment(file, prefix: prefix, page_key: page_key, title: title, append_to: append_to,
-                        wrap_body: wrap_body, add_form_result: add_form_result, lift_json_ld: lift_json_ld)
+                        wrap_body: wrap_body, lift_json_ld: lift_json_ld)
 
   when 'upload'
     slug = argv.shift

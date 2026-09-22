@@ -54,7 +54,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `tools SLUG` | `GET /api/v1/tools` | none | both |
 | `upload SLUG FILE [FILE...]` | `POST /api/v1/media/uploads` | draft | v2 |
 | `push SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]` | `read + upload xN + save` | draft | v2 |
-| `fragment FILE\|- [--page KEY] [--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]` | -- | none | none |
+| `fragment FILE\|- [--page KEY] [--append-changes FILE] [--wrap-body] [--lift-json-ld]` | -- | none | none |
 | `validate-config FILE --site SLUG` | `read {kind: schema}` | read | v2 |
 | `check URL [--against URL] [--screenshot PATH] [--viewport] [--ignore S] [--no-probe]` | -- | none | none |
 | `manual` | -- | none | none |
@@ -411,7 +411,7 @@ apart before it can be saved, and doing that by hand is how a site ends up with
 a duplicated `id="main"` or a stylesheet nothing loads.
 
 `fragment FILE|- [--prefix assets/] [--page KEY] [--title T]
-[--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]`
+[--append-changes FILE] [--wrap-body] [--lift-json-ld]`
 does the conversion and prints it:
 
 ```json
@@ -456,13 +456,16 @@ shipped clean through twenty-four browser checks and empty build diagnostics:**
 | Warning | Why it matters | Flag |
 |---|---|---|
 | the `<body>` carried attributes | a fragment has no `<body>`. Losing `class="bg-sand-50 text-ink antialiased"` changed font smoothing, the page background and the default text colour on twelve pages, and only a pixel diff caught it | `--wrap-body` re-wraps in a `<div>` carrying them. A background utility on a wrapper paints over a descendant at a negative `z-index`, which `<body>` did not -- for decorative layers, put the background on the body element through the page's `css` instead |
-| a `/f/<name>` form with no result element | the POST succeeds and the visitor sees nothing | `--add-form-result` |
 | a JSON-LD script in the body | page structured data belongs in `metadata.schema` | `--lift-json-ld` |
 | a third-party stylesheet `config.stylesheets` cannot hold | it is dropped, so the page ships without it | upload it |
 | third-party scripts, in the head or left in the body | the head's went with the head; the body's load from someone else's origin on every view | -- |
 | a declared **SVG favicon** | linked as it stands and not resizable, so the site ships no apple-touch-icon and no raster sizes (`favicon_svg_unresizable`) | rasterize and declare the `.png` |
 | an `srcset` that was not rewritten | bind each candidate by hand, or use one `src` | -- |
-| a page that binds its own `submit` handler on a `/f/` form without `stopPropagation()` | `/platform/forms-1.js` binds a document-level `submit` listener too, so one click posts twice | -- |
+
+A `/f/<name>` form needs no result element and no submit-handler care any
+more: the platform no longer ships a document-level submit listener, so a
+page's own handler on the form does not double-fire, and a plain POST renders
+its own response page. See "forms" above and `sites-cli guide SLUG forms`.
 
 ## One save, many documents
 
@@ -474,7 +477,7 @@ commands and twelve builds.
 sites-cli save onyx --config ./config.json \
   --page /        --html ./build/index.html \
   --page /about   --html ./build/about.html   --title "About Onyx" \
-  --page /contact --html ./build/contact.html --add-form-result \
+  --page /contact --html ./build/contact.html \
   --page /blog/first --markdown ./posts/first.md \
   --collection blog ./collections/blog.json \
   --redirect /old-about /about \
@@ -636,7 +639,7 @@ sites-cli validate-config ./config.json --site onyx
 sites-cli save onyx --config ./config.json \
   --page /        --html ./public/index.html \
   --page /about   --html ./public/about.html \
-  --page /contact --html ./public/contact.html --add-form-result \
+  --page /contact --html ./public/contact.html \
   --message "onyx, three pages"
 
 # 4. wait for the build (head_preview and integrations come back with it),
@@ -693,7 +696,7 @@ rm -f /tmp/changes.json
 for page in index about services contact; do
   route=$([ "$page" = index ] && echo / || echo "/$page")
   sites-cli fragment "./build/$page.html" --page "$route" \
-    --wrap-body --add-form-result --lift-json-ld \
+    --wrap-body --lift-json-ld \
     --append-changes /tmp/changes.json
 done
 sites-cli validate-config ./build/config.json --site SLUG
