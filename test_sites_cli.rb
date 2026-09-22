@@ -2676,6 +2676,14 @@ check('sites-cli manual prints a markdown table and makes no request') do
   assert(requests.values.sum == before, 'the manual asked the server something')
 end
 
+check("AGENTS.md's pasted table is byte-identical to what sites-cli manual prints") do
+  doc = File.read(File.expand_path('AGENTS.md', __dir__))
+  pasted = doc[%r{<!-- sites-cli manual -->\n(.*?)<!-- /sites-cli manual -->}m, 1]
+  assert(pasted, 'expected the manual block in AGENTS.md, between the two marker comments')
+  assert(pasted.strip == run_cli('manual').first.strip,
+    'AGENTS.md has drifted from the code: rerun `sites-cli manual` and paste it between the markers')
+end
+
 check('every subcommand the manual names is one run() dispatches, and the other way round') do
   source = File.read(CLI)
   dispatch = source[/def run\(argv\).*?\n  else\n/m]

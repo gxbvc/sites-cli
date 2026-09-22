@@ -21,51 +21,61 @@ naming the tool to use instead (`upgrade_required` / `not_versioned`).
 
 ## Subcommand -> tool -> capability
 
-| Subcommand | MCP tool | Capability | Contract |
+Do not edit this table by hand. It is the output of `sites-cli manual`, which
+prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
+`when` clause disagree. Regenerate it with `sites-cli manual` and paste.
+
+<!-- sites-cli manual -->
+| Subcommand | Tool | Capability | Contract |
 |---|---|---|---|
-| `describe SLUG [PATH] [--branch B]` | `describe_site` | `read` | both (the server answers in the site's own shape) |
-| `read SLUG KIND [KEY]` | `read` | `read` | v2 |
-| `read SLUG asset --keys a,b` | `read` (batch `{key => digest}`) | `read` | v2 |
-| `save SLUG --changes FILE` | `save` | `draft` | v2 |
-| `create-branch SLUG NAME` | `create_branch` | `draft` | v2 |
-| `archive-branch SLUG NAME` | `archive_branch` | `draft` | v2 |
-| `diff SLUG` | `diff` | `read` | v2 |
-| `publish SLUG --review T\|last` | `publish` | `publish` | v2 |
-| `publish SLUG --expected T --keys ...` | `publish` | `publish` | v2 |
-| `merge-live SLUG --expected-live ID` | `merge_live` | `draft` | v2 |
-| `resolve-merge SLUG --proposal T` | `resolve_merge` | `draft` | v2 |
-| `history SLUG` | `history` | `read` | v2 |
-| `revoke-preview SLUG URL_OR_TOKEN` | `revoke_preview` | `draft` | v2 |
-| `wait-preview SLUG` | `describe_site` (polled) | `read` | v2 |
-| `list-submissions SLUG` | `list_submissions` | `read_submissions` | both |
-| `analytics SLUG` | `get_analytics` | `read` | both |
-| `list-sites` | `list_sites` (platform door) | `read` | platform |
-| `list-sites SLUG` | `list_sites` (site door) | `read` | both |
-| `create-site SLUG --name N` | `create_site` (platform door) | `draft` + GXB staff | platform |
-| `platform-tools` | -- (`GET /api/v1/platform/tools`) | none | platform |
-| `upload SLUG FILE...` | -- (`POST /api/v1/media/uploads`) | `draft` | v2 |
-| `push SLUG DIR` | one batch `read` + `upload` x N + one `save` | `draft` | v2 |
-| `push SLUG DIR --dry-run` | one `describe_site` | `read` | v2 |
-| `fragment FILE` | -- (local) | none | none |
-| `check URL` | -- (`agent-browser`) | none | none |
-| `describe_site` / `list_files` / `read_file` / `write_file` / `edit_file` / `publish SLUG PATH` | same names | `read` / `draft` / `publish` | legacy |
-| `list` / `show` / `open` / `create` | -- (`rails runner`) | staff | both |
+| `describe SLUG [PATH] [--branch B]` (alias: `describe_site`) | `describe_site` | read | both |
+| `read SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]` | `read` | read | v2 |
+| `schema SLUG [config\|page\|collection\|redirect\|changes]` | `read {kind: schema}` | read | v2 |
+| `save SLUG --changes FILE \| --page KEY --html FILE ... [--dry-run]` | `save` | draft | v2 |
+| `create-branch SLUG NAME [--from live\|BRANCH]` | `create_branch` | draft | v2 |
+| `archive-branch SLUG NAME` | `archive_branch` | draft | v2 |
+| `diff SLUG [--branch B] [--against live\|BRANCH]` | `diff` | read | v2 |
+| `publish SLUG --review T\|last \| --expected T --keys ... \| PATH` | `publish` | publish | both |
+| `merge-live SLUG [--branch B] --expected T --expected-live ID` | `merge_live` | draft | v2 |
+| `resolve-merge SLUG --proposal T --resolutions FILE` | `resolve_merge` | draft | v2 |
+| `history SLUG [--branch B] [--limit N]` | `history` | read | v2 |
+| `revoke-preview SLUG URL_OR_TOKEN` | `revoke_preview` | draft | v2 |
+| `wait-preview SLUG [--branch B] [--timeout 120]` | `describe_site (polled)` | read | v2 |
+| `list-domains SLUG` | `list_domains` | read | v2 |
+| `connect-domain SLUG HOST [--no-primary]` | `connect_domain` | manage_domains | v2 |
+| `verify-domain SLUG HOST` | `verify_domain` | manage_domains | v2 |
+| `disconnect-domain SLUG HOST` | `disconnect_domain` | manage_domains | v2 |
+| `list-submissions SLUG [--form F] [--since ISO] [--limit N]` | `list_submissions` | read_submissions | both |
+| `delete-submission SLUG ID` | `delete_submission` | read_submissions | both |
+| `analytics SLUG [--period today\|yesterday\|7d\|30d\|all]` | `get_analytics` | read | both |
+| `list-sites [SLUG]` | `list_sites` | read | platform, or a site door with SLUG |
+| `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
+| `platform-tools` | `GET /api/v1/platform/tools` | none | platform |
+| `tools SLUG` | `GET /api/v1/tools` | none | both |
+| `upload SLUG FILE [FILE...]` | `POST /api/v1/media/uploads` | draft | v2 |
+| `push SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]` | `read + upload xN + save` | draft | v2 |
+| `fragment FILE\|- [--page KEY] [--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]` | -- | none | none |
+| `validate-config FILE --site SLUG` | `read {kind: schema}` | read | v2 |
+| `check URL [--against URL] [--screenshot PATH] [--viewport] [--ignore S] [--no-probe]` | -- | none | none |
+| `manual` | -- | none | none |
+| `list [SLUG] [--prod]` | `rails runner, or list_files with SLUG` | staff / read | both |
+| `show SLUG [--prod]` | `rails runner` | staff | both |
+| `open SLUG [--prod]` | `rails runner` | staff | both |
+| `create SLUG [--name N] [--team T] [--prod]` | `rails runner` | staff | legacy |
+| `list_files SLUG [--prefix P]` | `list_files` | read | legacy |
+| `read_file SLUG PATH [--view live]` | `read_file` | read | legacy |
+| `write_file SLUG PATH --content C \| --file FILE` (alias: `write`) | `write_file` | draft | legacy |
+| `edit_file SLUG PATH --edits-file FILE` (alias: `edit`) | `edit_file` | draft | legacy |
+<!-- /sites-cli manual -->
 
 Every argument name here is the one `Mcp::ToolRegistry::TOOLS` declares. That
 registry is the contract; this table is a map of which shell word posts which
 tool.
 
-**What the server has.** Slice D (builds, preview hostnames, real
-`preview_status`, `revoke_preview`) is deployed. Slice E (`publish` both forms,
-`merge_live`, `resolve_merge`, `history`, `read {at:}`, the batch asset `read`,
-`archive_branch`) and slice F (`POST /api/v1/platform/tools`, personal tokens,
-`read_submissions` as its own capability) are on `main` and deploy after
-review; until that deploy a production server answers `unknown tool` for the
-new names and 404 at the platform path, and the CLI prints that verbatim. The
-`*.gxbsites.com` wildcard certificate is **not** installed yet, so a finished
-build reports `provisioning` rather than `ready` and its preview hostname
-cannot complete a TLS handshake. That is a host state, not something to wait
-out -- see `wait-preview` below.
+**What the server has: ask it.** `sites-cli tools SLUG` prints the server's own
+tool index for that site and `sites-cli schema SLUG` prints the document
+schemas. A paragraph in this file cannot stay true across a deploy and twice
+has told people a working feature was broken; those two commands can.
 
 ## Ergonomics
 
@@ -82,7 +92,8 @@ out -- see `wait-preview` below.
 - **`read --at` never updates the cache either.** A historical read answers
   with the snapshot token it read, under the same `branch` and `expected` keys
   a head read uses; caching it would hand the next `save` a token for a
-  snapshot the branch is not on.
+  snapshot the branch is not on. Nor does `save --dry-run`: a rehearsal makes
+  no snapshot, so it leaves no local state.
 - **`--review` never defaults.** A review is a binding to one exact candidate,
   so it is remembered under its own key and only `--review last` spends it.
   `publish --review last` with nothing remembered fails locally (`NO_REVIEW`)
@@ -94,8 +105,12 @@ out -- see `wait-preview` below.
   supply the whole arguments object; explicit flags override individual keys.
 - An unknown `--flag` is refused before any request goes out.
 - **stdout is one JSON object, always.** Every note, warning, change list and
-  next step goes to stderr, so `sites-cli <anything> | jq` works. The one
-  deliberate exception is `upload`, which prints one JSON line per file.
+  next step goes to stderr, so `sites-cli <anything> | jq` works. The two
+  deliberate exceptions are `upload`, which prints one JSON line per file, and
+  `manual`, which prints a markdown table.
+- **Nothing ever prints a Ruby backtrace.** A server answer nobody expected is
+  a structured error with the body attached, and a worker thread that raises
+  fails one file rather than the command.
 - Nothing ever prints a bearer token.
 
 ## Tokens: which one, where
@@ -106,15 +121,15 @@ out -- see `wait-preview` below.
 | Site token `sk_site_<slug>_...` | `tokens.json` under the slug | `POST /api/v1/tools`, `/api/v1/media/uploads` for that one site |
 | Staff credentials | the Rails app itself | `list` / `show` / `open` / `create` through the runner |
 
-**One personal credential opens both doors.** A site token is for handing a
-single site to someone else. A slug with no entry in `tokens.json` falls back
-to the personal token, and then every request carries `"site": "<slug>"` --
-the same field Chat sends. The server resolves it through that person's
-viewable sites and checks their capabilities on it, so a site they cannot read
-is a 404 (never 403: "no such site" and "a site you cannot read" have to read
-the same), and a capability they do not hold is 403 `capability_denied` naming
-it. A slug with a site token is sent exactly as it always was, with no `site`
-field at all.
+**One personal credential opens both doors**, and this is deployed. A site
+token is for handing a single site to someone else. A slug with no entry in
+`tokens.json` falls back to the personal token, and then every request carries
+`"site": "<slug>"` -- the same field Chat sends. The server resolves it through
+that person's viewable sites and checks their capabilities on it, so a site
+they cannot read is a 404 (never 403: "no such site" and "a site you cannot
+read" have to read the same), and a capability they do not hold is 403
+`capability_denied` naming it. A slug with a site token is sent exactly as it
+always was, with no `site` field at all.
 
 A site token presented at the platform door is 403 `capability_denied`, printed
 verbatim -- it is one tenant's credential at the platform endpoint, not "almost
@@ -126,13 +141,13 @@ capabilities, so the smaller of the two wins. A read-only personal token
 cannot draft on a site its owner administers, and `describe_site` reports the
 intersection rather than the person's full set.
 
-A token's scopes **are** the six capabilities, and they are fixed when it is
+A token's scopes **are** the capabilities, and they are fixed when it is
 minted. `read` no longer contains `read_submissions`: reading a site's source
 is not reading the contact details people typed into its forms. So
 `list-submissions` on a token minted before that split is a 403 naming
 `read_submissions`, and the recovery is a new token with the box ticked on the
 site's admin page, not a retry. The CLI says so on stderr when it sees that
-exact 403.
+exact 403. `manage_domains` is its own capability the same way.
 
 ## State and token files
 
@@ -151,7 +166,7 @@ with no entry of its own. `state.json` is one flat map with two key shapes:
 
 | Key | Value | Written by |
 |---|---|---|
-| `expected:<slug>:<branch>` | branch head CAS token (`snap_...`) | every 2xx v2 response carrying `branch`+`expected`, and every `branches[]` entry in `describe`. Never a `read --at` response, never a 409 body |
+| `expected:<slug>:<branch>` | branch head CAS token (`snap_...`) | every 2xx v2 response carrying `branch`+`expected`, and every `branches[]` entry in `describe`. Never a `read --at` response, never a `save --dry-run`, never a 409 body |
 | `last_review:<slug>:<branch>` | the last `review` this CLI printed for that branch | every 2xx response carrying `branch`+`review` (`describe`, `save`, `create-branch`, `merge-live`, `resolve-merge`, `publish --keys`, `wait-preview`). An explicit `review: null` deletes it; so does a `publish --review` that spends it |
 | `<slug>/<path>` | legacy file version | `read_file`, `write_file`, `edit_file`, `write_file --file` |
 
@@ -169,17 +184,49 @@ flow for each file, four at a time, and prints one JSON line per file:
 
 Exit 1 if any file failed. On a versioned site `label` and `expected_version`
 are omitted and `filename` + a `digest` hint are sent instead: bytes are bound
-to a logical path later, by `save`. Content type comes from the extension:
-`js mjs css svg glb woff woff2 json txt png jpg jpeg webp gif mp4`, plus an
-extensionless `LICENSE`/`LICENCE`/`NOTICE`/`COPYING`/`COPYRIGHT`/`AUTHORS`/
-`PATENTS` as `text/plain`, so a vendored bundle's notice can sit next to the
-code it covers. `.mjs` uploads as `text/javascript` and the server delivers it
-as `asset.js` -- the suffix comes from the validated type, never the filename.
+to a logical path later, by `save`.
 
-The platform types bytes from **content**, not from the name, so a file called
-`.png` that holds JPEG bytes is stored and served as `image/jpeg`. `push`
-prints that on stderr when it happens; otherwise it appears nowhere short of a
-browser's network log.
+**Bytes the platform already holds are the cheap case.** Authorize answers
+`status: "ready"` with the blob URL and no `upload_url`, and that line comes
+back with `"deduplicated": true` and no PUT, no complete and no poll. This is
+the fast path global content addressing exists for -- a file another tenant
+published is already there -- and it used to hand `nil` to `URI()` and print a
+thread backtrace with nothing on stdout.
+
+**Any content type.** The extension table
+(`js mjs css svg glb woff woff2 json txt png jpg jpeg webp gif mp4`, plus an
+extensionless `LICENSE`/`LICENCE`/`NOTICE`/`COPYING`/`COPYRIGHT`/`AUTHORS`/
+`PATENTS` as `text/plain`) is a hint for the types the platform has opinions
+about. Anything it does not name is typed by extension through Marcel, or
+`mime-types`, or finally `application/octet-stream`. The one refusal left is
+the server's: `text/html`, `application/xhtml+xml` and anything that sniffs as
+HTML, because a page served as a blob on `cdn.gxbsites.com` would be phishing
+on our own origin. That 422 is printed verbatim; the CLI does not guess it
+locally, but `push` says on stderr that an HTML file belongs in a page
+document. Single PUT up to 25 MB; above that the server asks for the multipart
+transport whatever the type is, and the CLI follows `multipart` in the
+authorize response.
+
+`.mjs` uploads as `text/javascript` and the server delivers it as `asset.js` --
+the suffix comes from the validated type, never the filename. The platform
+types bytes from **content**, not from the name, so a file called `.png` that
+holds JPEG bytes is stored and served as `image/jpeg`. `push` prints that on
+stderr when it happens; otherwise it appears nowhere short of a browser's
+network log.
+
+**Derivatives come from the CDN, not from a second upload.** An image blob is
+resizable in place through the Cloudflare transform prefix:
+
+```
+https://cdn.gxbsites.com/cdn-cgi/image/width=400,format=auto/blobs/<digest>/asset.jpg
+```
+
+**Assets are cross-origin.** They are served from `cdn.gxbsites.com` and the
+page is not, so a canvas or WebGL texture needs `crossOrigin = "anonymous"` on
+the image (or `{ crossOrigin: 'anonymous' }` on a three.js loader) or the
+canvas is tainted and `readPixels`/`toDataURL` throws.
+
+### push
 
 `push SLUG DIR [--branch B] [--prefix assets/] [--dry-run] [--offline]` walks
 `DIR` with `Dir.glob` (never `find`), skipping dotfiles and dot directories,
@@ -188,23 +235,28 @@ then:
 1. one `read {kind:"asset", keys:[...]}` (1000 keys per call) asking which of
    those logical paths the branch already binds, and to what digest;
 2. uploads only the files whose local sha256 differs from what came back, four
-   at a time -- identical bytes anywhere in the tree are still one upload;
+   at a time -- identical bytes anywhere in the tree are still one upload, and
+   bytes the platform already holds cost an authorize and nothing else;
 3. emits **one** `save` with a `put {kind:"asset", key, digest}` per *changed*
    file. A tree where nothing moved makes no `save` at all and prints
    `{"saved":false,"unchanged":n}`.
 
-The skip count goes to stderr (`push: 12 of 30 file(s) already bound at the
-same digest`) so stdout stays one JSON envelope. The `read` in step 1 is also
-the freshest look at the branch head there is, so its `expected` is what the
-`save` uses unless `--expected` named one. A server with no batch asset read
-(404/422) falls back to uploading everything; slice D's digest hint still
-short-circuits bytes the platform already has, so the cost is a round trip per
-file, not a wrong answer. Any other error (401, 403, or the 409 a legacy site
-answers) stops the push.
+The skip count and the dedup count go to stderr so stdout stays one JSON
+envelope. The `read` in step 1 is also the freshest look at the branch head
+there is, so its `expected` is what the `save` uses unless `--expected` named
+one. A server with no batch asset read (404/422) falls back to uploading
+everything; the digest hint still short-circuits bytes the platform already
+has, so the cost is a round trip per file, not a wrong answer. Any other error
+(401, 403, or the 409 a legacy site answers) stops the push.
 
 A relative path that already starts with the prefix is not prefixed twice, so
 `push onyx ./public` on a tree containing `assets/app.js` produces the key
 `assets/app.js`, not `assets/assets/app.js`.
+
+**An empty tree is a site, not a mistake.** A site whose pages reference no
+images, fonts or scripts pushes `{"saved":false,"unchanged":0,"files":0}` and
+exits 0, after the same contract check a dry run makes, so `push && save` needs
+no special case.
 
 `--dry-run` prints the full change list (with real local sha256 digests and
 each file's declared `media_type`) and makes **one** request: the
@@ -225,7 +277,131 @@ flight, each part retried with a fresh presign, and an unrecoverable part
 aborts the whole upload (`DELETE .../uploads/:id`, releasing the quota
 reservation).
 
-## fragment, and `save --page --html`
+## The documents: config, page, changes
+
+`sites-cli schema SLUG` prints the JSON Schema for all of them, generated on
+the server from the same tables its validator uses, and every property carries
+a one-line description of what the shell emits for it. `sites-cli
+validate-config FILE --site SLUG` fetches that schema and runs it locally --
+unknown keys with the allowed set beside them, types, enums and missing
+required keys, all in one pass, before any write. `sites-cli save SLUG
+--config FILE --dry-run` is the server's own answer to the same question.
+
+A 422 `invalid_document` carries `path`, `keys`, `allowed` and `schema: true`,
+and reports every problem in the document at once rather than the first.
+
+### config
+
+`name` is required. `title_template` takes two placeholders: `{title}` is the
+page's own title and `{site}` is `config.name`, so `"{title} | {site}"` is the
+common one and a template with no `{title}` is a 422 that says so. A page whose
+own title already names the site sets `metadata.title_is_full: true` rather
+than fighting the template.
+
+`business` is the public NAP/identity projection the JSON-LD and the Markdown
+alternates are built from. **The public URL is not in here.** `business.url`
+used to be accepted and emit nothing; it is a rejection now that names
+`connect_domain`. See "Domains" below.
+
+### page
+
+`{format, metadata, body, css}`. `format` is `html` or `markdown`. The body is
+a **fragment** -- see the next section. `metadata.title` is required.
+`metadata.schema` is an array of JSON-LD nodes (at most 20, 32 KB) merged into
+the shell's own `@graph`: objects only, no `@context` (the graph has one), and
+no `@id` that collides with a shell node. That is where a page-specific
+`FAQPage` or `Article` belongs; a hand-placed `<script type="application/ld+json">`
+in the body works but the build reports it as `json_ld_in_body`.
+
+### changes, the op vocabulary
+
+`save` takes an array of change objects. `op` is one of `put`,
+`patch_metadata`, `edit_body`, `delete`; `kind` is one of `page`, `layout`,
+`include`, `collection`, `redirect`, `config`, `asset`.
+
+| Change | Shape |
+|---|---|
+| put a page | `{op:"put", kind:"page", key:"/about", document:{format, metadata, body, css}}` |
+| put the config | `{op:"put", kind:"config", document:{...}}` -- no `key`, and a put **replaces** the whole document rather than merging |
+| put a redirect | `{op:"put", kind:"redirect", key:"/old", document:{to:"/new", status:301}}` (301, 302, 307 or 308) |
+| put a collection | `{op:"put", kind:"collection", key:"blog", document:{name, path_prefix, layout, description, order, position}}` |
+| bind an asset | `{op:"put", kind:"asset", key:"assets/app.js", digest:"<sha256>"}` -- any site's digest works; one nobody has published is 422 `unknown_asset` |
+| **delete** | `{op:"delete", kind:"page", key:"/gone"}` -- destroys the row rather than moving live; repeating it is a 404, not a no-op |
+| patch metadata | `{op:"patch_metadata", kind:"page", key:"/", set:{...}, unset:[...]}` -- a shallow merge; `set.custom` replaces the whole custom map |
+| edit the body | `{op:"edit_body", kind:"page", key:"/", edits:[{old_text, new_text}]}` -- each `old_text` must match exactly once |
+
+`save SLUG` builds that array for you: see "One save, many documents".
+
+### read kinds
+
+`page`, `layout`, `include`, `collection`, `redirect`, `config`, `asset`, plus
+two that are not documents anybody authors:
+
+- **`prepared`** returns the HTML and Markdown a ready build already stored for
+  one route (`key`, default `/`) on a branch head or on the candidate a review
+  binds, with `subject` naming which. Those are the same bytes the preview
+  hostname serves, so it is how you read what shipped without a browser. A
+  build that is not ready is 409 `build_not_ready`.
+- **`schema`** returns the JSON Schemas above.
+
+### forms
+
+A page posts to `/f/<name>`, and `<name>` has to be declared in
+`config.forms` -- an undeclared name is a 404 `unknown_form` on a versioned
+site, and the build refuses to publish a page that posts to one
+(`undeclared_form`).
+
+**The result element is not optional.** The platform injects
+`/platform/forms-1.js`, which writes the server's answer into the page's
+`[data-form-result]` element, or into `#form-<name>-result`, and does nothing
+at all without one: the POST goes out, the server answers
+`200 {"ok":true,"message":"..."}`, and the visitor sees no message and a submit
+button left permanently disabled. `sites-cli fragment` warns when a page posts
+to `/f/<name>` and has neither, and `--add-form-result` inserts
+`<p data-form-result hidden></p>` after the form.
+
+To smoke-test a form without putting a fake person in the client's inbox, fill
+the hidden `website` honeypot field: the endpoint answers with the form's
+ordinary success response and stores nothing and mails nobody. A submission you
+made on purpose with the honeypot empty is a real row, and
+`sites-cli delete-submission SLUG ID` is how it comes back out.
+
+## Domains: the site's public URL
+
+The canonical link, `og:url`, the sitemap, `llms.txt` and every JSON-LD `@id`
+are baked from the site's **primary domain**. No config key sets it. Every
+hosted site has `<slug>.gxbsites.com` and that always works; a real hostname is
+four commands:
+
+```bash
+sites-cli list-domains onyx                    # canonical_url, every claim, what is verified
+sites-cli connect-domain onyx onyxmodular.com  # creates the claim, prints the record to publish
+# publish that TXT record at the registrar, wait for DNS
+sites-cli verify-domain onyx onyxmodular.com   # 200 {verified:true}, or 200 {verified:false, checked:[...]}
+sites-cli publish onyx --review last           # republish: the artifact is built for a host
+```
+
+`connect-domain` prints one copyable line on stderr:
+
+```
+TXT _gxbsites-verify.onyxmodular.com "gxbsites-verify=0123456789abcdef0123456789abcdef"
+```
+
+A host that already resolves to us (CNAME to `sites.gxb.vc`, or A to the
+server IP) counts as proof too. **A `verified: false` is a 200 and exit 0**:
+the request was fine, the record is not published yet, and a person has to go
+and publish it. The CLI prints what was looked up and what came back.
+
+Unverified claims may coexist across sites; a host another site holds
+*verified* is a 409 `domain_taken`. An unverified claim gets no certificate and
+serves no content. `disconnect-domain` removes a claim and refuses to remove
+the last hosted one.
+
+`describe_site` carries `canonical_url` and, when the live artifact was
+prepared for a different host than the current canonical, `live_prepared_for`
+and a `next` saying to wait for the rebuild and republish.
+
+## fragment, and save --page --html
 
 A versioned page is a JSON document whose `body` is a **fragment**: the shell
 owns `<!doctype>`, `<html>`, `<head>`, `<title>`, `<meta>`, the one import map
@@ -234,12 +410,26 @@ rather than a URL. A page authored as a standalone HTML file has to be taken
 apart before it can be saved, and doing that by hand is how a site ends up with
 a duplicated `id="main"` or a stylesheet nothing loads.
 
-`fragment FILE|- [--prefix assets/]` does the conversion and prints it:
+`fragment FILE|- [--prefix assets/] [--page KEY] [--title T]
+[--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]`
+does the conversion and prints it:
 
 ```json
 {"ok":true,"data":{"format":"html","metadata":{...},"body":"...","css":"...",
  "config":{"stylesheets":[...],"modules":[...],"imports":{...},"favicon":{"url":"..."}},
- "assets":[...],"changes":[...],"warnings":[...]}}
+ "assets":[...],"changes":[...],"notes":[...],"warnings":[...]}}
+```
+
+`changes` is the real ops array `save` takes -- one `put page` when `--page KEY`
+is given, and empty without it. The English sentences are under `notes` and
+also go to stderr. `--append-changes FILE` appends to a JSON array on disk, so
+a loop over twelve documents produces one file and one `save`:
+
+```bash
+for page in home about contact; do
+  sites-cli fragment "./build/$page.html" --page "/$page" --append-changes /tmp/changes.json
+done
+sites-cli save onyx --changes /tmp/changes.json --message "twelve pages, one snapshot"
 ```
 
 | Source | Becomes |
@@ -248,33 +438,68 @@ a duplicated `id="main"` or a stylesheet nothing loads.
 | `<title>` | `metadata.title` (entity-decoded) |
 | `<meta name="description">`, `<meta name="robots" content="noindex">` | `metadata.description`, `metadata.noindex` |
 | `<link rel="stylesheet" href="assets/x.css">` | `config.stylesheets` |
+| `<link rel="stylesheet" href="https://fonts.googleapis.com/...">` | `metadata.font_stylesheet` -- the one font host the shell links |
 | `<link rel="icon" href="assets/x">` | `config.favicon.url` |
 | `<script type="importmap">` | `config.imports` -- the shell emits the one import map |
 | `<script type="module" src="assets/x.js">` | `config.modules` |
+| `<script type="application/ld+json">` in `<head>` | `metadata.schema`, with `@context` stripped and `@graph` splatted |
+| `<script src="...analytics.gxb.vc...">` | dropped -- the shell emits the site's own |
 | `<style>` (head or body) | the page document's `css` |
 | `<a href="#main">` | dropped -- the shell emits its own skip link |
 | `<main id="main" class="x">` ... `</main>` | `<div class="x">` ... `</div>` |
 | `src`/`href`/`data-asset`/`poster`/`data-src` = `assets/x`, `./assets/x`, `/assets/x` | `{{ asset:assets/x }}` |
 
 Everything else is left alone, including the page's own inline `<script>`.
-Every line above is reported on stderr, and warnings name the four things that
-only break later: an external stylesheet `config.stylesheets` cannot hold, an
-`srcset` that was not rewritten, a declared **SVG favicon** (a hard 415 on
-every page -- the platform routes `favicon.url` through a Cloudflare image
-transform, and those refuse SVG input), and a page that binds its own `submit`
-handler on a `/f/` form without `stopPropagation()` (the platform injects
-`/platform/forms-1.js`, which binds a document-level `submit` listener too, so
-one click posts twice).
+Every line above is reported on stderr. **The warnings are the things that
+shipped clean through twenty-four browser checks and empty build diagnostics:**
 
-`save SLUG --page KEY --html FILE [--config FILE] [--title T] [--metadata FILE]`
-runs the same conversion and builds the changes JSON from it: a `put config`
-first, then a `put page`. A `--config` document gets the stylesheets, modules
-and imports the conversion found, but only for keys it does not declare at all
--- an explicit `"stylesheets": []` is a declaration and wins. `--title` (or
-`--metadata`) overrides what the `<title>` said; a document with neither is
-refused locally, because the server requires `metadata.title`. `--changes` and
-`--html`/`--config` in the same command is a usage error: one of them would
-have to win.
+| Warning | Why it matters | Flag |
+|---|---|---|
+| the `<body>` carried attributes | a fragment has no `<body>`. Losing `class="bg-sand-50 text-ink antialiased"` changed font smoothing, the page background and the default text colour on twelve pages, and only a pixel diff caught it | `--wrap-body` re-wraps in a `<div>` carrying them. A background utility on a wrapper paints over a descendant at a negative `z-index`, which `<body>` did not -- for decorative layers, put the background on the body element through the page's `css` instead |
+| a `/f/<name>` form with no result element | the POST succeeds and the visitor sees nothing | `--add-form-result` |
+| a JSON-LD script in the body | page structured data belongs in `metadata.schema` | `--lift-json-ld` |
+| a third-party stylesheet `config.stylesheets` cannot hold | it is dropped, so the page ships without it | upload it |
+| third-party scripts, in the head or left in the body | the head's went with the head; the body's load from someone else's origin on every view | -- |
+| a declared **SVG favicon** | linked as it stands and not resizable, so the site ships no apple-touch-icon and no raster sizes (`favicon_svg_unresizable`) | rasterize and declare the `.png` |
+| an `srcset` that was not rewritten | bind each candidate by hand, or use one `src` | -- |
+| a page that binds its own `submit` handler on a `/f/` form without `stopPropagation()` | `/platform/forms-1.js` binds a document-level `submit` listener too, so one click posts twice | -- |
+
+## One save, many documents
+
+Every document flag below repeats, keeps its order, and ends up in **one**
+`changes` array, one snapshot and one build. Twelve pages used to be twelve
+commands and twelve builds.
+
+```bash
+sites-cli save onyx --config ./config.json \
+  --page /        --html ./build/index.html \
+  --page /about   --html ./build/about.html   --title "About Onyx" \
+  --page /contact --html ./build/contact.html --add-form-result \
+  --page /blog/first --markdown ./posts/first.md \
+  --collection blog ./collections/blog.json \
+  --redirect /old-about /about \
+  --delete page /retired \
+  --asset assets/app.js ./build/assets/app.js \
+  --message "onyx, one snapshot"
+```
+
+| Flag | Becomes |
+|---|---|
+| `--page KEY` | opens a page; the next `--html`/`--markdown`/`--title`/`--metadata` belong to it |
+| `--html FILE` | the conversion above, as a `put page` |
+| `--markdown FILE` | a `put page` with `format: "markdown"`; the title is `--title` or the file's first `# ` heading |
+| `--title T`, `--metadata FILE` | merged into that page's metadata; `--title` wins |
+| `--config FILE` | a `put config`, always first in the array |
+| `--collection KEY FILE` | a `put collection` |
+| `--redirect FROM TO` | a `put redirect` |
+| `--delete KIND KEY` | a `delete` |
+| `--asset KEY FILE-or-DIGEST` | a `put asset`. A file is hashed locally; `save` binds digests and uploads nothing, so `upload` or `push` the bytes first |
+
+`--changes FILE` still takes a raw array, and `--changes` together with the
+document flags is a usage error: one of them would have to win. `--dry-run`
+sends `dry_run: true`, which validates the whole array, resolves the digests
+and answers `{would_change_keys, diagnostics}` without creating a snapshot or a
+build; it leaves the remembered head alone.
 
 ## publish is two calls
 
@@ -301,23 +526,27 @@ list is 422 `review_mismatch`.
 
 ## wait-preview
 
-Polls `describe_site` until the branch's build settles, then stops. What each
-`preview_status` does:
+Polls `describe_site` until the branch's build settles, then stops, and prints
+the whole branch payload: `preview_status`, `preview_url`, `diagnostics`,
+`head_preview` (the title, description, theme_color, canonical, robots,
+favicon, json_ld_types and manifest_name the build stored), `integrations` and
+`canonical_url`. There is nothing left to run a second `describe` for.
 
 | Status | wait-preview | Exit |
 |---|---|---|
 | `queued`, `building` | keep polling until `--timeout` | 0 / 1 on timeout |
 | `ready` | print the payload | 0 |
-| `provisioning` | terminal: the build is good, but the hostname cannot be opened until the `*.gxbsites.com` wildcard certificate is installed on the host. The payload carries that as `message` | 0 |
+| `provisioning` | terminal: the build is good, and the host has not finished provisioning the hostname, so it may not open yet | 0 |
 | `invalid` | terminal: source diagnostics say what to fix; it cannot be published | 1 |
 | `failed` | terminal: infrastructure fault, being retried | 1 |
 | `revoked` | terminal: every preview of this snapshot was withdrawn; `save` again for a new one | 1 |
 | `unavailable` | terminal: the snapshot predates builds | 1 |
 | absent / anything else | error (`PREVIEW_MISSING` / `PREVIEW_UNKNOWN`) | 1 |
 
-`provisioning` is the state production is in today, so a successful
-`wait-preview` today usually means "built and good, not openable yet". Nothing
-polls that away.
+A preview hostname is `<token>--<slug>.gxbsites.com` -- **two** dashes. Grants
+minted before 2026-09-22 use one and still resolve. The `*.gxbsites.com`
+wildcard certificate is installed, so a finished build normally settles
+`ready` with an openable URL.
 
 A preview URL is read access to that exact snapshot for whoever holds it.
 Never paste one into a ticket, a Slack thread or an email; `revoke-preview`
@@ -325,12 +554,12 @@ withdraws one that got out.
 
 ## check
 
-`check URL [--width 1440] [--height 900] [--screenshot PATH] [--ignore SUBSTR]
-[--no-probe]` opens the URL in a fresh `agent-browser` session, waits for
-`networkidle`, and prints:
+`check URL [--against URL2] [--width 1440] [--height 900] [--screenshot PATH]
+[--viewport] [--ignore SUBSTR] [--no-probe]` opens the URL in a fresh
+`agent-browser` session, waits for `networkidle`, and prints:
 
 ```json
-{"status":200,"console_errors":[],"failed_requests":[{"url":"...","status":404}],"title":"Onyx","url":"...","screenshot":"/abs/path.png"}
+{"status":200,"console_errors":[],"failed_requests":[{"url":"...","status":404}],"title":"Onyx","url":"..."}
 ```
 
 Exit 1 on any console error or failed request. `console_errors` merges
@@ -338,8 +567,8 @@ Exit 1 on any console error or failed request. `console_errors` merges
 (uncaught page errors) -- that pair is its nearest equivalent to a single
 console-error stream. `failed_requests` is every request with no status or a
 status >= 400, so a site with no favicon shows `/favicon.ico` 404; drop it with
-`--ignore favicon`. The session is always closed, including on failure: every
-orphan is a full Chrome that lives until reboot.
+`--ignore favicon`. The session is always closed, **by name, never
+`close --all`**: seven of these run at once and `--all` is a cross-agent kill.
 
 **A blocked subresource and a missing one look identical in a browser**: an
 entry with no status, and nothing in the console. So for every cross-origin
@@ -356,120 +585,84 @@ adds what it found:
 
 The browser's own failure text (`net::ERR_FAILED`, `ERR_BLOCKED_BY_RESPONSE`)
 rides along as `error`, and the diagnosis is repeated in prose on stderr.
-`--no-probe` turns the whole thing off.
+`--no-probe` turns the whole thing off. A preview hostname that resolves but
+cannot finish a TLS handshake is `PREVIEW_TLS` rather than a bare browser
+error: that is the host's certificate, and the build itself is fine.
 
-A preview hostname that resolves but cannot finish a TLS handshake is
-`PREVIEW_TLS` rather than a bare browser error: that is the missing
-`*.gxbsites.com` wildcard certificate, and the build itself is fine.
+### --against: is the rebuild the same page?
 
-## Commands
+`check URL --against URL2` opens both in the one session and compares:
 
-```bash
-# runner (staff)
-sites-cli list [--prod]
-sites-cli show SLUG [--prod]
-sites-cli open SLUG [--prod]
-sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]
+- **the head**: `title`, `description`, `canonical`, `robots`, `theme-color`,
+  `og:image`, `twitter:card`, `favicon`, and the JSON-LD `@type` list;
+- **the counts**: images, scripts, stylesheets;
+- **the visible text**, normalised -- tags stripped, block boundaries kept as
+  line breaks, curly quotes and dashes folded to ASCII, whitespace collapsed.
 
-# v2
-sites-cli describe SLUG [--branch B]
-sites-cli read SLUG KIND [KEY] [--branch B] [--fields metadata,body] [--lines 1,40] [--at SNAPSHOT]
-sites-cli read SLUG asset --keys assets/a.js,assets/b.css [--branch B]
-sites-cli save SLUG --changes FILE|- [--branch B] [--expected TOKEN] [--message M] [--idempotency-key K]
-sites-cli save SLUG --page KEY --html FILE [--config FILE] [--title T] [--metadata FILE] [--prefix assets/]
-sites-cli fragment FILE|- [--prefix assets/]
-sites-cli create-branch SLUG NAME [--from live|BRANCH]
-sites-cli archive-branch SLUG NAME
-sites-cli diff SLUG [--branch B] [--against live|BRANCH]
-sites-cli publish SLUG --review TOKEN|last [--idempotency-key K]
-sites-cli publish SLUG --expected TOKEN --keys page:/about,asset:assets/x.js
-sites-cli merge-live SLUG [--branch B] --expected TOKEN --expected-live ID
-sites-cli resolve-merge SLUG --proposal TOKEN --resolutions FILE
-sites-cli history SLUG [--branch B] [--limit N]
-sites-cli revoke-preview SLUG URL_OR_TOKEN
-sites-cli wait-preview SLUG [--branch B] [--timeout 120]
-sites-cli list-submissions SLUG [--form F] [--since ISO] [--limit N]
-sites-cli analytics SLUG [--period today|yesterday|7d|30d|all]
-sites-cli upload SLUG FILE [FILE...]
-sites-cli push SLUG DIR [--branch B] [--prefix assets/] [--dry-run] [--offline]
-sites-cli check URL [--width 1440] [--screenshot PATH] [--ignore SUBSTR] [--no-probe]
+It prints `differences` (one line per head or count field that moved) and
+`text_diff` (a unified diff) in the payload and in prose on stderr, and exits 1
+on any difference `--ignore` does not cover. `--ignore canonical` is the usual
+one while a rebuild is still on a staging hostname.
 
-# platform tools (a personal token: SITES_CLI_TOKEN or tokens.json "_platform")
-sites-cli list-sites                  # every site you can read
-sites-cli list-sites SLUG             # through that site's door, not the platform one
-sites-cli create-site SLUG --name N   # GXB staff only
-sites-cli platform-tools              # the two schemas, from the server
+### screenshots
 
-# legacy file API
-sites-cli list_files SLUG [--prefix _posts/]        # alias: list SLUG
-sites-cli read_file SLUG about.md [--view live]
-sites-cli write_file SLUG about.md --content "$(cat about.md)" [--expected-version V]
-sites-cli write_file SLUG assets/hero.jpg --file ./hero.jpg
-sites-cli edit_file SLUG about.md --edits-file edits.json [--expected-version V]
-sites-cli publish SLUG about.md [--expected-version V]
-```
+`--screenshot PATH` captures the **full page** by default; `--viewport` is the
+old behaviour. After the capture, `check` reads the PNG header and refuses to
+call a blank image a success: a full-page capture under 6 KB, or any capture
+whose bytes-per-pixel says it is one flat colour, sets `screenshot_blank` with
+the reason and exits 1. That is a heuristic, not a decoder, and it catches the
+real case -- a page that paints from an inline script fires `networkidle`
+before first paint, and a 4.9 KB all-background PNG used to be reported as a
+clean check.
 
-`sites-cli list SLUG` lists that site's files. `sites-cli list` with no slug
-lists every tenant site through the runner. `sites-cli list-sites` asks the
-platform tool instead, and answers for whoever the personal token belongs to.
+## Worked example: a three-page site
 
-`create-site` posts `create_site` to `POST /api/v1/platform/tools` with a
-personal bearer and returns the new site's `draft` branch and its first
-`expected` token, which this CLI remembers -- so the very next call really is a
-`save`, `push` or `upload` on the same credential, with no token step in
-between. Minting the site's own token is optional now, and is for handing that
-one site to someone else (`Admin::ApiTokensController` on its admin page, then
-`tokens.json` under the slug). `create-site` still sets no form recipient. The
-runner command `sites-cli create SLUG --name NAME` also works and needs no
-token at all.
-
-## Worked example: an Onyx-shaped site
-
-Seven commands and one credential, from nothing to live. Given a directory
-holding `index.html`, `assets/`, and a `config.json` with the site's `name`,
-`runtime` and `business`, and a personal token in `SITES_CLI_TOKEN`:
+One personal token in `SITES_CLI_TOKEN`, a directory holding `index.html`,
+`about.html`, `contact.html`, `assets/`, and a `config.json`:
 
 ```bash
-# 0. the site itself. Nothing else is needed: no admin page, no site token.
+# 0. the site. Nothing else is needed: no admin page, no site token.
 sites-cli create-site onyx --name "Onyx"      # remembers the new draft head
 
-# 1. the public tree: contract checked, unchanged files skipped, the rest
-#    uploaded and bound in one save
+# 1. the public tree: contract checked, unchanged files skipped, bytes the
+#    platform already holds not sent at all
 sites-cli push onyx ./public --dry-run        # one describe_site: right contract? right branch?
 sites-cli push onyx ./public                  # batch read + uploads + one save
 
-# 2. the homepage and the config, converted and saved in one command. The
-#    document shell is dropped, <title>/<meta> become metadata, the head's
-#    stylesheet/module/import map join config.json, and every assets/
-#    reference becomes {{ asset: }}. What it did goes to stderr.
-sites-cli save onyx --page / --html ./public/index.html --config ./config.json \
-  --message "onyx homepage"
+# 2. the config, checked against the server's own schema before any write
+sites-cli validate-config ./config.json --site onyx
 
-# 3. wait for the build, then look at the preview in a real browser
-sites-cli wait-preview onyx                   # 1 on invalid/failed/revoked;
-                                              # 0 on provisioning, which cannot be opened yet
-sites-cli check https://<token>-onyx.gxbsites.com --screenshot /tmp/onyx.png
+# 3. all three pages and the config in ONE save: one snapshot, one build
+sites-cli save onyx --config ./config.json \
+  --page /        --html ./public/index.html \
+  --page /about   --html ./public/about.html \
+  --page /contact --html ./public/contact.html --add-form-result \
+  --message "onyx, three pages"
 
-# 4. publish. describe_site only offers a review once a ready build exists for
-#    that head, so this is the token that publishes the whole branch delta.
+# 4. wait for the build (head_preview and integrations come back with it),
+#    then look at it in a real browser
+sites-cli wait-preview onyx
+sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
+
+# 5. publish the whole branch delta
 sites-cli describe onyx                       # remembers branches[].review
 sites-cli publish onyx --review last
+
+# 6. the public URL
+sites-cli connect-domain onyx onyxmodular.com # prints the TXT record to publish
+sites-cli verify-domain onyx onyxmodular.com  # once DNS has propagated
+sites-cli publish onyx --review last          # the artifact is built for a host
 ```
 
 To see the conversion before committing to it, `sites-cli fragment
-./public/index.html` prints exactly what `save --html` would send and makes no
-request. To ship one page and its assets first, publish is two calls, not one:
+./public/index.html --page /` prints exactly what `save` would send and makes
+no request. To ship one page and its assets first, publish is two calls:
 
 ```bash
 sites-cli publish onyx --keys page:/about     # 200 published:false + its own review
 sites-cli wait-preview onyx                   # the candidate has its own build
 sites-cli publish onyx --review last          # this is what flips live
 ```
-
-Every command above ran on the one personal token, which is why step 0 sits in
-the same block as the rest. To hand this site to someone who should have only
-it, mint its own token on its admin page and add it to `tokens.json` under the
-slug; this CLI then prefers that token for this slug and sends no `site` field.
 
 A missing static dependency (`BufferGeometryUtils.js`) makes the `save`
 succeed and `wait-preview` exit 1 with `preview_status: "invalid"` and a
@@ -480,6 +673,57 @@ Selecting a page whose layout is still unpublished is 422
 `unpublished_dependency` naming the exact keys to add, and a review minted
 before somebody else published is 409 `upstream_changed` pointing at
 `merge-live`. Neither is retried; both name the next call.
+
+## Rebuilding an existing site
+
+Seven agents rebuilt seven live sites in one afternoon and converged on this.
+`SOURCE` is the site as it stands, `SLUG` is the new versioned site.
+
+```bash
+# 1. Fetch the source: every page, its assets, robots.txt, llms.txt, sitemap.
+#    Keep the tree as it is served, so the asset keys match the references.
+
+# 2. The site, and the asset tree.
+sites-cli create-site SLUG --name "Name"
+sites-cli push SLUG ./build/assets --dry-run
+sites-cli push SLUG ./build/assets
+
+# 3. Convert every page into one changes file, then save once.
+rm -f /tmp/changes.json
+for page in index about services contact; do
+  route=$([ "$page" = index ] && echo / || echo "/$page")
+  sites-cli fragment "./build/$page.html" --page "$route" \
+    --wrap-body --add-form-result --lift-json-ld \
+    --append-changes /tmp/changes.json
+done
+sites-cli validate-config ./build/config.json --site SLUG
+sites-cli save SLUG --changes /tmp/changes.json --message "rebuild: pages"
+sites-cli save SLUG --config ./build/config.json --message "rebuild: config"
+
+# 4. Build, then compare every page against the source it replaces.
+sites-cli wait-preview SLUG
+for route in / /about /services /contact; do
+  sites-cli check "https://<token>--SLUG.gxbsites.com$route" \
+    --against "https://SOURCE$route" \
+    --ignore canonical --ignore og:url \
+    --screenshot "/tmp/shots/$(echo "$route" | tr / _).png"
+done
+
+# 5. Publish, then move the hostname.
+sites-cli publish SLUG --review last
+sites-cli connect-domain SLUG SOURCE
+sites-cli verify-domain SLUG SOURCE
+sites-cli publish SLUG --review last
+```
+
+Read every `fragment` warning before step 3 finishes. Each one in that table is
+something that shipped clean through a full browser check on a real client's
+site and had to be found by pixel diff or by reading platform source.
+
+Two things `--against` will report while the site is still on a staging
+hostname, and both are expected until step 5: `canonical` and `og:url`. Ignore
+those two by name rather than turning the comparison off, so everything else
+still fails the check.
 
 ## Environment
 
@@ -500,20 +744,21 @@ ruby test_sites_cli.rb
 ```
 
 A stub WEBrick server plays the Sites API in-process and drives the real CLI
-binary against it (111 checks): token/site binding, the nonzero 409 exit with
-no automatic retry or reread and no cache poisoning from the conflict body or
-from a `read --at`, expected-token persistence, review caching and forgetting,
-every v2 subcommand's request shape against `Mcp::ToolRegistry`, each terminal
-`preview_status`, byte-for-byte streamed binary uploads (single PUT and
-multipart), upload content types and bounded parallelism, push change-list
-generation, dedup, the batch-read skip and its fallback, the platform door
-(personal bearer, a site token's 403 printed verbatim, the remembered new-site
-head), the personal token at the site doors (the `site` field on every tools,
-upload and status request, none on a site token's, create-site straight into a
-save, and `NO_TOKEN` naming both ways out),
+binary against it (163 checks): token/site binding, the nonzero 409 exit with
+no automatic retry or reread and no cache poisoning from the conflict body,
+from a `read --at` or from a `save --dry-run`, expected-token persistence,
+review caching and forgetting, every v2 subcommand's request shape against
+`Mcp::ToolRegistry`, each terminal `preview_status`, byte-for-byte streamed
+binary uploads (single PUT and multipart), the dedup fast path and the
+structured error an unexpected authorize shape becomes, upload content types
+and bounded parallelism, push change-list generation, dedup, the batch-read
+skip and its fallback, the empty tree, the platform door, the personal token at
+the site doors, the domain tools and the record `connect-domain` prints,
+`delete_submission`, `schema` and the local `validate-config` pass,
 `list_submissions` and its `read_submissions` 403, `get_analytics`, the
-`fragment` conversion and every warning it raises, `save --page --html
---config` and its config merge, the dry-run contract check, the `check`
-wrapper against a stub browser including the CORS probe and the preview-TLS
-hint, that stdout is one JSON object per command, and that no bearer token
-reaches stdout or state.json.
+`fragment` conversion and every warning it raises, multi-document `save` and
+its config merge, `save --dry-run`, the dry-run contract check, the `check`
+wrapper against a stub browser including the CORS probe, the preview-TLS hint
+on both host shapes, `--against` and the blank-screenshot refusal, that
+`manual` and the dispatch agree, that stdout is one JSON object per command,
+and that no bearer token reaches stdout or state.json.
