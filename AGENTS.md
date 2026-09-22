@@ -390,30 +390,57 @@ two that are not documents anybody authors:
   one route (`key`, default `/`) on a branch head or on the candidate a review
   binds, with `subject` naming which. Those are the same bytes the preview
   hostname serves, so it is how you read what shipped without a browser. A
-  build that is not ready is 409 `build_not_ready`.
+  build that is not ready is 409 `build_not_ready`. `keys` reads many routes
+  at once -- `sites-cli heads SLUG ROUTE...` is the shell for it -- answering
+  per route the same head summary `head_preview` computes for `/`: title,
+  description, canonical, robots, lang, which `og` fields are present,
+  `json_ld_types`, hreflang alternates, integrations, byte size and the
+  artifact digest. A route with no build answers `{key, missing: true}`
+  instead of failing the whole batch. This replaced opening a browser once per
+  route to diff a head (`pc_8ecfd09c`).
 - **`schema`** returns the JSON Schemas above.
+- **`guide`** returns prose, not a document: `key` names a topic (`forms`,
+  `conventions`, ...) and a missing `key` lists the topics there are.
+  `sites-cli guide SLUG [TOPIC]` is the shell for it, generated from one Ruby
+  constant on the server so this file and the server's own text cannot drift
+  the way the old hand-copied forms contract did.
 
 ### forms
 
 A page posts to `/f/<name>`, and `<name>` has to be declared in
 `config.forms` -- an undeclared name is a 404 `unknown_form` on a versioned
 site, and the build refuses to publish a page that posts to one
-(`undeclared_form`).
+(`undeclared_form`). The full contract -- markup, both response modes, the
+honeypot field, rate limits and worked examples -- lives on the server now:
+`sites-cli guide SLUG forms` prints it, generated from one Ruby constant
+rather than kept in sync by hand here.
 
-**The result element is not optional.** The platform injects
-`/platform/forms-1.js`, which writes the server's answer into the page's
-`[data-form-result]` element, or into `#form-<name>-result`, and does nothing
-at all without one: the POST goes out, the server answers
-`200 {"ok":true,"message":"..."}`, and the visitor sees no message and a submit
-button left permanently disabled. `sites-cli fragment` warns when a page posts
-to `/f/<name>` and has neither, and `--add-form-result` inserts
-`<p data-form-result hidden></p>` after the form.
+**No script is required.** The platform used to inject `/platform/forms-1.js`
+to write the answer into a `[data-form-result]` element, which was silently
+inert because the script never removed the `hidden` attribute it told agents
+to author (`pc_8781d8fc`) -- a submission that worked server-side left the
+visitor looking at a button that stayed disabled. That script is gone. A
+plain `<form action="/f/<name>" method="post">` with no JavaScript at all
+renders a full success or error page from the server on submit; a site that
+wants an inline result writes its own `fetch` against the JSON contract
+instead. `sites-cli fragment` no longer inserts or warns about a result
+element -- `--add-form-result` is gone with it.
 
-To smoke-test a form without putting a fake person in the client's inbox, fill
-the hidden `website` honeypot field: the endpoint answers with the form's
-ordinary success response and stores nothing and mails nobody. A submission you
-made on purpose with the honeypot empty is a real row, and
-`sites-cli delete-submission SLUG ID` is how it comes back out.
+`config.forms.<name>.redirect_to` names a route in this site; when set, a
+successful plain-HTML POST is a 303 there instead of the platform's own
+success page (the JSON contract for a `fetch` caller is unchanged either way).
+The build warns `redirect_missing_page` when the snapshot has no such route.
+
+A submission whose scalar fields are all blank is rejected (422, not stored,
+not mailed) with an error naming what to fill in -- it used to go through
+silently. On a preview host, a POST runs the same validation and answers the
+same shapes with `preview: true`, storing and mailing nothing, so a form can
+be exercised on a preview without putting a real row in anyone's inbox. To do
+the same thing deliberately on a **live** host, fill the hidden `website`
+honeypot field: the endpoint answers with the form's ordinary success response
+and stores nothing and mails nobody. A submission you made on purpose with the
+honeypot empty is a real row, and `sites-cli delete-submission SLUG ID` is how
+it comes back out.
 
 ## Domains: the site's public URL
 
