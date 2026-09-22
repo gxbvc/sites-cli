@@ -33,8 +33,14 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.1.0'
+VERSION = '2.2.0'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
+
+# A worker thread that dies prints its own backtrace to stderr and takes the
+# command's output with it. Every thread body below turns its own failure into
+# a structured result instead, so a surprising server answer is JSON with the
+# body attached and never a Ruby stack trace (pc_60d7aa4c, pc_e3810da4).
+Thread.report_on_exception = false
 
 # -----------------------------------------------------------------------------
 # Output helpers
@@ -640,14 +646,52 @@ UPLOAD_CONTENT_TYPES = MEDIA_CONTENT_TYPES.merge(
 # text/plain is already an accepted asset kind.
 TEXT_FILENAMES = %w[LICENSE LICENCE NOTICE COPYING COPYRIGHT AUTHORS PATENTS].freeze
 
+# The server takes any content type now (uploads brief item 2), so the table
+# above is a hint for the types the platform has opinions about, not a gate.
+# Anything it does not name is typed by extension through Marcel (or
+# mime-types, whichever is installed) and finally as octet-stream. The one
+# refusal left is on the server: a type a browser would execute as a page on
+# cdn.gxbsites.com, which is a 422 whose message is printed verbatim.
+REFUSED_UPLOAD_TYPES = %w[text/html application/xhtml+xml].freeze
+FALLBACK_CONTENT_TYPE = 'application/octet-stream'
+# Single PUT up to here; the server asks for the multipart transport above it
+# and the CLI follows `multipart` in the authorize response either way.
+MULTIPART_THRESHOLD_BYTES = 25 * 1024 * 1024
+
+# Loaded once, and only if it is there: neither gem ships with Ruby, and an
+# upload must not depend on whether a Rails app happens to be installed next
+# to this script.
+def mime_lookup(name)
+  @mime_lookup ||= begin
+    require 'marcel'
+    ->(filename) { Marcel::MimeType.for(name: filename).to_s }
+  rescue LoadError
+    begin
+      require 'mime/types'
+      ->(filename) { MIME::Types.type_for(filename).first&.content_type.to_s }
+    rescue LoadError
+      ->(_filename) { '' }
+    end
+  end
+  found = @mime_lookup.call(name)
+  found.empty? || found == FALLBACK_CONTENT_TYPE ? nil : found
+end
+
 def content_type_for(path)
   name = File.basename(path)
   extension = File.extname(name).downcase
-  return UPLOAD_CONTENT_TYPES[extension] unless extension.empty?
-  TEXT_FILENAMES.include?(name.upcase) ? 'text/plain' : nil
+  return UPLOAD_CONTENT_TYPES[extension] if UPLOAD_CONTENT_TYPES.key?(extension)
+  return 'text/plain' if extension.empty? && TEXT_FILENAMES.include?(name.upcase)
+  mime_lookup(name) || FALLBACK_CONTENT_TYPE
 end
 
-def accepted_types_note = "#{UPLOAD_CONTENT_TYPES.keys.join(' ')}, or an extensionless #{TEXT_FILENAMES.join('/')}"
+def accepted_types_note
+  "any file. #{UPLOAD_CONTENT_TYPES.keys.join(' ')} and an extensionless " \
+    "#{TEXT_FILENAMES.join('/')} are typed from this table; anything else is typed by extension and " \
+    "falls back to #{FALLBACK_CONTENT_TYPE}. The platform refuses only what a browser would run as a " \
+    "page on the asset CDN (#{REFUSED_UPLOAD_TYPES.join(', ')}, or anything that sniffs as HTML) -- " \
+    'a page belongs in a page document. Single PUT to 25 MB, multipart above it'
+end
 
 PART_CONCURRENCY = 4
 PART_MAX_ATTEMPTS = 3
@@ -704,6 +748,13 @@ def media_upload(slug, file_path, content_type, target, credential:)
   return [nil, err] if err
   upload_id = data['id']
 
+  # The platform is content addressed, so when it already holds these bytes
+  # authorize answers `ready` with the blob URL and no upload_url at all. That
+  # is the fast path the digest hint exists for and the one plan 30 is built
+  # around -- it used to hand nil to URI() and print a thread backtrace
+  # (pc_60d7aa4c, pc_e3810da4, pc_c3606ecf). Nothing to PUT, complete or poll.
+  return [data.merge('deduplicated' => true), nil] if data['status'] == 'ready'
+
   if data['multipart']
     parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'], credential: credential)
     if part_err
@@ -711,6 +762,12 @@ def media_upload(slug, file_path, content_type, target, credential:)
       return [nil, part_err]
     end
     complete_body = { parts: parts }
+  elsif data['upload_url'].to_s.empty?
+    # Not "ready", not multipart, and nowhere to send bytes. Say what came back
+    # rather than dying inside URI().
+    return [nil, api_error("authorize for #{File.basename(file_path)} answered status " \
+                           "#{data['status'].inspect} with no upload_url and no multipart plan, so there is " \
+                           'nowhere to send the bytes', code: 'UPLOAD_UNEXPECTED', body: data)]
   else
     put_err = put_upload(data['upload_url'], file_path, content_type, byte_size)
     return [nil, put_err] if put_err
@@ -772,7 +829,11 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, crede
         break unless part_number
         mutex.synchronize { break if first_error }
 
-        etag, err = upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential: credential)
+        etag, err = begin
+          upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential: credential)
+        rescue StandardError => e
+          [nil, api_error("part #{part_number} raised #{e.class}: #{e.message}", code: 'PART_UPLOAD_FAILED')]
+        end
         mutex.synchronize do
           if err
             first_error ||= err
@@ -854,7 +915,14 @@ def upload_files(slug, files, credential:)
       loop do
         index = begin queue.pop(true) rescue nil end
         break unless index
-        results[index] = upload_one_file(slug, files[index], credential: credential)
+        results[index] = begin
+          upload_one_file(slug, files[index], credential: credential)
+        rescue StandardError => e
+          # A raise here used to escape the thread and print a backtrace with
+          # nothing on stdout. One file's surprise is one file's failed line.
+          { path: files[index], status: 'failed', code: 'UPLOAD_UNEXPECTED',
+            error: "#{e.class}: #{e.message}" }
+        end
       end
     end
   end
@@ -864,11 +932,6 @@ end
 
 def upload_one_file(slug, file_path, credential:)
   content_type = content_type_for(file_path)
-  unless content_type
-    return { path: file_path, status: 'failed', code: 'BAD_TYPE',
-             error: "cannot type #{File.basename(file_path)} -- accepts #{accepted_types_note}" }
-  end
-
   digest = sha256_file(file_path)
   # `label` is omitted on a versioned site: bytes are bound to a logical path
   # later by `save`, not now. `digest` is the type-conflict hint slice B added.
@@ -881,7 +944,7 @@ def upload_one_file(slug, file_path, credential:)
 
   { path: file_path, digest: data['digest'] || digest, url: data['url'],
     media_type: data['media_type'] || data['content_type'], byte_size: data['byte_size'] || data['bytes'],
-    status: data['status'] }
+    status: data['status'], deduplicated: data['deduplicated'] }.compact
 end
 
 # Dir.glob rather than `find` (which walks huge trees and hangs): '**/*' skips
@@ -970,12 +1033,29 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:, offline: false)
   return failure("no such directory: #{dir}", code: 'NO_DIR') unless File.directory?(dir)
 
   entries = push_entries(dir, prefix)
-  return failure("no files under #{dir} (dotfiles are skipped)", code: 'EMPTY_TREE') if entries.empty?
+  # A site whose pages reference nothing is an ordinary site, not a usage
+  # error, and `push && save` should not have to special-case it (pc_6b2ffb91).
+  # The contract check is the half of a dry run worth having, so an empty tree
+  # still gets it.
+  if entries.empty?
+    $stderr.puts("push: no files under #{dir} (dotfiles and dot directories are skipped) -- nothing to upload")
+    payload = { 'site' => slug, 'branch' => branch, 'prefix' => prefix, 'files' => 0,
+                'unchanged' => 0, 'saved' => false, 'changes' => [],
+                'contract' => offline ? 'unchecked' : 'versioned' }
+    payload['dry_run'] = true if dry_run
+    return success(payload) if offline
+    entry, err = push_preflight(slug, branch)
+    return fail_with(err) if err
+    payload['expected'] = expected || entry['expected']
+    payload['preview_status'] = entry['preview_status']
+    return success(payload)
+  end
 
-  unsupported = entries.reject { |e| e['media_type'] }
-  if unsupported.any?
-    return failure("cannot type #{unsupported.size} file(s) in #{dir} -- accepts #{accepted_types_note}",
-                   code: 'BAD_TYPE', body: { 'files' => unsupported.map { |e| e['file'] } })
+  html = entries.select { |e| REFUSED_UPLOAD_TYPES.include?(e['media_type']) }
+  if html.any?
+    $stderr.puts("push: #{html.size} file(s) under #{dir} are #{html.first['media_type']}, which the platform " \
+                 'refuses as a blob -- a page belongs in a page document (`save --page KEY --html FILE`). ' \
+                 "The upload will answer 422 and print what it said: #{html.map { |e| e['key'] }.join(', ')}")
   end
 
   if dry_run
@@ -1034,6 +1114,15 @@ def cmd_push(slug, dir, branch:, prefix:, expected:, dry_run:, offline: false)
   if mismatched.any?
     return failure("the server returned a digest that does not match the local bytes", code: 'DIGEST_MISMATCH',
                    body: { 'files' => mismatched.map { |r| r[:path] } })
+  end
+
+  # The fast path plan 30 is built around: bytes the platform already holds
+  # anywhere, uploaded by nobody. Worth one line, because it is the difference
+  # between a 28-file push that sends 28 files and one that sends 4.
+  deduplicated = results.count { |r| r[:deduplicated] }
+  if deduplicated.positive?
+    $stderr.puts("push: #{deduplicated} of #{results.size} upload(s) were already on the platform " \
+                 'under the same sha256, so no bytes were sent for them')
   end
 
   # The platform types bytes from content, not from the filename, so a file
@@ -2204,4 +2293,15 @@ def run(argv)
   end
 end
 
-exit run(ARGV.dup)
+# Nothing this binary does is worth a raw Ruby backtrace on somebody's
+# terminal: an agent reading stdout gets the same envelope it gets for every
+# other failure, and the shape that surprised us rides in the message.
+begin
+  exit run(ARGV.dup)
+rescue Interrupt
+  exit 130
+rescue Errno::EPIPE
+  exit 0
+rescue StandardError => e
+  exit failure("sites-cli could not finish: #{e.class}: #{e.message}", code: 'INTERNAL')
+end

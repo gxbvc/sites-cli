@@ -70,6 +70,17 @@ put_mutex = Mutex.new
 concurrent_puts = 0
 max_concurrent_puts = 0
 fail_upload_named = nil                        # a test arms this to break one file
+# The platform is content addressed: once it holds a digest, a later authorize
+# for the same bytes answers `ready` with the blob URL and NO upload_url. That
+# fast path used to crash the CLI (pc_60d7aa4c, pc_e3810da4, pc_c3606ecf).
+known_digests = {}                             # digest => {media_type, byte_size}
+authorize_bodies = []                          # every label-less authorize payload, in order
+weird_authorize = nil                          # a test arms this to answer a shape nothing expects
+multipart_named = nil                          # a test arms this to force the multipart transport
+multipart_upa = nil                            # the upload id that took it
+BIG_PART_SIZE = 12
+BIG_PARTS_COUNT = 3
+big_parts = {}                                 # part_number => bytes received
 
 # -- multipart video (plans/24-agent-sites.md 5b) stub state ----------------
 MP4_PART_SIZE = 10
@@ -366,8 +377,36 @@ server.mount_proc('/') do |req, res|
       upload_seq += 1
       id = "upa#{upload_seq}"
       authorized[id] = payload
-      res.status = 201
-      res.body = JSON.generate(id: id, status: 'pending', upload_url: "http://127.0.0.1:#{port}/put/#{id}")
+      authorize_bodies << payload
+      held = known_digests[payload['digest']]
+      if weird_authorize
+        res.status = 200
+        res.body = JSON.generate(id: id, status: 'contemplating')
+      elsif payload['content_type'].to_s.start_with?('text/html')
+        # The one refusal left: a page hosted as a blob would be phishing on
+        # cdn.gxbsites.com (uploads brief item 2).
+        res.status = 422
+        res.body = JSON.generate(error: 'unsupported_content_type',
+          message: 'text/html is refused: a page belongs in a page document, not a blob on the asset CDN')
+      elsif held
+        # No upload_url at all: the bytes are already here.
+        res.status = 200
+        res.body = JSON.generate(id: id, status: 'ready', digest: payload['digest'],
+          media_type: held[:media_type], byte_size: held[:byte_size],
+          url: "http://cdn.test/blobs/#{payload['digest']}/asset.bin")
+      elsif payload['filename'] == multipart_named
+        # Over 25 MB the server asks for the multipart transport whatever the
+        # type is (uploads brief item 2). The CLI follows `multipart`, so the
+        # threshold is the server's to pick; this proves the CLI follows it for
+        # a kind that used to be single-PUT only.
+        multipart_upa = id
+        res.status = 201
+        res.body = JSON.generate(id: id, status: 'pending', multipart: true,
+          parts_count: BIG_PARTS_COUNT, part_size: BIG_PART_SIZE)
+      else
+        res.status = 201
+        res.body = JSON.generate(id: id, status: 'pending', upload_url: "http://127.0.0.1:#{port}/put/#{id}")
+      end
     else
       current = versions[payload['label']]
       if payload['expected_version'] != current
@@ -435,6 +474,20 @@ server.mount_proc('/') do |req, res|
 
   # -- plan 30 label-less uploads -------------------------------------------
 
+  in [ 'POST', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)/parts\z}
+    payload = JSON.parse(req.body)
+    requests["#{token} media_parts"] += 1
+    res.status = 200
+    res.body = JSON.generate(parts: payload['part_numbers'].map { |n|
+      { part_number: n, upload_url: "http://127.0.0.1:#{port}/putbig/#{n}" } })
+
+  in [ 'PUT', String => path ] if path.start_with?('/putbig/')
+    part_number = path.split('/').last.to_i
+    big_parts[part_number] = req.body
+    res['ETag'] = %("big-#{part_number}-etag")
+    res.status = 200
+    res.body = ''
+
   in [ 'POST', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)/complete\z}
     id = Regexp.last_match(1)
     requests["#{token} media_complete"] += 1
@@ -444,6 +497,7 @@ server.mount_proc('/') do |req, res|
     # The platform types bytes from content, not from the filename: a file
     # called .png holding JPEG bytes is stored and served as image/jpeg.
     media_type = uploaded["/put/#{id}"].to_s.start_with?("\xFF\xD8\xFF".b) ? 'image/jpeg' : payload['content_type']
+    known_digests[digest] = { media_type: media_type, byte_size: payload['byte_size'] }
     res.status = 200
     res.body = JSON.generate(id: id, status: 'ready', digest: digest,
       media_type: media_type, byte_size: payload['byte_size'],
@@ -1265,16 +1319,51 @@ ensure
   fail_upload_named = nil
 end
 
-check('upload refuses an unsupported extension without touching the network') do
+check('upload types anything the table does not name and sends it anyway') do
   Dir.mktmpdir do |dir|
-    path = File.join(dir, 'notes.md')
-    File.write(path, '# hi')
-    before = requests.values.sum
-    out, _err, code = run_cli('upload', 'onyx', path)
-    assert(code == 1, 'expected a nonzero exit')
-    assert(JSON.parse(out)['code'] == 'BAD_TYPE', "expected BAD_TYPE, got #{out}")
-    assert(requests.values.sum == before, 'an unsupported file reached the server')
+    notes = File.join(dir, 'notes.md')
+    binary = File.join(dir, 'firmware.bin')
+    File.write(notes, "# hi #{SecureRandom.hex(4)}")
+    File.write(binary, SecureRandom.hex(8))
+    authorize_bodies.clear
+
+    out, _err, code = run_cli('upload', 'onyx', notes, binary)
+    assert(code == 0, "expected exit 0 now that any type is accepted, got #{code}: #{out}")
+    types = authorize_bodies.to_h { |p| [ p['filename'], p['content_type'] ] }
+    assert(types['notes.md'] == 'text/markdown', "expected a mime lookup for .md, got #{types.inspect}")
+    assert(types['firmware.bin'] == 'application/octet-stream', "expected the octet-stream fallback, got #{types.inspect}")
   end
+end
+
+check('an HTML file is sent and the server refusal is printed verbatim, not guessed at locally') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'index.html')
+    File.write(path, '<!doctype html><title>no</title>')
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code == 1, "expected exit 1, got #{code}: #{out}")
+    line = JSON.parse(out.lines.first)
+    assert(line['status'] == 'failed', "got #{line.inspect}")
+    assert(line.dig('body', 'error') == 'unsupported_content_type', "expected the server's own body, got #{line.inspect}")
+    assert(line['error'].include?('page document'), "expected the server's own message, got #{line.inspect}")
+  end
+end
+
+check('a file the server asks to send in parts takes the multipart transport whatever its type is') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'firmware.iso')
+    original = SecureRandom.random_bytes(BIG_PART_SIZE * BIG_PARTS_COUNT)
+    File.binwrite(path, original)
+    multipart_named = 'firmware.iso'
+    big_parts.clear
+
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    reassembled = (1..BIG_PARTS_COUNT).map { |n| big_parts.fetch(n) }.join
+    assert(reassembled == original, 'reassembled part bytes did not match the source file')
+    assert(JSON.parse(out)['status'] == 'ready', "got #{out}")
+  end
+ensure
+  multipart_named = nil
 end
 
 # -- push ---------------------------------------------------------------------
@@ -1392,14 +1481,107 @@ check('push accepts an extensionless LICENSE as text/plain, so a vendored notice
   end
 end
 
-check('push still refuses a file it cannot type, and names what it takes') do
+check('push types a file the table does not name rather than refusing the whole tree') do
   Dir.mktmpdir do |dir|
     File.write(File.join(dir, 'notes.md'), '# hi')
+    File.write(File.join(dir, 'firmware.bin'), 'binary')
     out, _err, code = run_cli('push', 'onyx', dir, '--offline')
-    assert(code == 1, 'expected a nonzero exit')
-    parsed = JSON.parse(out)
-    assert(parsed['code'] == 'BAD_TYPE', "expected BAD_TYPE, got #{out}")
-    assert(parsed['error'].include?('LICENSE'), 'expected the extensionless names to be listed')
+    assert(code == 0, "expected exit 0 now that any type is accepted, got #{code}: #{out}")
+    types = JSON.parse(out)['data']['file_details'].to_h { |d| [ File.basename(d['key']), d['media_type'] ] }
+    assert(types['notes.md'] == 'text/markdown', "got #{types.inspect}")
+    assert(types['firmware.bin'] == 'application/octet-stream', "got #{types.inspect}")
+  end
+end
+
+check('push says on stderr that an HTML file belongs in a page document') do
+  Dir.mktmpdir do |dir|
+    File.write(File.join(dir, 'index.html'), '<!doctype html>')
+    _out, err, code = run_cli('push', 'onyx', dir, '--offline')
+    assert(code == 0, 'expected the rehearsal to still run')
+    assert(err.include?('page document'), "expected the note on stderr, got #{err.inspect}")
+    assert(err.include?('save --page'), "expected the tool that does work to be named, got #{err.inspect}")
+  end
+end
+
+# The blocker: pc_60d7aa4c, pc_e3810da4, pc_c3606ecf. Authorize answers `ready`
+# with a blob URL and no upload_url when the platform already holds the bytes.
+check('a second upload of the same bytes is the dedup fast path: no PUT, no complete, no crash') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'dedup.css')
+    File.write(path, "body { color: ##{SecureRandom.hex(3)} }")
+
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code == 0, "expected the first upload to succeed, got #{code}: #{out}")
+    digest = JSON.parse(out)['digest']
+
+    before_complete = requests["#{TOKEN_ONYX} media_complete"]
+    before_puts = uploaded.size
+    out, err, code = run_cli('upload', 'onyx', path)
+    assert(code == 0, "expected exit 0 on the dedup path, got #{code}: #{out}#{err}")
+    assert(!err.include?('Thread'), "a thread backtrace reached stderr: #{err.inspect}")
+
+    line = JSON.parse(out)
+    assert(line['status'] == 'ready', "expected a ready line, got #{line.inspect}")
+    assert(line['digest'] == digest, "expected the same digest, got #{line.inspect}")
+    assert(line['deduplicated'] == true, "expected the line to say the bytes were already there, got #{line.inspect}")
+    assert(line['url'].to_s.include?(digest), "expected the blob URL, got #{line.inspect}")
+    assert(requests["#{TOKEN_ONYX} media_complete"] == before_complete, 'a deduped upload called complete')
+    assert(uploaded.size == before_puts, 'a deduped upload sent bytes')
+  end
+end
+
+check('push over a tree the platform already holds saves the keys and sends no bytes') do
+  Dir.mktmpdir do |dir|
+    body = "const shared = #{SecureRandom.hex(4).inspect}"
+    File.write(File.join(dir, 'shared.js'), body)
+    run_cli('upload', 'onyx', File.join(dir, 'shared.js')) # the platform now holds these bytes
+
+    run_cli('describe', 'onyx')
+    before_puts = uploaded.size
+    out, err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
+    assert(uploaded.size == before_puts, 'push sent bytes the platform already had')
+    assert(err.include?('already on the platform'), "expected the dedup note on stderr, got #{err.inspect}")
+    assert(last_args['save']['changes'].map { |c| c['key'] } == %w[assets/shared.js], "got #{last_args['save'].inspect}")
+  end
+end
+
+check('an authorize shape nothing expects becomes a structured error with the body, never a backtrace') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'odd.js')
+    File.write(path, "const odd = #{SecureRandom.hex(4).inspect}")
+    weird_authorize = true
+
+    out, err, code = run_cli('upload', 'onyx', path)
+    assert(code == 1, "expected exit 1, got #{code}: #{out}")
+    assert(!err.include?('backtrace') && !err.include?('.rb:'), "expected no Ruby trace, got #{err.inspect}")
+    line = JSON.parse(out)
+    assert(line['code'] == 'UPLOAD_UNEXPECTED', "expected UPLOAD_UNEXPECTED, got #{line.inspect}")
+    assert(line.dig('body', 'status') == 'contemplating', "expected the server's body attached, got #{line.inspect}")
+  end
+ensure
+  weird_authorize = nil
+end
+
+check('push --dry-run on a tree with no assets exits 0 and still checks the contract') do
+  Dir.mktmpdir do |dir|
+    before_describe = requests["#{TOKEN_ONYX} describe_site"]
+    out, _err, code = run_cli('push', 'onyx', dir, '--dry-run')
+    assert(code == 0, "expected exit 0 on an empty tree, got #{code}: #{out}")
+    data = JSON.parse(out)['data']
+    assert(data['files'] == 0 && data['saved'] == false && data['changes'] == [], "got #{data.inspect}")
+    assert(data['contract'] == 'versioned', "expected the contract checked, got #{data.inspect}")
+    assert(requests["#{TOKEN_ONYX} describe_site"] == before_describe + 1, 'expected exactly one describe_site')
+  end
+end
+
+check('push on a tree with no assets exits 0 too, so push && save needs no special case') do
+  Dir.mktmpdir do |dir|
+    before_save = requests["#{TOKEN_ONYX} save"]
+    out, _err, code = run_cli('push', 'onyx', dir)
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(JSON.parse(out).dig('data', 'saved') == false, "got #{out}")
+    assert(requests["#{TOKEN_ONYX} save"] == before_save, 'an empty tree emitted a save')
   end
 end
 
