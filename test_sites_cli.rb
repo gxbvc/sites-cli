@@ -1063,8 +1063,8 @@ check('wait-preview treats provisioning as terminal success and says why the URL
   assert(code == 0, "expected exit 0 on provisioning, got #{code}: #{out}")
   parsed = JSON.parse(out)
   assert(parsed.dig('data', 'preview_status') == 'provisioning', "got #{out}")
-  assert(parsed.dig('data', 'message').to_s.include?('wildcard certificate'),
-    "expected the message to name the wildcard certificate, got #{parsed.dig('data', 'message').inspect}")
+  assert(parsed.dig('data', 'message').to_s.include?('not finished provisioning'),
+    "expected the message to say why the URL may not open, got #{parsed.dig('data', 'message').inspect}")
   assert(requests["#{TOKEN_ONYX} describe_site"] == before + 2, 'provisioning must stop the poll, not spin the timeout')
 end
 
@@ -2045,6 +2045,15 @@ check('check names the missing preview wildcard certificate rather than just the
   assert(parsed['error'].include?('ERR_SSL_PROTOCOL_ERROR'), 'expected the browser error preserved too')
 end
 
+check('the double-dash preview host is recognised, and so is a grant minted before the change') do
+  [ 'https://orst2izx5hazhn--metrolocksmith-next.gxbsites.com',
+    'https://orst2izx5hazhn-onyx.gxbsites.com' ].each do |host|
+    out, _err, code = run_cli('check', host, env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'tls'))
+    assert(code == 1, "expected a nonzero exit for #{host}")
+    assert(JSON.parse(out)['code'] == 'PREVIEW_TLS', "expected PREVIEW_TLS for #{host}, got #{out}")
+  end
+end
+
 check('a live hostname keeps the plain browser error -- the hint is only for preview hosts') do
   out, _err, code = run_cli('check', 'https://onyx.gxbsites.com', env: BROWSER_ENV.merge('STUB_BROWSER_MODE' => 'tls'))
   assert(code == 1, 'expected a nonzero exit')
@@ -2244,7 +2253,7 @@ check('fragment warns about the things that only break later: forms-1.js, an SVG
   with_page_file do |_dir, path|
     _out, err, = run_cli('fragment', path)
     assert(err.include?('stopPropagation'), "expected the double-submit warning, got #{err.inspect}")
-    assert(err.include?('415'), "expected the SVG favicon warning, got #{err.inspect}")
+    assert(err.include?('favicon_svg_unresizable'), "expected the SVG favicon warning, got #{err.inspect}")
     assert(err.include?('fonts.example.com'), "expected the external stylesheet warning, got #{err.inspect}")
   end
 end
@@ -2649,6 +2658,40 @@ check('save --html needs --page, and refuses --changes in the same breath') do
     assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "expected USAGE for both forms at once, got #{out}")
     assert(requests["#{TOKEN_ONYX} save"] == before, 'a malformed save reached the server')
   end
+end
+
+# -- the manual is generated from the code ------------------------------------
+#
+# The hand-written table in AGENTS.md drifted in both directions: it named
+# tools the server did not have and denied ones it did (pc_6b2ffb91,
+# pc_d9fdedfe, pc_01d8cf27). `sites-cli manual` prints it, the manual pastes
+# the output, and this keeps a row and a `when` clause from disagreeing.
+
+check('sites-cli manual prints a markdown table and makes no request') do
+  before = requests.values.sum
+  out, _err, code = run_cli('manual')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(out.lines.first.start_with?('| Subcommand |'), "got #{out.lines.first.inspect}")
+  assert(out.lines.size > 30, "expected a row per subcommand, got #{out.lines.size}")
+  assert(requests.values.sum == before, 'the manual asked the server something')
+end
+
+check('every subcommand the manual names is one run() dispatches, and the other way round') do
+  source = File.read(CLI)
+  dispatch = source[/def run\(argv\).*?\n  else\n/m]
+  assert(dispatch, 'could not find the dispatch case in sites-cli')
+  wired = dispatch.scan(/^\s*when\s+((?:'[^']+'(?:,\s*)?)+)/).flatten
+                  .flat_map { |clause| clause.scan(/'([^']+)'/).flatten }
+                  .reject { |name| name.start_with?('-') || name == 'help' }
+
+  # Only the first column: the others name tools, not subcommands.
+  documented = run_cli('manual').first.lines.drop(2)
+               .flat_map { |line| line.split(/(?<!\\)\|/)[1].to_s.scan(/`([a-z_][a-z0-9_-]*)[ `]/).flatten }
+
+  missing = wired - documented
+  assert(missing.empty?, "these subcommands dispatch and the manual never names them: #{missing.join(', ')}")
+  invented = documented.uniq.reject { |name| wired.include?(name) }
+  assert(invented.empty?, "the manual names subcommands nothing dispatches: #{invented.join(', ')}")
 end
 
 # -- stdout is one JSON envelope ----------------------------------------------

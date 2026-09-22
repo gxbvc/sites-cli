@@ -1331,11 +1331,13 @@ PREVIEW_NO_HOSTNAME = {
 }.freeze
 
 # `ready` and `provisioning` are both "the build is done and it is good". They
-# differ only in whether the wildcard certificate is installed on the host yet,
-# which is a platform state no amount of polling changes -- so provisioning is
-# terminal and successful, and says why the URL will not open.
-PROVISIONING_NOTE = 'the build is ready, but the preview hostname cannot be opened until the ' \
-                    '*.gxbsites.com wildcard certificate is installed on the host'
+# differ only in whether the host has finished issuing this hostname its
+# certificate, which is a platform state no amount of polling changes -- so
+# provisioning is terminal and successful, and says why the URL may not open.
+# The *.gxbsites.com wildcard certificate is installed, so a build that settles
+# today normally settles `ready`.
+PROVISIONING_NOTE = 'the build is ready; the host has not finished provisioning this preview hostname, ' \
+                    'so it may not open yet. Nothing about the build changes if it does not.'
 
 # Polls describe_site until the branch's preview build settles.
 def cmd_wait_preview(slug, branch, timeout)
@@ -1488,9 +1490,9 @@ def tls_hint(url, message)
   return nil unless message.to_s.match?(/ERR_SSL|ERR_CERT|SSL_PROTOCOL|handshake/i)
   host = begin URI(url).host rescue nil end
   return nil unless host&.match?(PREVIEW_HOST)
-  'this is a preview hostname and the *.gxbsites.com wildcard certificate is not installed on the host yet, ' \
-    'so no client can complete a TLS handshake with it. The build itself is unaffected -- ' \
-    '`sites-cli wait-preview SLUG` reports what it is.'
+  'this is a preview hostname, so a handshake that cannot complete means the *.gxbsites.com wildcard ' \
+    'certificate is not being served for it -- a host problem, not a build one. The build itself is ' \
+    'unaffected: `sites-cli wait-preview SLUG` reports what it is.'
 end
 
 # -----------------------------------------------------------------------------
@@ -1873,17 +1875,19 @@ end
 
 SCRIPT_TAG = %r{(<script\b[^>]*>)(.*?)</script>}mi
 
-# What a config document says that a browser will punish later. Today there is
-# one: Site::PublicConfig always routes favicon.url through a Cloudflare image
-# transform, and those refuse SVG input -- so a declared SVG favicon validates,
-# builds `ready`, and is a 415 on every page (slice G friction 3).
+# What a config document says that costs something later. This used to claim a
+# declared SVG favicon was a hard 415 on every page while the server's own tool
+# text called it a warning, and nobody could tell which risk they were taking
+# (pc_4af26022, pc_26fc72b5). The server is right: the SVG is linked as it
+# stands, and what the site loses is the resized icons.
 def config_warnings(config)
   return [] unless config.is_a?(Hash)
   url = config.dig('favicon', 'url') || config.dig('favicon', :url)
   return [] unless url.to_s.downcase.end_with?('.svg')
-  ['a declared SVG favicon is an HTTP 415 on every page: the platform routes favicon.url through a ' \
-   'Cloudflare image transform, and those refuse SVG input. The blob itself is fine -- rasterize it ' \
-   '(rsvg-convert -w 512 -h 512 in.svg -o out.png), upload the raster, and declare the .png.']
+  ['a declared SVG favicon is linked as it stands and cannot be resized, so the site ships no ' \
+   'apple-touch-icon and no raster sizes; the build reports it as favicon_svg_unresizable. To get ' \
+   'those, rasterize it (rsvg-convert -w 512 -h 512 in.svg -o out.png), upload the raster and ' \
+   'declare the .png.']
 end
 
 def scan_scripts(markup, prefix, config, warnings)
@@ -2510,6 +2514,72 @@ end
 # CLI
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# The subcommand table, as data.
+#
+# AGENTS.md used to carry a hand-written copy of this, and it drifted in both
+# directions: it named tools the server did not have and denied ones it did
+# (pc_6b2ffb91, pc_d9fdedfe, pc_01d8cf27). `sites-cli manual` prints the table
+# and the manual pastes its output, so a row and a `when` clause cannot
+# disagree without the test saying so.
+#
+# [names, arguments, tool, capability, contract]
+# -----------------------------------------------------------------------------
+SUBCOMMANDS = [
+  [%w[describe describe_site], 'SLUG [PATH] [--branch B]', 'describe_site', 'read', 'both'],
+  [%w[read], 'SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]', 'read', 'read', 'v2'],
+  [%w[schema], "SLUG [#{SCHEMA_PARTS.join('|')}]", 'read {kind: schema}', 'read', 'v2'],
+  [%w[save], 'SLUG --changes FILE | --page KEY --html FILE ... [--dry-run]', 'save', 'draft', 'v2'],
+  [%w[create-branch], 'SLUG NAME [--from live|BRANCH]', 'create_branch', 'draft', 'v2'],
+  [%w[archive-branch], 'SLUG NAME', 'archive_branch', 'draft', 'v2'],
+  [%w[diff], 'SLUG [--branch B] [--against live|BRANCH]', 'diff', 'read', 'v2'],
+  [%w[publish], 'SLUG --review T|last | --expected T --keys ... | PATH', 'publish', 'publish', 'both'],
+  [%w[merge-live], 'SLUG [--branch B] --expected T --expected-live ID', 'merge_live', 'draft', 'v2'],
+  [%w[resolve-merge], 'SLUG --proposal T --resolutions FILE', 'resolve_merge', 'draft', 'v2'],
+  [%w[history], 'SLUG [--branch B] [--limit N]', 'history', 'read', 'v2'],
+  [%w[revoke-preview], 'SLUG URL_OR_TOKEN', 'revoke_preview', 'draft', 'v2'],
+  [%w[wait-preview], 'SLUG [--branch B] [--timeout 120]', 'describe_site (polled)', 'read', 'v2'],
+  [%w[list-domains], 'SLUG', 'list_domains', 'read', 'v2'],
+  [%w[connect-domain], 'SLUG HOST [--no-primary]', 'connect_domain', 'manage_domains', 'v2'],
+  [%w[verify-domain], 'SLUG HOST', 'verify_domain', 'manage_domains', 'v2'],
+  [%w[disconnect-domain], 'SLUG HOST', 'disconnect_domain', 'manage_domains', 'v2'],
+  [%w[list-submissions], 'SLUG [--form F] [--since ISO] [--limit N]', 'list_submissions', 'read_submissions', 'both'],
+  [%w[delete-submission], 'SLUG ID', 'delete_submission', 'read_submissions', 'both'],
+  [%w[analytics], 'SLUG [--period today|yesterday|7d|30d|all]', 'get_analytics', 'read', 'both'],
+  [%w[list-sites], '[SLUG]', 'list_sites', 'read', 'platform, or a site door with SLUG'],
+  [%w[create-site], 'SLUG --name NAME', 'create_site', 'draft + GXB staff', 'platform'],
+  [%w[platform-tools], '', 'GET /api/v1/platform/tools', 'none', 'platform'],
+  [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
+  [%w[upload], 'SLUG FILE [FILE...]', 'POST /api/v1/media/uploads', 'draft', 'v2'],
+  [%w[push], 'SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]', 'read + upload xN + save', 'draft', 'v2'],
+  [%w[fragment], 'FILE|- [--page KEY] [--append-changes FILE] [--wrap-body] [--add-form-result] [--lift-json-ld]', '--', 'none', 'none'],
+  [%w[validate-config], 'FILE --site SLUG', 'read {kind: schema}', 'read', 'v2'],
+  [%w[check], 'URL [--against URL] [--screenshot PATH] [--viewport] [--ignore S] [--no-probe]', '--', 'none', 'none'],
+  [%w[manual], '', '--', 'none', 'none'],
+  [%w[list], '[SLUG] [--prod]', 'rails runner, or list_files with SLUG', 'staff / read', 'both'],
+  [%w[show], 'SLUG [--prod]', 'rails runner', 'staff', 'both'],
+  [%w[open], 'SLUG [--prod]', 'rails runner', 'staff', 'both'],
+  [%w[create], 'SLUG [--name N] [--team T] [--prod]', 'rails runner', 'staff', 'legacy'],
+  [%w[list_files], 'SLUG [--prefix P]', 'list_files', 'read', 'legacy'],
+  [%w[read_file], 'SLUG PATH [--view live]', 'read_file', 'read', 'legacy'],
+  [%w[write_file write], 'SLUG PATH --content C | --file FILE', 'write_file', 'draft', 'legacy'],
+  [%w[edit_file edit], 'SLUG PATH --edits-file FILE', 'edit_file', 'draft', 'legacy']
+].freeze
+
+def cmd_manual
+  puts "| Subcommand | Tool | Capability | Contract |"
+  puts "|---|---|---|---|"
+  SUBCOMMANDS.each do |names, arguments, tool, capability, contract|
+    label = "`#{[names.first, arguments].reject(&:empty?).join(' ')}`"
+    label += " (alias: #{names[1..].map { |n| "`#{n}`" }.join(', ')})" if names.size > 1
+    cells = [label, tool == '--' ? '--' : "`#{tool}`", capability, contract]
+    # A pipe inside a cell is the table's own separator, so it is escaped --
+    # this output is pasted into AGENTS.md as it stands.
+    puts "| #{cells.map { |cell| cell.gsub('|', '\\|') }.join(' | ')} |"
+  end
+  0
+end
+
 def usage
   puts <<~USAGE
     sites-cli #{VERSION} — GXB tenant site management
@@ -2528,15 +2598,26 @@ def usage
                                [--lines 1,40] [--at SNAPSHOT]
       sites-cli read SLUG asset --keys assets/a.js,assets/b.css
                                             batch: {key => digest} for the bound ones
+      sites-cli schema SLUG [config|page|collection|redirect|changes]
+      sites-cli validate-config FILE --site SLUG
+                                            the fetched schema, run locally, before any write
       sites-cli save SLUG --changes FILE|- [--branch B] [--expected TOKEN]
-                          [--message M] [--idempotency-key K]
-      sites-cli save SLUG --page / --html page.html [--config config.json]
-                          [--title T] [--metadata meta.json] [--prefix assets/]
-                                            builds the changes JSON: the document shell is
-                                            dropped, the head becomes config/metadata, and
-                                            every assets/ reference becomes {{ asset: }}
-      sites-cli fragment FILE|- [--prefix assets/]
-                                            the same conversion, printed and not sent
+                          [--message M] [--idempotency-key K] [--dry-run]
+      sites-cli save SLUG --page KEY --html FILE [--title T] [--metadata FILE]
+                          [--markdown FILE] [--config FILE] [--collection KEY FILE]
+                          [--redirect FROM TO] [--delete KIND KEY]
+                          [--asset KEY FILE-or-DIGEST] [--prefix assets/]
+                          [--wrap-body] [--add-form-result] [--lift-json-ld]
+                                            every document flag repeats and keeps its order,
+                                            and the whole command is ONE changes array and one
+                                            snapshot. --title/--metadata bind to the --page
+                                            they follow. --dry-run validates and saves nothing
+      sites-cli fragment FILE|- [--page KEY] [--append-changes FILE] [--title T]
+                                [--prefix assets/] [--wrap-body] [--add-form-result]
+                                [--lift-json-ld]
+                                            the same conversion, printed and not sent;
+                                            --page makes it the real `put page` change and
+                                            --append-changes collects many into one file
       sites-cli create-branch SLUG NAME [--from live|BRANCH]
       sites-cli archive-branch SLUG NAME
       sites-cli diff SLUG [--branch B] [--against live|BRANCH]
@@ -2549,22 +2630,42 @@ def usage
       sites-cli wait-preview SLUG [--branch B] [--timeout 120]
       sites-cli list-submissions SLUG [--form F] [--since ISO] [--limit N]
                                                  needs a token minted with read_submissions
+      sites-cli delete-submission SLUG ID        takes a test row back out
       sites-cli analytics SLUG [--period today|yesterday|7d|30d|all]
 
-      sites-cli upload SLUG FILE [FILE...]       4 at a time; one JSON line each
+    Domains -- the site's public URL, which the canonical, og:url, sitemap,
+    llms.txt and every JSON-LD @id are baked from (capability manage_domains):
+      sites-cli list-domains SLUG
+      sites-cli connect-domain SLUG HOST [--no-primary]
+                                                 creates the claim and prints the DNS
+                                                 record to publish as one copyable line
+      sites-cli verify-domain SLUG HOST          resolves it; not-yet-published is a
+                                                 200 saying what was looked up
+      sites-cli disconnect-domain SLUG HOST
+
+      sites-cli upload SLUG FILE [FILE...]       4 at a time; one JSON line each. Any
+                                                 content type; bytes the platform already
+                                                 holds are a ready line with no PUT
       sites-cli push SLUG DIR [--branch B] [--prefix assets/] [--dry-run] [--offline]
                                                  one batch read to skip files already
                                                  bound at the same digest, then upload
                                                  + one save with the rest. --dry-run asks
                                                  describe_site which contract the site is
                                                  on and stops there; --offline asks nothing
-      sites-cli check URL [--width 1440] [--screenshot PATH] [--ignore SUBSTR] [--no-probe]
+      sites-cli check URL [--against URL] [--width 1440] [--screenshot PATH]
+                         [--viewport] [--ignore SUBSTR] [--no-probe]
+                                                 --against diffs the head, the counts and
+                                                 the visible text of two URLs and exits 1
+                                                 on any difference. --screenshot is the
+                                                 full page, and a blank one exits 1
+      sites-cli manual                           the subcommand table, from this table
 
     Platform tools (a personal token, POST /api/v1/platform/tools):
       sites-cli list-sites                       every site you can read
       sites-cli list-sites SLUG                  ask through that site's door instead
       sites-cli create-site SLUG --name NAME     GXB staff only
       sites-cli platform-tools                   the two schemas, from the server
+      sites-cli tools SLUG                       the site tools, from the server
 
     Every tool subcommand also takes --json FILE (or --json -) to supply the
     whole arguments object; explicit flags override individual keys.
@@ -2625,15 +2726,22 @@ def usage
                              the fallback for any slug with no site token
       SITES_CLI_BROWSER      agent-browser binary for `check`
 
-    Examples (all six on one personal token):
-      sites-cli create-site metrolocksmith --name "Metro Locksmith"
-      sites-cli push onyx ./public --dry-run
+    A three-page site, on one personal token, in six commands:
+      sites-cli create-site onyx --name "Onyx"
       sites-cli push onyx ./public
-      sites-cli save onyx --page / --html index.html --config config.json
+      sites-cli validate-config ./config.json --site onyx
+      sites-cli save onyx --config ./config.json \\
+        --page /        --html ./public/index.html \\
+        --page /about   --html ./public/about.html \\
+        --page /contact --html ./public/contact.html --add-form-result \\
+        --message "onyx, three pages"
       sites-cli wait-preview onyx
-      sites-cli check https://xxxxxxxxxxxxxx-onyx.gxbsites.com --screenshot onyx.png
+      sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
       sites-cli publish onyx --review last
-      sites-cli list-submissions onyx --since 2026-09-01
+      sites-cli connect-domain onyx onyxmodular.com   # then verify-domain, then publish again
+
+    A preview hostname is <token>--onyx.gxbsites.com (two dashes). Grants
+    minted before 2026-09-22 use one dash and still resolve.
   USAGE
   0
 end
@@ -2838,6 +2946,7 @@ def run(argv)
   case command
   when '-h', '--help', 'help', nil then return usage
   when '-v', '--version' then return success(version: VERSION)
+  when 'manual' then return cmd_manual
 
   # -- runner-based site folder commands --
   when 'list'
