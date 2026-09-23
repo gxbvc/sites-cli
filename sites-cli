@@ -2739,7 +2739,11 @@ SUBCOMMANDS = [
   [%w[list-submissions], 'SLUG [--form F] [--since ISO] [--limit N]', 'list_submissions', 'read_submissions', 'both'],
   [%w[delete-submission], 'SLUG ID', 'delete_submission', 'read_submissions', 'both'],
   [%w[analytics], 'SLUG [--period today|yesterday|7d|30d|all]', 'get_analytics', 'read', 'both'],
-  [%w[list-sites], '[SLUG]', 'list_sites', 'read', 'platform, or a site door with SLUG'],
+  [%w[list-sites], '[SLUG] [--search QUERY]', 'list_sites', 'read', 'platform, or a site door with SLUG'],
+  [%w[users], '[--search QUERY] [--cursor ID]', 'search_users', 'manage_access + GXB staff', 'platform'],
+  [%w[members], 'SLUG', 'list_members', 'manage_access', 'both'],
+  [%w[grant], 'SLUG --email EMAIL|--auth-user-id ID --role viewer|editor|admin [--read-submissions]', 'grant_access', 'manage_access', 'both'],
+  [%w[revoke], 'SLUG --email EMAIL|--auth-user-id ID --yes', 'revoke_access', 'manage_access', 'both'],
   [%w[create-site], 'SLUG --name NAME', 'create_site', 'draft + GXB staff', 'platform'],
   [%w[platform-tools], '', 'GET /api/v1/platform/tools', 'none', 'platform'],
   [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
@@ -2867,6 +2871,15 @@ def usage
                                                  on any difference. --screenshot is the
                                                  full page, and a blank one exits 1
       sites-cli manual                           the subcommand table, from this table
+
+    Access (same API for CLI and Chat; manage_access required):
+      users [--search QUERY] [--cursor ID]          Search Auth names/emails (GXB staff)
+      list-sites [--search QUERY]                  Search readable site names/slugs
+      members SLUG                                List explicit and effective access
+      grant SLUG --email EMAIL --role editor       Add read + draft, without submissions
+      grant SLUG --auth-user-id UUID --role viewer [--read-submissions]
+      revoke SLUG --email EMAIL --yes              Remove this site's explicit grant
+      Grants preserve existing rights. Repeating a grant is a no-op. No email is sent.
 
     Platform tools (a personal token, POST /api/v1/platform/tools):
       sites-cli list-sites                       every site you can read
@@ -3278,9 +3291,51 @@ def run(argv)
   #    SLUG asks through that site's door instead: with the site's own token
   #    that answers with just that site, and with a personal token it answers
   #    the same list the platform door would. --
+  when 'users'
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    search = opt(argv, '--search')
+    cursor = opt(argv, '--cursor')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return failure('users takes --search and --cursor, not positional arguments', code: 'USAGE') unless argv.empty?
+    base['search'] = search if search
+    base['cursor'] = cursor if cursor
+    return platform_tool_call('_platform', 'search_users', base, 'users')
+
+  when 'members', 'grant', 'revoke'
+    slug = argv.shift
+    return failure("#{command} requires SLUG", code: 'USAGE') unless slug && !slug.start_with?('--')
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    if command != 'members'
+      email = opt(argv, '--email')
+      auth_user_id = opt(argv, '--auth-user-id')
+      base['email'] = email if email
+      base['auth_user_id'] = auth_user_id if auth_user_id
+      if command == 'grant'
+        role = opt(argv, '--role')
+        base['role'] = role if role
+        base['read_submissions'] = true if flag?(argv, '--read-submissions')
+        return failure('grant requires --role viewer|editor|admin', code: 'USAGE') unless %w[viewer editor admin].include?(base['role'])
+      else
+        return failure('revoke removes all explicit access on this site; confirm with --yes', code: 'CONFIRMATION_REQUIRED') unless flag?(argv, '--yes')
+      end
+      unless [base['email'], base['auth_user_id']].count { |v| v.is_a?(String) && !v.strip.empty? } == 1
+        return failure('provide exactly one of --email or --auth-user-id (an Auth UUID, not a Sites user ID)', code: 'USAGE')
+      end
+    end
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return failure("unexpected arguments: #{argv.join(' ')}", code: 'USAGE') unless argv.empty?
+    tool = { 'members' => 'list_members', 'grant' => 'grant_access', 'revoke' => 'revoke_access' }.fetch(command)
+    return tool_call(slug, tool, base)
+
   when 'list-sites'
     base, err = json_arguments(argv)
     return fail_with(err) if err
+    search = opt(argv, '--search')
+    base['search'] = search if search
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     slug = argv.shift

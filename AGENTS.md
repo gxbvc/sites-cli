@@ -51,7 +51,11 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `list-submissions SLUG [--form F] [--since ISO] [--limit N]` | `list_submissions` | read_submissions | both |
 | `delete-submission SLUG ID` | `delete_submission` | read_submissions | both |
 | `analytics SLUG [--period today\|yesterday\|7d\|30d\|all]` | `get_analytics` | read | both |
-| `list-sites [SLUG]` | `list_sites` | read | platform, or a site door with SLUG |
+| `list-sites [SLUG] [--search QUERY]` | `list_sites` | read | platform, or a site door with SLUG |
+| `users [--search QUERY] [--cursor ID]` | `search_users` | manage_access + GXB staff | platform |
+| `members SLUG` | `list_members` | manage_access | both |
+| `grant SLUG --email EMAIL\|--auth-user-id ID --role viewer\|editor\|admin [--read-submissions]` | `grant_access` | manage_access | both |
+| `revoke SLUG --email EMAIL\|--auth-user-id ID --yes` | `revoke_access` | manage_access | both |
 | `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
 | `platform-tools` | `GET /api/v1/platform/tools` | none | platform |
 | `tools SLUG` | `GET /api/v1/tools` | none | both |
@@ -79,6 +83,38 @@ tool.
 tool index for that site and `sites-cli schema SLUG` prints the document
 schemas. A paragraph in this file cannot stay true across a deploy and twice
 has told people a working feature was broken; those two commands can.
+
+## People and site access
+
+```sh
+sites-cli users --search "Dirk"
+sites-cli list-sites --search "tap"
+sites-cli grant tap --email dperritt@mdhealthpathways.com --role editor
+sites-cli members tap
+# Removal requires explicit confirmation:
+sites-cli revoke tap --email dperritt@mdhealthpathways.com --yes
+```
+
+`users` searches active Auth users by name or email. Without `--search`, it
+lists them, 50 per page. Pass `next_cursor` back with `--cursor` for the next
+page. It requires a staff personal token with `manage_access`. Sites uses its
+existing OAuth credential to call Auth; the Auth application must have
+`directory_access` enabled. No Auth credential reaches the CLI.
+
+Grants accept one exact `--email` or `--auth-user-id` (Auth UUID, not Sites'
+integer user ID). Fuzzy names are search inputs only. Staff grants resolve
+Auth identity before writing. Client site admins can invite an exact email
+without access to the global directory. An email not yet in Auth can receive
+an invitation record; no prior Sites login is required. No email is sent.
+
+New `viewer` grants mean `read`; `editor` means `read,draft`. Add
+`--read-submissions` explicitly to include inquiries. `admin` includes all
+capabilities. Existing members keep their stored capabilities. Grants add
+rights, never reduce them, and repeated identical grants report
+`changed:false`. Use `revoke` to remove the explicit membership on one site.
+It refuses self-removal, the last manager on a restricted site, and implicit
+GXB staff access. `members` reports both granted and effective capabilities.
+All three access commands need `manage_access` and use the same tools as Chat.
 
 ## Ergonomics
 

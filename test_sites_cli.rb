@@ -373,6 +373,8 @@ server.mount_proc('/') do |req, res|
     when 'list_sites'
       res.status = 200
       res.body = JSON.generate(sites: [ { slug: 'onyx', name: 'Onyx', versioned: true } ])
+    when 'list_members', 'grant_access', 'revoke_access'
+      res.body = JSON.generate(site: payload['site'] || 'onyx', changed: true, arguments: args)
     when 'list_submissions'
       if token == TOKEN_ONYX
         res.status = 200
@@ -438,6 +440,8 @@ server.mount_proc('/') do |req, res|
         message: 'this endpoint takes a personal token minted from your profile on sites.gxb.vc, not a site token')
     else
       case tool
+      when 'search_users'
+        res.body = JSON.generate(users: [{ auth_user_id: 'auth-uuid', name: 'Dirk', email: 'dirk@example.com' }], next_cursor: nil)
       when 'list_sites'
         res.status = 200
         res.body = JSON.generate(sites: [
@@ -1335,6 +1339,40 @@ check('wait-preview treats a missing preview_status as an error, not something t
   out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
   assert(code == 1, "expected exit 1 when the key is absent, got #{code}: #{out}")
   assert(JSON.parse(out)['code'] == 'PREVIEW_MISSING', "expected PREVIEW_MISSING, got #{out}")
+end
+
+check('access commands send exact selectors and search through the shared API') do
+  env = { 'SITES_CLI_TOKEN' => TOKEN_USER }
+  out, _err, code = run_cli('users', '--search', 'Dirk', '--cursor', 'cursor-uuid', env: env)
+  assert(code == 0, out)
+  assert(last_args['platform:search_users'] == { 'search' => 'Dirk', 'cursor' => 'cursor-uuid' }, 'directory filters lost')
+  out, _err, code = run_cli('list-sites', '--search', 'tap', env: env)
+  assert(code == 0, out)
+  assert(last_args['platform:list_sites'] == { 'search' => 'tap' }, 'site search lost')
+  out, _err, code = run_cli('grant', 'tap', '--email', 'dirk@example.com', '--role', 'editor', env: env)
+  assert(code == 0, out)
+  assert(last_envelope['grant_access']['site'] == 'tap', 'wrong site')
+  assert(last_args['grant_access'] == { 'email' => 'dirk@example.com', 'role' => 'editor' }, 'grant overreached')
+  out, _err, code = run_cli('grant', 'tap', '--auth-user-id', 'auth-uuid', '--role', 'viewer', '--read-submissions', env: env)
+  assert(code == 0, out)
+  assert(last_args['grant_access'] == { 'auth_user_id' => 'auth-uuid', 'role' => 'viewer', 'read_submissions' => true }, 'explicit submissions lost')
+  out, _err, code = run_cli('members', 'tap', env: env)
+  assert(code == 0, out)
+  assert(last_args['list_members'] == {}, 'members takes no selectors')
+  out, _err, code = run_cli('revoke', 'tap', '--email', 'dirk@example.com', '--yes', env: env)
+  assert(code == 0, out)
+  assert(last_args['revoke_access'] == { 'email' => 'dirk@example.com' }, 'revoke shape wrong')
+end
+
+check('access commands reject ambiguous selectors and unconfirmed revocation locally') do
+  before = requests.values.sum
+  [ ['grant', 'tap', '--email', 'dirk@example.com', '--auth-user-id', '123', '--role', 'editor'],
+    ['grant', 'tap', '--role', 'editor'], ['grant', 'tap', '--email', 'dirk@example.com', '--role', 'owner'],
+    ['revoke', 'tap', '--email', 'dirk@example.com'], ['members', 'tap', 'extra'], ['users', '--typo', 'Dirk'] ].each do |args|
+    out, _err, code = run_cli(*args, env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
+    assert(code == 1, out)
+  end
+  assert(requests.values.sum == before, 'invalid access command sent a request')
 end
 
 # -- the platform door (slice F section 4) -----------------------------------
