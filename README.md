@@ -71,7 +71,7 @@ stderr every time it sees `published: false`.
 
 There are still two doors. `list_sites` and `create_site` have no site to be
 bound to, so they go to `POST /api/v1/platform/tools`; every other tool goes to
-`POST /api/v1/tools`, and uploads to `/api/v1/media/uploads`.
+`POST /api/v1/tools`. Versioned uploads post `upload_asset` and `complete_upload` there too.
 
 One **personal** token opens both (`sk_user_...`, minted at
 `https://sites.gxb.vc/profile`, GXB staff only, from `SITES_CLI_TOKEN` or the

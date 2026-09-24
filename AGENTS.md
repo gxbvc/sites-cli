@@ -59,7 +59,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
 | `platform-tools` | `GET /api/v1/platform/tools` | none | platform |
 | `tools SLUG` | `GET /api/v1/tools` | none | both |
-| `upload SLUG FILE [FILE...]` | `POST /api/v1/media/uploads` | draft | v2 |
+| `upload SLUG FILE [FILE...]` | `upload_asset + complete_upload` | draft | v2 |
 | `push SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]` | `read + upload xN + save` | draft | v2 |
 | `fragment FILE\|- [--page KEY] [--append-changes FILE] [--wrap-body] [--lift-json-ld]` | -- | none | none |
 | `validate-config FILE --site SLUG` | `read {kind: schema}` | read | v2 |
@@ -172,7 +172,7 @@ All three access commands need `manage_access` and use the same tools as Chat.
 | Credential | Where it lives | What it opens |
 |---|---|---|
 | Personal token `sk_user_<id>_...` | `SITES_CLI_TOKEN`, or `tokens.json` under `_platform` | everything the person can reach: `POST /api/v1/platform/tools` (`list_sites`, `create_site`), and every site door and upload for a site they can read |
-| Site token `sk_site_<slug>_...` | `tokens.json` under the slug | `POST /api/v1/tools`, `/api/v1/media/uploads` for that one site |
+| Site token `sk_site_<slug>_...` | `tokens.json` under the slug | `POST /api/v1/tools` for that one site |
 | Staff credentials | the Rails app itself | `list` / `show` / `open` / `create` through the runner |
 
 **One personal credential opens both doors**, and this is deployed. A site
@@ -229,8 +229,9 @@ the caller named it.
 
 ## Uploads
 
-`upload SLUG FILE [FILE...]` runs the authorize -> PUT -> complete -> poll
-flow for each file, four at a time, and prints one JSON line per file:
+`upload SLUG FILE [FILE...]` posts `upload_asset` then `complete_upload`
+(and PUTs the bytes in between) for each file, four at a time, and prints
+one JSON line per file:
 
 ```json
 {"path":"public/assets/app.js","digest":"9932...","url":"https://cdn.gxbsites.com/blobs/9932.../asset.js","media_type":"text/javascript","byte_size":19542,"status":"ready"}
@@ -240,7 +241,7 @@ Exit 1 if any file failed. On a versioned site `label` and `expected_version`
 are omitted and `filename` + a `digest` hint are sent instead: bytes are bound
 to a logical path later, by `save`.
 
-**Bytes the platform already holds are the cheap case.** Authorize answers
+**Bytes the platform already holds are the cheap case.** `upload_asset` answers
 `status: "ready"` with the blob URL and no `upload_url`, and that line comes
 back with `"deduplicated": true` and no PUT, no complete and no poll. This is
 the fast path global content addressing exists for -- a file another tenant
@@ -898,12 +899,13 @@ ruby test_sites_cli.rb
 ```
 
 A stub WEBrick server plays the Sites API in-process and drives the real CLI
-binary against it (182 checks): token/site binding, the nonzero 409 exit with
+binary against it (189 checks): token/site binding, the nonzero 409 exit with
 no automatic retry or reread and no cache poisoning from the conflict body,
 from a `read --at` or from a `save --dry-run`, expected-token persistence,
 review caching and forgetting, every v2 subcommand's request shape against
 `Mcp::ToolRegistry`, each terminal `preview_status`, byte-for-byte streamed
-binary uploads (single PUT and multipart), the dedup fast path and the
+binary uploads (single PUT and multipart) through `upload_asset` /
+`complete_upload`, a 429 then retry, the dedup fast path and the
 structured error an unexpected authorize shape becomes, upload content types
 and bounded parallelism, push change-list generation, dedup, the batch-read
 skip and its fallback, the empty tree, the platform door, the personal token at

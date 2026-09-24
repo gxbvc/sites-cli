@@ -86,6 +86,7 @@ weird_authorize = nil                          # a test arms this to answer a sh
 multipart_named = nil                          # a test arms this to force the multipart transport
 verify_domain_succeeds = false                 # a test flips this to make DNS resolve
 multipart_upa = nil                            # the upload id that took it
+rate_limit_uploads = 0                         # upload_asset starts left to 429, then succeed
 BIG_PART_SIZE = 12
 BIG_PARTS_COUNT = 3
 big_parts = {}                                 # part_number => bytes received
@@ -417,6 +418,60 @@ server.mount_proc('/') do |req, res|
     when 'get_analytics'
       res.status = 200
       res.body = JSON.generate(site: 'onyx', period: args['period'] || '7d', visitors: 12, pageviews: 30)
+    when 'upload_asset'
+      if args['part_numbers']
+        res.status = 200
+        res.body = JSON.generate(upload_id: args['upload_id'], multipart: true,
+          parts: args['part_numbers'].map { |n|
+            { part_number: n, upload_url: "http://127.0.0.1:#{port}/putbig/#{n}" } })
+        next
+      end
+      if rate_limit_uploads > 0
+        rate_limit_uploads -= 1
+        res.status = 429
+        res['Retry-After'] = '0'
+        res.body = JSON.generate(error: 'rate_limited',
+          message: 'too many writes this minute (limit 30); wait and try again',
+          retry_after: 0, limit: 30)
+        next
+      end
+      upload_seq += 1
+      id = "upa#{upload_seq}"
+      authorized[id] = args
+      authorize_bodies << args
+      held = known_digests[args['digest']]
+      if weird_authorize
+        res.status = 200
+        res.body = JSON.generate(upload_id: id, status: 'contemplating')
+      elsif args['content_type'].to_s.start_with?('text/html')
+        res.status = 422
+        res.body = JSON.generate(error: 'unsupported_content_type',
+          message: 'text/html is refused: a page belongs in a page document, not a blob on the asset CDN')
+      elsif held
+        res.status = 200
+        res.body = JSON.generate(upload_id: id, status: 'ready', digest: args['digest'],
+          media_type: held[:media_type], byte_size: held[:byte_size],
+          url: "http://cdn.test/blobs/#{args['digest']}/asset.bin")
+      elsif args['filename'] == multipart_named
+        multipart_upa = id
+        res.status = 200
+        res.body = JSON.generate(upload_id: id, status: 'pending', multipart: true,
+          parts_count: BIG_PARTS_COUNT, part_size: BIG_PART_SIZE)
+      else
+        res.status = 200
+        res.body = JSON.generate(upload_id: id, status: 'pending',
+          upload_url: "http://127.0.0.1:#{port}/put/#{id}")
+      end
+    when 'complete_upload'
+      id = args['upload_id']
+      payload = authorized.fetch(id)
+      digest = payload['digest']
+      media_type = uploaded["/put/#{id}"].to_s.start_with?("\xFF\xD8\xFF".b) ? 'image/jpeg' : payload['content_type']
+      known_digests[digest] = { media_type: media_type, byte_size: payload['byte_size'] }
+      res.status = 200
+      res.body = JSON.generate(upload_id: id, status: 'ready', digest: digest,
+        media_type: media_type, byte_size: payload['byte_size'],
+        url: "http://cdn.test/blobs/#{digest}/asset.bin", version: id)
     when 'create_site'
       res.status = 403
       res.body = JSON.generate(error: 'capability_denied', capability: 'create_site',
@@ -496,40 +551,11 @@ server.mount_proc('/') do |req, res|
     site_on_site_token << "media_authorize #{payload['site'].inspect}" if !token.start_with?('sk_user_') && payload.key?('site')
 
     if payload['label'].nil?
-      # plan 30: no label, no expected_version -- filename and digest only.
-      upload_seq += 1
-      id = "upa#{upload_seq}"
-      authorized[id] = payload
-      authorize_bodies << payload
-      held = known_digests[payload['digest']]
-      if weird_authorize
-        res.status = 200
-        res.body = JSON.generate(id: id, status: 'contemplating')
-      elsif payload['content_type'].to_s.start_with?('text/html')
-        # The one refusal left: a page hosted as a blob would be phishing on
-        # cdn.gxbsites.com (uploads brief item 2).
-        res.status = 422
-        res.body = JSON.generate(error: 'unsupported_content_type',
-          message: 'text/html is refused: a page belongs in a page document, not a blob on the asset CDN')
-      elsif held
-        # No upload_url at all: the bytes are already here.
-        res.status = 200
-        res.body = JSON.generate(id: id, status: 'ready', digest: payload['digest'],
-          media_type: held[:media_type], byte_size: held[:byte_size],
-          url: "http://cdn.test/blobs/#{payload['digest']}/asset.bin")
-      elsif payload['filename'] == multipart_named
-        # Over 25 MB the server asks for the multipart transport whatever the
-        # type is (uploads brief item 2). The CLI follows `multipart`, so the
-        # threshold is the server's to pick; this proves the CLI follows it for
-        # a kind that used to be single-PUT only.
-        multipart_upa = id
-        res.status = 201
-        res.body = JSON.generate(id: id, status: 'pending', multipart: true,
-          parts_count: BIG_PARTS_COUNT, part_size: BIG_PART_SIZE)
-      else
-        res.status = 201
-        res.body = JSON.generate(id: id, status: 'pending', upload_url: "http://127.0.0.1:#{port}/put/#{id}")
-      end
+      # Versioned uploads go through upload_asset. Hitting REST here means the
+      # CLI still uses the old door for a label-less file.
+      res.status = 404
+      res.body = JSON.generate(error: 'not_found',
+        message: 'versioned uploads go through upload_asset, not POST /api/v1/media/uploads')
     else
       current = versions[payload['label']]
       if payload['expected_version'] != current
@@ -590,51 +616,26 @@ server.mount_proc('/') do |req, res|
     res.status = 200
     res.body = JSON.generate(id: 'upvideo', status: 'ready', url: 'http://cdn.test/tour.mp4')
 
-  in [ 'DELETE', '/api/v1/media/uploads/upvideo' ]
+  in [ 'DELETE', String => path ] if path.start_with?('/api/v1/media/uploads/')
     requests["#{token} media_abort"] += 1
     res.status = 200
-    res.body = JSON.generate(id: 'upvideo', status: 'aborted')
+    res.body = JSON.generate(id: path.split('/').last, status: 'aborted')
 
-  # -- plan 30 label-less uploads -------------------------------------------
-
-  in [ 'POST', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)/parts\z}
-    payload = JSON.parse(req.body)
-    requests["#{token} media_parts"] += 1
-    res.status = 200
-    res.body = JSON.generate(parts: payload['part_numbers'].map { |n|
-      { part_number: n, upload_url: "http://127.0.0.1:#{port}/putbig/#{n}" } })
+  # -- versioned multipart part bytes (presigned by upload_asset) -------------
 
   in [ 'PUT', String => path ] if path.start_with?('/putbig/')
     part_number = path.split('/').last.to_i
-    big_parts[part_number] = req.body
-    res['ETag'] = %("big-#{part_number}-etag")
-    res.status = 200
+    part_attempts[part_number] += 1
+    if part_number == always_fail_part
+      res.status = 500
+    elsif part_number == flaky_part && part_attempts[part_number] == 1
+      res.status = 500
+    else
+      big_parts[part_number] = req.body
+      res['ETag'] = %("big-#{part_number}-etag")
+      res.status = 200
+    end
     res.body = ''
-
-  in [ 'POST', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)/complete\z}
-    id = Regexp.last_match(1)
-    requests["#{token} media_complete"] += 1
-    media_sites << JSON.parse(req.body)['site'] if token.start_with?('sk_user_')
-    payload = authorized.fetch(id)
-    digest = payload['digest']
-    # The platform types bytes from content, not from the filename: a file
-    # called .png holding JPEG bytes is stored and served as image/jpeg.
-    media_type = uploaded["/put/#{id}"].to_s.start_with?("\xFF\xD8\xFF".b) ? 'image/jpeg' : payload['content_type']
-    known_digests[digest] = { media_type: media_type, byte_size: payload['byte_size'] }
-    res.status = 200
-    res.body = JSON.generate(id: id, status: 'ready', digest: digest,
-      media_type: media_type, byte_size: payload['byte_size'],
-      url: "http://cdn.test/blobs/#{digest}/asset.bin", version: id)
-
-  in [ 'GET', String => path ] if path =~ %r{\A/api/v1/media/uploads/(upa\d+)\z}
-    id = Regexp.last_match(1)
-    # A GET has no body, so a personal token names the site in the query.
-    media_sites << req.query['site'] if token.start_with?('sk_user_')
-    payload = authorized.fetch(id)
-    res.status = 200
-    res.body = JSON.generate(id: id, status: 'ready', digest: payload['digest'],
-      media_type: payload['content_type'], byte_size: payload['byte_size'],
-      url: "http://cdn.test/blobs/#{payload['digest']}/asset.bin")
 
   in [ 'PUT', String => path ] if path.start_with?('/put/')
     if path.start_with?('/put/upa')
@@ -1510,24 +1511,23 @@ end
 check('push over a personal token names the site on the read, the uploads and the save') do
   Dir.mktmpdir do |dir|
     File.write(File.join(dir, 'app.js'), "export const flow = #{SecureRandom.hex(4).inspect};")
-    media_sites.clear
     out, err, code = run_cli('push', 'flowsite', dir, env: PERSONAL_ENV)
     assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
     assert(last_envelope['read']['site'] == 'flowsite', 'expected the batch asset read to name the site')
     assert(last_envelope['save']['site'] == 'flowsite', 'expected the save to name the site')
-    assert(media_sites.any?, 'no media request named a site')
-    assert(media_sites.uniq == [ 'flowsite' ], "expected every media request to name flowsite, got #{media_sites.uniq.inspect}")
+    assert(last_envelope['upload_asset']['site'] == 'flowsite', 'expected upload_asset to name the site')
+    assert(last_envelope['complete_upload']['site'] == 'flowsite', 'expected complete_upload to name the site')
   end
 end
 
-check('upload over a personal token names the site on authorize, complete and the status poll') do
+check('upload over a personal token names the site on upload_asset and complete_upload') do
   Dir.mktmpdir do |dir|
     path = File.join(dir, 'solo.css')
     File.write(path, 'body { color: red }')
-    media_sites.clear
     out, _err, code = run_cli('upload', 'flowsite', path, env: PERSONAL_ENV)
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
-    assert(media_sites.uniq == [ 'flowsite' ], "expected every media request to name flowsite, got #{media_sites.inspect}")
+    assert(last_envelope['upload_asset']['site'] == 'flowsite', "expected upload_asset to name flowsite, got #{last_envelope['upload_asset'].inspect}")
+    assert(last_envelope['complete_upload']['site'] == 'flowsite', "expected complete_upload to name flowsite, got #{last_envelope['complete_upload'].inspect}")
   end
 end
 
@@ -1848,15 +1848,76 @@ check('a file the server asks to send in parts takes the multipart transport wha
     File.binwrite(path, original)
     multipart_named = 'firmware.iso'
     big_parts.clear
+    before_rest = requests["#{TOKEN_ONYX} media_authorize"]
+    before_asset = requests["#{TOKEN_ONYX} upload_asset"]
 
     out, _err, code = run_cli('upload', 'onyx', path)
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
     reassembled = (1..BIG_PARTS_COUNT).map { |n| big_parts.fetch(n) }.join
     assert(reassembled == original, 'reassembled part bytes did not match the source file')
     assert(JSON.parse(out)['status'] == 'ready', "got #{out}")
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_rest, 'versioned multipart still hit REST authorize')
+    assert(requests["#{TOKEN_ONYX} upload_asset"] > before_asset, 'versioned multipart never called upload_asset')
   end
 ensure
   multipart_named = nil
+end
+
+check('a versioned part that fails once is retried with a fresh upload_asset presign') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'firmware.iso')
+    File.binwrite(path, SecureRandom.random_bytes(BIG_PART_SIZE * BIG_PARTS_COUNT))
+    multipart_named = 'firmware.iso'
+    part_attempts.clear
+    flaky_part = 2
+    big_parts.clear
+
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code == 0, "expected the retried part to eventually succeed, got: #{out}")
+    assert(part_attempts[2] == 2, "expected part 2 to be attempted twice, got #{part_attempts[2]}")
+  end
+ensure
+  multipart_named = nil
+  flaky_part = nil
+end
+
+check('a versioned part failure returns the error and does not DELETE') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'firmware.iso')
+    File.binwrite(path, SecureRandom.random_bytes(BIG_PART_SIZE * BIG_PARTS_COUNT))
+    multipart_named = 'firmware.iso'
+    always_fail_part = 1
+    part_attempts.clear
+    before_abort = requests["#{TOKEN_ONYX} media_abort"]
+    before_rest = requests["#{TOKEN_ONYX} media_authorize"]
+
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code != 0, 'expected a nonzero exit once a part cannot be uploaded')
+    assert(JSON.parse(out)['code'] == 'PART_UPLOAD_FAILED', "expected PART_UPLOAD_FAILED, got: #{out}")
+    assert(part_attempts[1] == 3, "expected exactly 3 bounded attempts, got #{part_attempts[1]}")
+    assert(requests["#{TOKEN_ONYX} media_abort"] == before_abort, 'versioned upload issued DELETE after a part failure')
+    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_rest, 'versioned part failure still hit REST')
+  end
+ensure
+  multipart_named = nil
+  always_fail_part = nil
+end
+
+check('upload_asset 429 then retry succeeds') do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, 'retry.js')
+    File.write(path, "export const retry = #{SecureRandom.hex(4).inspect}")
+    rate_limit_uploads = 1
+    before = requests["#{TOKEN_ONYX} upload_asset"]
+
+    out, _err, code = run_cli('upload', 'onyx', path)
+    assert(code == 0, "expected exit 0 after a 429 retry, got #{code}: #{out}")
+    assert(JSON.parse(out)['status'] == 'ready', "got #{out}")
+    calls = requests["#{TOKEN_ONYX} upload_asset"] - before
+    assert(calls == 2, "expected one 429 then one start, got #{calls}")
+  end
+ensure
+  rate_limit_uploads = 0
 end
 
 # -- push ---------------------------------------------------------------------
@@ -1905,7 +1966,7 @@ check('push --dry-run asks describe_site which contract the site is on, and noth
     onyx_tree(dir)
     before_describe = requests["#{TOKEN_ONYX} describe_site"]
     before_save = requests["#{TOKEN_ONYX} save"]
-    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+    before_authorize = requests["#{TOKEN_ONYX} upload_asset"]
 
     out, _err, code = run_cli('push', 'onyx', dir, '--dry-run')
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
@@ -1915,7 +1976,7 @@ check('push --dry-run asks describe_site which contract the site is on, and noth
     assert(data['expected'] == branch_heads['draft'], "expected the real branch head, got #{data['expected'].inspect}")
     assert(requests["#{TOKEN_ONYX} describe_site"] == before_describe + 1, 'expected exactly one describe_site')
     assert(requests["#{TOKEN_ONYX} save"] == before_save, 'a dry run saved')
-    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize, 'a dry run uploaded')
+    assert(requests["#{TOKEN_ONYX} upload_asset"] == before_authorize, 'a dry run uploaded')
   end
 end
 
@@ -2007,7 +2068,7 @@ check('a second upload of the same bytes is the dedup fast path: no PUT, no comp
     assert(code == 0, "expected the first upload to succeed, got #{code}: #{out}")
     digest = JSON.parse(out)['digest']
 
-    before_complete = requests["#{TOKEN_ONYX} media_complete"]
+    before_complete = requests["#{TOKEN_ONYX} complete_upload"]
     before_puts = uploaded.size
     out, err, code = run_cli('upload', 'onyx', path)
     assert(code == 0, "expected exit 0 on the dedup path, got #{code}: #{out}#{err}")
@@ -2018,7 +2079,7 @@ check('a second upload of the same bytes is the dedup fast path: no PUT, no comp
     assert(line['digest'] == digest, "expected the same digest, got #{line.inspect}")
     assert(line['deduplicated'] == true, "expected the line to say the bytes were already there, got #{line.inspect}")
     assert(line['url'].to_s.include?(digest), "expected the blob URL, got #{line.inspect}")
-    assert(requests["#{TOKEN_ONYX} media_complete"] == before_complete, 'a deduped upload called complete')
+    assert(requests["#{TOKEN_ONYX} complete_upload"] == before_complete, 'a deduped upload called complete')
     assert(uploaded.size == before_puts, 'a deduped upload sent bytes')
   end
 end
@@ -2082,14 +2143,14 @@ check('push uploads each distinct digest once and emits exactly one save with ev
   Dir.mktmpdir do |dir|
     onyx_tree(dir)
     run_cli('describe', 'onyx') # refresh the remembered head
-    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+    before_authorize = requests["#{TOKEN_ONYX} upload_asset"]
     before_save = requests["#{TOKEN_ONYX} save"]
     head = branch_heads['draft']
 
     out, _err, code = run_cli('push', 'onyx', dir)
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
 
-    uploads = requests["#{TOKEN_ONYX} media_authorize"] - before_authorize
+    uploads = requests["#{TOKEN_ONYX} upload_asset"] - before_authorize
     assert(uploads == 2, "expected two uploads for three files with two distinct digests, got #{uploads}")
     assert(requests["#{TOKEN_ONYX} save"] == before_save + 1, 'expected exactly one save')
 
@@ -2112,11 +2173,11 @@ check('push skips files already bound at the same digest and saves only what cha
     assert(last_args['read'] == { 'kind' => 'asset', 'keys' => %w[assets/one.js assets/two.js], 'branch' => 'draft' },
       "expected push to ask the batch read first, got #{last_args['read'].inspect}")
 
-    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+    before_authorize = requests["#{TOKEN_ONYX} upload_asset"]
     before_save = requests["#{TOKEN_ONYX} save"]
     out, err, code = run_cli('push', 'onyx', dir)
     assert(code == 0, "expected exit 0 on an unchanged tree, got #{code}: #{out}")
-    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize, 'an unchanged file was uploaded again')
+    assert(requests["#{TOKEN_ONYX} upload_asset"] == before_authorize, 'an unchanged file was uploaded again')
     assert(requests["#{TOKEN_ONYX} save"] == before_save, 'an unchanged tree still emitted a save')
     assert(JSON.parse(out).dig('data', 'saved') == false, "got #{out}")
     assert(JSON.parse(out).dig('data', 'unchanged') == 2, "got #{out}")
@@ -2125,7 +2186,7 @@ check('push skips files already bound at the same digest and saves only what cha
     File.write(File.join(dir, 'two.js'), 'const two = 22')
     out, _err, code = run_cli('push', 'onyx', dir)
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
-    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize + 1, 'expected exactly one upload for one changed file')
+    assert(requests["#{TOKEN_ONYX} upload_asset"] == before_authorize + 1, 'expected exactly one upload for one changed file')
     keys = last_args['save']['changes'].map { |c| c['key'] }
     assert(keys == %w[assets/two.js], "got #{keys.inspect}")
   end
@@ -2136,11 +2197,11 @@ check('push falls back to uploading everything when the server has no batch asse
     File.write(File.join(dir, 'solo.js'), 'const solo = 1')
     run_cli('describe', 'onyx')
     fail_batch_read = true
-    before_authorize = requests["#{TOKEN_ONYX} media_authorize"]
+    before_authorize = requests["#{TOKEN_ONYX} upload_asset"]
 
     out, _err, code = run_cli('push', 'onyx', dir)
     assert(code == 0, "expected the push to survive a server with no batch read, got #{code}: #{out}")
-    assert(requests["#{TOKEN_ONYX} media_authorize"] == before_authorize + 1, 'expected the file to be uploaded anyway')
+    assert(requests["#{TOKEN_ONYX} upload_asset"] == before_authorize + 1, 'expected the file to be uploaded anyway')
     assert(last_args['save']['changes'].map { |c| c['key'] } == %w[assets/solo.js], "got #{last_args['save'].inspect}")
   end
 ensure

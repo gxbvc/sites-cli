@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.4.0'
+VERSION = '2.4.1'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
@@ -410,8 +410,12 @@ def parse_api_response(res)
 
   return [body, nil] if res.code.to_i.between?(200, 299)
 
-  [nil, api_error(body['message'] || body['error'] || "HTTP #{res.code}",
-                  code: (body['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: body)]
+  err = api_error(body['message'] || body['error'] || "HTTP #{res.code}",
+                  code: (body['error'] || "HTTP_#{res.code}").to_s, status: res.code.to_i, body: body)
+  wait = body['retry_after'] if body.is_a?(Hash)
+  wait = res['Retry-After'] if wait.nil?
+  err[:retry_after] = wait.to_f unless wait.nil?
+  [nil, err]
 end
 
 TOOLS_PATH = '/api/v1/tools'
@@ -434,6 +438,29 @@ def api_call(slug, tool, arguments, credential: nil, path: TOOLS_PATH)
   parse_api_response(http_request(req, uri))
 rescue *NETWORK_ERRORS => e
   [nil, api_error("#{tool} request failed: #{e.class}: #{e.message}", code: 'HTTP_ERROR')]
+end
+
+# The tools door rate-limits writes (30 starts/minute). The REST media door
+# never did, so a first push of many new files used to just work and now 429s
+# unless we wait. Cap the retries so a stuck limiter cannot hang the command.
+RATE_LIMIT_ATTEMPTS = 6
+DEFAULT_RETRY_AFTER = 5
+
+def retry_after_seconds(err)
+  wait = err[:retry_after]
+  wait = err.dig(:body, 'retry_after') if wait.nil? && err[:body].is_a?(Hash)
+  wait.nil? ? DEFAULT_RETRY_AFTER : wait.to_f
+end
+
+def api_call_retrying_rate_limit(slug, tool, arguments, credential: nil, path: TOOLS_PATH)
+  attempts = 0
+  loop do
+    data, err = api_call(slug, tool, arguments, credential: credential, path: path)
+    return [data, err] unless err && err[:status] == 429
+    attempts += 1
+    return [nil, err] if attempts >= RATE_LIMIT_ATTEMPTS
+    sleep retry_after_seconds(err)
+  end
 end
 
 # -----------------------------------------------------------------------------
@@ -472,7 +499,7 @@ end
 # snapshot token it read under the same `branch`/`expected` keys, so caching it
 # would hand the next `save` a token for a snapshot nobody is on.
 def tool_call(slug, tool, arguments, credential: nil, remember: true, path: TOOLS_PATH)
-  data, err = api_call(slug, tool, arguments, credential: credential, path: path)
+  data, err = api_call_retrying_rate_limit(slug, tool, arguments, credential: credential, path: path)
   if err
     note_if_server_predates_round2(tool, arguments, err)
     return fail_with(err)
@@ -1043,6 +1070,9 @@ PART_MAX_ATTEMPTS = 3
 UPLOAD_CONCURRENCY = 4
 UPLOAD_POLL_TIMEOUT = 300
 UPLOAD_POLL_INTERVAL = 1
+# Versioned complete_upload polls sleep this when the body has no retry_after.
+# 5 s keeps a 300 s poll at 12 calls/minute, under the tools write limiter.
+TOOL_UPLOAD_POLL_INTERVAL = 5
 
 # A personal token names the site in the JSON body, the same field the tools
 # envelope carries. GET and DELETE have no body, so there it rides in the
@@ -1083,15 +1113,14 @@ rescue *NETWORK_ERRORS => e
   api_error("upload PUT failed: #{e.class}: #{e.message}", code: 'UPLOAD_FAILED')
 end
 
-# The whole authorize -> stage -> complete -> poll flow for one file. `target`
-# carries either a legacy {label:, expected_version:} or a versioned
-# {filename:, digest:}. Returns the final upload_status body.
+# Labeled REST upload for legacy `write_file --file`. Versioned upload / push
+# go through tool_upload (upload_asset / complete_upload) and never hit this.
 def media_upload(slug, file_path, content_type, target, credential:)
   byte_size = File.size(file_path)
   data, err = media_api_call(slug, :post, '/api/v1/media/uploads',
                              target.merge(content_type: content_type, byte_size: byte_size), credential: credential)
   return [nil, err] if err
-  upload_id = data['id']
+  upload_id = data['upload_id'] || data['id']
 
   # The platform is content addressed, so when it already holds these bytes
   # authorize answers `ready` with the blob URL and no upload_url at all. That
@@ -1150,7 +1179,7 @@ def cmd_write_file_upload(slug, path, file_path, expected_version)
                            { label: path, expected_version: version }, credential: credential_for(slug))
   return fail_with(err) if err
 
-  remember_version(slug, path, data['id'].to_s)
+  remember_version(slug, path, (data['upload_id'] || data['id']).to_s)
   success(data)
 end
 
@@ -1159,7 +1188,8 @@ end
 # retried independently (PART_MAX_ATTEMPTS each, a fresh presign every
 # attempt so an expired one just renews), at most one part's bytes
 # (part_size, 16 MiB) resident per worker regardless of total file size.
-def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, credential:)
+# `via: :tools` presigns through upload_asset; `:rest` is the labeled path.
+def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, credential:, via: :rest)
   total_size = File.size(file_path)
   queue = Queue.new
   (1..parts_count).each { |n| queue << n }
@@ -1175,7 +1205,7 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, crede
         mutex.synchronize { break if first_error }
 
         etag, err = begin
-          upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential: credential)
+          upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential: credential, via: via)
         rescue StandardError => e
           [nil, api_error("part #{part_number} raised #{e.class}: #{e.message}", code: 'PART_UPLOAD_FAILED')]
         end
@@ -1195,15 +1225,21 @@ def upload_video_parts(slug, upload_id, file_path, parts_count, part_size, crede
   [ results, nil ]
 end
 
-def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential:)
+def upload_one_part(slug, upload_id, file_path, part_number, part_size, total_size, credential:, via: :rest)
   offset = (part_number - 1) * part_size
   length = [ part_size, total_size - offset ].min
 
   attempts = 0
   loop do
     attempts += 1
-    presign, err = media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts",
-                                  { part_numbers: [ part_number ] }, credential: credential)
+    presign, err = if via == :tools
+      api_call_retrying_rate_limit(slug, 'upload_asset',
+                                   { 'upload_id' => upload_id, 'part_numbers' => [ part_number ] },
+                                   credential: credential)
+    else
+      media_api_call(slug, :post, "/api/v1/media/uploads/#{upload_id}/parts",
+                     { part_numbers: [ part_number ] }, credential: credential)
+    end
     return [ nil, err ] if err
 
     part_url = presign.dig('parts', 0, 'upload_url')
@@ -1226,6 +1262,57 @@ def put_part(upload_url, file_path, offset, length)
   res.code.to_i.between?(200, 299) ? res['etag'] : nil
 rescue *NETWORK_ERRORS
   nil
+end
+
+# Versioned authorize -> PUT -> complete -> poll, through POST /api/v1/tools.
+# Digest is always sent. A part failure returns the error; the hourly server
+# job aborts abandoned multipart rows -- this CLI does not DELETE.
+def tool_upload(slug, file_path, content_type, digest, credential:)
+  byte_size = File.size(file_path)
+  data, err = api_call_retrying_rate_limit(slug, 'upload_asset', {
+    'filename' => File.basename(file_path),
+    'content_type' => content_type,
+    'byte_size' => byte_size,
+    'digest' => digest
+  }, credential: credential)
+  return [nil, err] if err
+  upload_id = data['upload_id'] || data['id']
+
+  return [data.merge('deduplicated' => true), nil] if data['status'] == 'ready'
+
+  if data['multipart']
+    parts, part_err = upload_video_parts(slug, upload_id, file_path, data['parts_count'], data['part_size'],
+                                         credential: credential, via: :tools)
+    return [nil, part_err] if part_err
+    complete_args = { 'upload_id' => upload_id, 'parts' => parts }
+  elsif data['upload_url'].to_s.empty?
+    return [nil, api_error("authorize for #{File.basename(file_path)} answered status " \
+                           "#{data['status'].inspect} with no upload_url and no multipart plan, so there is " \
+                           'nowhere to send the bytes', code: 'UPLOAD_UNEXPECTED', body: data)]
+  else
+    put_err = put_upload(data['upload_url'], file_path, content_type, byte_size)
+    return [nil, put_err] if put_err
+    complete_args = { 'upload_id' => upload_id }
+  end
+
+  data, err = api_call_retrying_rate_limit(slug, 'complete_upload', complete_args, credential: credential)
+  return [nil, err] if err
+
+  deadline = Time.now + UPLOAD_POLL_TIMEOUT
+  until %w[ready failed].include?(data['status'])
+    return [nil, api_error("upload #{upload_id} still #{data['status']} after #{UPLOAD_POLL_TIMEOUT}s", code: 'UPLOAD_TIMEOUT', body: data)] if Time.now >= deadline
+    wait = data['retry_after']
+    sleep(wait.nil? ? TOOL_UPLOAD_POLL_INTERVAL : wait.to_f)
+    data, err = api_call_retrying_rate_limit(slug, 'complete_upload', { 'upload_id' => upload_id }, credential: credential)
+    return [nil, err] if err
+  end
+
+  unless data['status'] == 'ready'
+    return [nil, api_error(data['error'] || 'upload verification failed',
+                           code: (data['error_code'] || 'UPLOAD_FAILED').to_s, body: data)]
+  end
+
+  [data, nil]
 end
 
 # -----------------------------------------------------------------------------
@@ -1278,10 +1365,9 @@ end
 def upload_one_file(slug, file_path, credential:)
   content_type = content_type_for(file_path)
   digest = sha256_file(file_path)
-  # `label` is omitted on a versioned site: bytes are bound to a logical path
-  # later by `save`, not now. `digest` is the type-conflict hint slice B added.
-  data, err = media_upload(slug, file_path, content_type,
-                           { filename: File.basename(file_path), digest: digest }, credential: credential)
+  # Versioned bytes are bound to a logical path later by `save`, not now.
+  # `digest` is required: the tools door verifies the bytes hash to it.
+  data, err = tool_upload(slug, file_path, content_type, digest, credential: credential)
   if err
     return { path: file_path, status: 'failed', code: err[:code], error: err[:error],
              http_status: err[:status], body: err[:body] }.compact
@@ -2747,7 +2833,7 @@ SUBCOMMANDS = [
   [%w[create-site], 'SLUG --name NAME', 'create_site', 'draft + GXB staff', 'platform'],
   [%w[platform-tools], '', 'GET /api/v1/platform/tools', 'none', 'platform'],
   [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
-  [%w[upload], 'SLUG FILE [FILE...]', 'POST /api/v1/media/uploads', 'draft', 'v2'],
+  [%w[upload], 'SLUG FILE [FILE...]', 'upload_asset + complete_upload', 'draft', 'v2'],
   [%w[push], 'SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]', 'read + upload xN + save', 'draft', 'v2'],
   [%w[fragment], 'FILE|- [--page KEY] [--append-changes FILE] [--wrap-body] [--lift-json-ld]', '--', 'none', 'none'],
   [%w[validate-config], 'FILE --site SLUG', 'read {kind: schema}', 'read', 'v2'],
