@@ -553,6 +553,29 @@ bytes are static and cannot vary by request header).
 - 126 Spanish routes of one real client site could not be represented before
   this existed (`pc_eede8112`); this is that decision, recorded.
 
+## Posts, llms.txt and analytics (plan 48)
+
+Nothing here needs a flag; it is what the server builds from documents you
+already send.
+
+- A page with `metadata.published_at` is an article. Its `.md` gets
+  `By A and B. Published 2026-03-04.` under the title, from
+  `metadata.author` and `metadata.published_at`. `author` is a name or a list
+  of names (at most 10); each name is its own JSON-LD `Person` and its own
+  `article:author`. A string like `"A & B"` is read as two people. Put it in
+  the `--metadata FILE` of `save --page`:
+  `{"title": "...", "author": ["Christian Genco", "Ricky Bureau"], "published_at": "2026-03-04"}`.
+- `llms.txt` links every listed page's `.md` (`/index.md` for `/`), and
+  `/llms-full.txt` is the `llms.txt` header plus the whole `.md` of each of
+  those pages. Noindex and unlisted pages are in neither. Check it on the
+  preview host after a save.
+- Every site has the analytics.gxb.vc beacon on its live pages, with a key the
+  platform mints and registers. `describe` shows `analytics.status` and the
+  analytics `site`; `analytics SLUG` reads it. Drop any beacon `<script>` from
+  imported HTML. Only staff can turn it off (`settings.analytics_disabled`).
+- `runtime.alpine: true` with `runtime.turbo: false` loads Alpine alone, with
+  no Turbo bytes.
+
 ## fragment, and save --page --html
 
 A versioned page is a JSON document whose `body` is a **fragment**: the shell
