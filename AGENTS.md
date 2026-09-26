@@ -378,7 +378,8 @@ in the body works but the build reports it as `json_ld_in_body`.
 |---|---|
 | put a page | `{op:"put", kind:"page", key:"/about", document:{format, metadata, body, css}}` |
 | put the config | `{op:"put", kind:"config", document:{...}}` -- no `key`, and a put **replaces** the whole document rather than merging |
-| put a redirect | `{op:"put", kind:"redirect", key:"/old", document:{to:"/new", status:301}}` (301, 302, 307 or 308) |
+| put a redirect | `{op:"put", kind:"redirect", key:"/old", document:{to:"/new", status:301}}` (301, 302, 307 or 308). `key` may end in `/*` (`/case-studies/*` matches everything below it, not the prefix itself); `to` may be an `https://` URL on any host and may carry `:splat`. The query string is kept. `guide SLUG redirects` |
+| serve a file at a fixed path | `config.public_files: {"/og-image.png": "assets/og.png", "/.well-known/...pem": "assets/key.pem"}` -- 200 with the bytes from the site's own host. `save SLUG --asset KEY FILE --public-file PATH KEY` adds the entry to the branch's current config. `guide SLUG public-files` |
 | put a collection | `{op:"put", kind:"collection", key:"blog", document:{name, path_prefix, layout, description, order, position}}` |
 | bind an asset | `{op:"put", kind:"asset", key:"assets/app.js", digest:"<sha256>"}` -- any site's digest works; one nobody has published is 422 `unknown_asset` |
 | **delete** | `{op:"delete", kind:"page", key:"/gone"}` -- destroys the row rather than moving live; repeating it is a 404, not a no-op |

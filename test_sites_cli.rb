@@ -256,6 +256,13 @@ server.mount_proc('/') do |req, res|
           res.status = 200
           res.body = JSON.generate(kind: 'guide', topics: %w[forms conventions])
         end
+      elsif args['kind'] == 'config'
+        # A config has no metadata/body halves; it comes back whole as
+        # `document`, which is what --public-file adds to.
+        res.status = 200
+        res.body = JSON.generate(kind: 'config', key: 'config', branch: branch, expected: expected,
+          digest: 'c' * 64, document: { name: 'Onyx', stylesheets: [ 'assets/site.css' ],
+                                        public_files: { '/favicon.ico' => 'assets/favicon.ico' } })
       elsif args['kind'] == 'prepared' && args['keys']
         case heads_shape
         when :missing
@@ -2948,6 +2955,48 @@ check('save mixes pages, a markdown page, a collection, a redirect, a delete and
     assert(changes[3]['document'] == { 'to' => '/new' }, "got #{changes[3].inspect}")
     assert(changes[5]['digest'] == Digest::SHA256.hexdigest('export const x = 1'), "got #{changes[5].inspect}")
   end
+end
+
+check('--public-file adds to the branch config it read, and saves against that read') do
+  run_cli('describe', 'onyx')
+  digest = 'b' * 64
+  out, _err, code = run_cli('save', 'onyx', '--asset', 'assets/og.png', digest,
+                            '--public-file', '/og-image.png', 'assets/og.png',
+                            '--public-file', '/.well-known/appspecific/com.tesla.3p.public-key.pem', 'assets/tesla.pem')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(last_args['read'] == { 'kind' => 'config', 'branch' => 'draft' }, "got #{last_args['read'].inspect}")
+  changes = last_args['save']['changes']
+  config = changes.find { |c| c['kind'] == 'config' }
+  assert(config && config['op'] == 'put', "no config put in #{changes.inspect}")
+  assert(config['document']['name'] == 'Onyx' && config['document']['stylesheets'] == [ 'assets/site.css' ],
+    "the rest of the config was not kept: #{config['document'].inspect}")
+  assert(config['document']['public_files'] == {
+    '/favicon.ico' => 'assets/favicon.ico', '/og-image.png' => 'assets/og.png',
+    '/.well-known/appspecific/com.tesla.3p.public-key.pem' => 'assets/tesla.pem' }, "got #{config['document'].inspect}")
+  assert(changes.any? { |c| c['kind'] == 'asset' && c['digest'] == digest }, "asset missing: #{changes.inspect}")
+end
+
+check('--public-file with --config FILE adds to that file and reads nothing') do
+  Dir.mktmpdir do |dir|
+    config = File.join(dir, 'config.json')
+    File.write(config, JSON.generate(name: 'From File'))
+    run_cli('describe', 'onyx')
+    last_args.delete('read')
+    out, _err, code = run_cli('save', 'onyx', '--config', config, '--public-file', '/og-image.png', 'assets/og.png')
+    assert(code == 0, "expected exit 0, got #{code}: #{out}")
+    assert(last_args['read'].nil?, "read the branch config anyway: #{last_args['read'].inspect}")
+    document = last_args['save']['changes'].find { |c| c['kind'] == 'config' }['document']
+    assert(document == { 'name' => 'From File', 'public_files' => { '/og-image.png' => 'assets/og.png' } }, "got #{document.inspect}")
+  end
+end
+
+check('--redirect passes a wildcard key and an https target through untouched') do
+  run_cli('describe', 'onyx')
+  run_cli('save', 'onyx', '--redirect', '/case-studies/*', '/projects', '--redirect', '/blog/*', 'https://example.org/:splat')
+  assert(last_args['save']['changes'] == [
+    { 'op' => 'put', 'kind' => 'redirect', 'key' => '/case-studies/*', 'document' => { 'to' => '/projects' } },
+    { 'op' => 'put', 'kind' => 'redirect', 'key' => '/blog/*', 'document' => { 'to' => 'https://example.org/:splat' } }
+  ], "got #{last_args['save']['changes'].inspect}")
 end
 
 check('--asset takes a bare sha256 as well as a file') do

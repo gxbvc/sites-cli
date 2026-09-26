@@ -2514,7 +2514,8 @@ end
 
 SAVE_DOCUMENT_FLAGS = {
   '--page' => 1, '--html' => 1, '--markdown' => 1, '--title' => 1, '--metadata' => 1,
-  '--config' => 1, '--collection' => 2, '--redirect' => 2, '--delete' => 2, '--asset' => 2
+  '--config' => 1, '--collection' => 2, '--redirect' => 2, '--delete' => 2, '--asset' => 2,
+  '--public-file' => 2
 }.freeze
 
 # Site::Versioned::OPS and Mcp::ToolRegistry::KINDS. Checked locally so a typo
@@ -2545,7 +2546,8 @@ def save_flag_usage(flag)
   { '--page' => '--page KEY', '--html' => '--html FILE', '--markdown' => '--markdown FILE',
     '--title' => '--title TEXT', '--metadata' => '--metadata FILE', '--config' => '--config FILE',
     '--collection' => '--collection KEY FILE', '--redirect' => '--redirect FROM TO',
-    '--delete' => '--delete KIND KEY', '--asset' => '--asset KEY FILE-or-DIGEST' }.fetch(flag, flag)
+    '--delete' => '--delete KIND KEY', '--asset' => '--asset KEY FILE-or-DIGEST',
+    '--public-file' => '--public-file PATH ASSET-KEY' }.fetch(flag, flag)
 end
 
 # A markdown page is its own body: no conversion, no shell to drop, and the
@@ -2573,11 +2575,12 @@ def load_object(file, what)
 end
 
 # rubocop:disable Metrics/AbcSize
-def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false)
+def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false, current_config: nil)
   pages = []
   items = []
   config_file = nil
   current = nil
+  public_files = {}
 
   taken.each do |flag, operands|
     case flag
@@ -2598,6 +2601,8 @@ def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false)
     when '--config'
       return [nil, api_error('save takes one --config document, not two', code: 'USAGE')] if config_file
       config_file = operands[0]
+    when '--public-file'
+      public_files[operands[0]] = operands[1]
     when '--collection', '--redirect', '--delete', '--asset'
       items << [flag.delete_prefix('--').to_sym, operands]
     end
@@ -2621,6 +2626,10 @@ def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false)
   changes = []
   config_change, err = build_config_change(config_file, pages)
   return [nil, err] if err
+  if public_files.any?
+    config_change, err = add_public_files(config_change, public_files, current_config)
+    return [nil, err] if err
+  end
   changes << config_change if config_change
 
   items.each do |type, payload|
@@ -2631,6 +2640,23 @@ def build_save_changes(taken, prefix:, wrap_body: false, lift_json_ld: false)
   [changes, nil]
 end
 # rubocop:enable Metrics/AbcSize
+
+# --public-file PATH ASSET-KEY (plan 48 in ~/projects/sites): config.public_files
+# serves an asset at a fixed path from the site's own host. A config put
+# replaces the whole document, so without a --config FILE the branch's current
+# config is read and the entries are added to it.
+def add_public_files(config_change, public_files, current_config)
+  unless config_change
+    return [nil, api_error('--public-file needs a --config FILE or a site to read the config from', code: 'USAGE')] unless current_config
+    document, err = current_config.call
+    return [nil, err] if err
+    config_change = { 'op' => 'put', 'kind' => 'config', 'document' => document }
+  end
+  document = config_change['document']
+  document['public_files'] = (document['public_files'] || {}).merge(public_files)
+  $stderr.puts("save: config.public_files now serves #{public_files.keys.join(', ')}")
+  [config_change, nil]
+end
 
 def render_save_item(type, payload)
   case type
@@ -2902,14 +2928,19 @@ def usage
       sites-cli save SLUG --page KEY --html FILE [--title T] [--metadata FILE]
                           [--markdown FILE] [--config FILE] [--collection KEY FILE]
                           [--redirect FROM TO] [--delete KIND KEY]
-                          [--asset KEY FILE-or-DIGEST] [--prefix assets/]
-                          [--wrap-body] [--lift-json-ld]
+                          [--asset KEY FILE-or-DIGEST] [--public-file PATH ASSET-KEY]
+                          [--prefix assets/] [--wrap-body] [--lift-json-ld]
                                             every document flag repeats and keeps its order,
                                             and the whole command is ONE changes array and one
                                             snapshot. --title/--metadata bind to the --page
                                             they follow. --dry-run validates and saves nothing.
                                             ops on one key apply in order; put omits css or
-                                            metadata to keep what the page has, null to clear it
+                                            metadata to keep what the page has, null to clear it.
+                                            --redirect FROM may end in /* and TO may be an
+                                            https URL or carry :splat (guide SLUG redirects).
+                                            --public-file serves ASSET-KEY at PATH from the
+                                            site's host, added to the branch's config (or to
+                                            --config FILE) (guide SLUG public-files)
       sites-cli fragment FILE|- [--page KEY] [--append-changes FILE] [--title T]
                                 [--prefix assets/] [--wrap-body]
                                 [--lift-json-ld]
@@ -3135,14 +3166,25 @@ def run_v2(command, argv)
       return fail_with(err) if err
       changes = loaded.is_a?(Hash) ? loaded['changes'] : loaded
     elsif taken.any?
-      built, err = build_save_changes(taken, prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld)
+      # --public-file edits the config the branch has now; the read's own
+      # head token is the save's CAS, so a config somebody changed in between
+      # is a 409 rather than silently overwritten.
+      read_config = lambda do
+        data, read_err = api_call(slug, 'read', base.slice('site').merge('kind' => 'config', 'branch' => branch))
+        return [nil, read_err] if read_err
+        expected_flag ||= data['expected']
+        [data['document'].is_a?(Hash) ? data['document'] : {}, nil]
+      end
+      built, err = build_save_changes(taken, prefix: prefix, wrap_body: wrap_body, lift_json_ld: lift_json_ld,
+                                      current_config: read_config)
       return fail_with(err) if err
       changes = built
     end
     unless changes.is_a?(Array)
       return failure('save requires --changes FILE|- (a JSON array of change objects), or document flags: ' \
                      '--page KEY --html FILE, --markdown FILE, --config FILE, --collection KEY FILE, ' \
-                     '--redirect FROM TO, --delete KIND KEY, --asset KEY FILE-or-DIGEST, repeatable and ' \
+                     '--redirect FROM TO, --delete KIND KEY, --asset KEY FILE-or-DIGEST, ' \
+                     '--public-file PATH ASSET-KEY, repeatable and ' \
                      'in any combination',
                      code: 'USAGE')
     end
