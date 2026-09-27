@@ -2856,6 +2856,7 @@ SUBCOMMANDS = [
   [%w[members], 'SLUG', 'list_members', 'manage_access', 'both'],
   [%w[grant], 'SLUG --email EMAIL|--auth-user-id ID --role viewer|editor|admin [--read-submissions]', 'grant_access', 'manage_access', 'both'],
   [%w[revoke], 'SLUG --email EMAIL|--auth-user-id ID --yes', 'revoke_access', 'manage_access', 'both'],
+  [%w[webhook-secret], 'SLUG [--rotate]', 'webhook_secret', 'manage_access', 'v2'],
   [%w[create-site], 'SLUG --name NAME', 'create_site', 'draft + GXB staff', 'platform'],
   [%w[platform-tools], '', 'GET /api/v1/platform/tools', 'none', 'platform'],
   [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
@@ -2997,6 +2998,7 @@ def usage
       grant SLUG --auth-user-id UUID --role viewer [--read-submissions]
       revoke SLUG --email EMAIL --yes              Remove this site's explicit grant
       Grants preserve existing rights. Repeating a grant is a no-op. No email is sent.
+      webhook-secret SLUG [--rotate]               Form webhook signing secret (read, or replace)
 
     Platform tools (a personal token, POST /api/v1/platform/tools):
       sites-cli list-sites                       every site you can read
@@ -3458,6 +3460,20 @@ def run(argv)
     return failure("unexpected arguments: #{argv.join(' ')}", code: 'USAGE') unless argv.empty?
     tool = { 'members' => 'list_members', 'grant' => 'grant_access', 'revoke' => 'revoke_access' }.fetch(command)
     return tool_call(slug, tool, base)
+
+  # The key config.forms.<name>.webhook deliveries are signed with (Sites
+  # plan 50). Reading mints it on first use; --rotate replaces it, and the
+  # receiving app has to be given the new value.
+  when 'webhook-secret'
+    slug = argv.shift
+    return failure('webhook-secret requires SLUG', code: 'USAGE') unless slug && !slug.start_with?('--')
+    base, err = json_arguments(argv)
+    return fail_with(err) if err
+    base['rotate'] = true if flag?(argv, '--rotate')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return failure("unexpected arguments: #{argv.join(' ')}", code: 'USAGE') unless argv.empty?
+    return tool_call(slug, 'webhook_secret', base)
 
   when 'list-sites'
     base, err = json_arguments(argv)

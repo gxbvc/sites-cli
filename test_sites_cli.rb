@@ -381,6 +381,9 @@ server.mount_proc('/') do |req, res|
     when 'list_sites'
       res.status = 200
       res.body = JSON.generate(sites: [ { slug: 'onyx', name: 'Onyx', versioned: true } ])
+    when 'webhook_secret'
+      res.status = 200
+      res.body = JSON.generate(site: payload['site'] || 'onyx', secret: 'whsec_test', rotated: args['rotate'] == true)
     when 'list_members', 'grant_access', 'revoke_access'
       res.body = JSON.generate(site: payload['site'] || 'onyx', changed: true, arguments: args)
     when 'list_submissions'
@@ -1370,6 +1373,24 @@ check('access commands send exact selectors and search through the shared API') 
   out, _err, code = run_cli('revoke', 'tap', '--email', 'dirk@example.com', '--yes', env: env)
   assert(code == 0, out)
   assert(last_args['revoke_access'] == { 'email' => 'dirk@example.com' }, 'revoke shape wrong')
+end
+
+check('webhook-secret reads, rotates only when asked, and rejects stray arguments') do
+  env = { 'SITES_CLI_TOKEN' => TOKEN_USER }
+  out, _err, code = run_cli('webhook-secret', 'tap', env: env)
+  assert(code == 0, out)
+  assert(last_envelope['webhook_secret']['site'] == 'tap', 'wrong site')
+  assert(last_args['webhook_secret'] == {}, 'a read must not rotate')
+  assert(out.include?('whsec_test'), out)
+  out, _err, code = run_cli('webhook-secret', 'tap', '--rotate', env: env)
+  assert(code == 0, out)
+  assert(last_args['webhook_secret'] == { 'rotate' => true }, 'rotate lost')
+  before = requests.values.sum
+  [ ['webhook-secret'], ['webhook-secret', 'tap', '--rotat'], ['webhook-secret', 'tap', 'extra'] ].each do |args|
+    out, _err, code = run_cli(*args, env: env)
+    assert(code == 1, out)
+  end
+  assert(requests.values.sum == before, 'a usage error reached the server')
 end
 
 check('access commands reject ambiguous selectors and unconfirmed revocation locally') do

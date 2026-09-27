@@ -56,6 +56,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `members SLUG` | `list_members` | manage_access | both |
 | `grant SLUG --email EMAIL\|--auth-user-id ID --role viewer\|editor\|admin [--read-submissions]` | `grant_access` | manage_access | both |
 | `revoke SLUG --email EMAIL\|--auth-user-id ID --yes` | `revoke_access` | manage_access | both |
+| `webhook-secret SLUG [--rotate]` | `webhook_secret` | manage_access | v2 |
 | `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
 | `platform-tools` | `GET /api/v1/platform/tools` | none | platform |
 | `tools SLUG` | `GET /api/v1/tools` | none | both |
@@ -469,6 +470,16 @@ element -- `--add-form-result` is gone with it.
 successful plain-HTML POST is a 303 there instead of the platform's own
 success page (the JSON contract for a `fetch` caller is unchanged either way).
 The build warns `redirect_missing_page` when the snapshot has no such route.
+
+`config.forms.<name>.webhook: {"url": "https://..."}` sends each accepted
+submission, as signed JSON, from the Sites server to that URL (Sites plan 50),
+so a site's own app can act on it without a cross-site POST. A preview-host
+POST is delivered too, marked `"preview": true`, and still stores nothing.
+`sites-cli webhook-secret SLUG` prints the site's signing secret (minted on
+first read); `--rotate` replaces it. Both need `manage_access`. The payload,
+headers, retry rules and a Ruby receiver that checks the signature are in
+`sites-cli guide SLUG forms`. `list-submissions` shows each row's `webhook`
+status, attempts and last HTTP status or error.
 
 A submission whose scalar fields are all blank is rejected (422, not stored,
 not mailed) with an error naming what to fill in -- it used to go through
