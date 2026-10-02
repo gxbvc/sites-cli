@@ -69,6 +69,7 @@ fail_batch_read = false                        # a test arms this to play a pre-
 pending_changes = { 'pages' => { 'added' => %w[/about], 'changed' => %w[/] },
                     'collections' => { 'added' => %w[blog] } }
 archived_branches = []                         # branch names archive_branch has taken out of service
+no_listing_read = false                        # a test arms this to play a server without the keyless listing read
 no_guide_kind = false                          # a test arms this to play a pre-round-2 server
 heads_shape = :bulk                            # :bulk, :legacy (pre-round-2 single-route answer), or :missing
 authorized = {}                                # upload id => the authorize payload
@@ -238,6 +239,23 @@ server.mount_proc('/') do |req, res|
           res.status = 200
           res.body = JSON.generate(kind: 'asset', branch: branch, expected: expected,
             digests: digests, keys: args['keys'].size)
+        end
+      elsif args['key'].nil? && %w[page collection layout].include?(args['kind'])
+        # A kind with no key is the server's listing (pc_4ab84e17). A server
+        # from before it answers the 422 a missing route always got.
+        if no_listing_read
+          res.status = 422
+          res.body = JSON.generate(error: 'invalid_request', message: 'route must be a string')
+        else
+          listed = { 'page' => %w[/ /about /contact], 'collection' => %w[blog], 'layout' => %w[default] }
+          body = { kind: args['kind'], branch: branch, expected: expected,
+                   count: listed[args['kind']].size, keys: listed[args['kind']] }
+          if args['kind'] == 'page' && Array(args['fields']).include?('metadata')
+            body[:metadata] = { '/' => { 'title' => 'Home' }, '/about' => { 'title' => 'About', 'noindex' => true },
+                                '/contact' => { 'title' => 'Contact' } }
+          end
+          res.status = 200
+          res.body = JSON.generate(body)
         end
       elsif args['kind'] == 'guide'
         # round-2: prose generated from one Ruby constant, kind "guide". A
@@ -915,22 +933,13 @@ check('read --keys with a non-asset kind is refused before any request') do
   assert(requests.values.sum == before, 'a batch read of pages reached the server')
 end
 
-# pc_4ab84e17: `read SLUG page` with no KEY used to be a 422 from the server
-# with nothing to do about it. Now it is a local usage error that names the
-# command that actually answers "what routes does this site have".
-check('read page with no KEY names list-pages instead of asking the server') do
-  before = requests.values.sum
-  out, _err, code = run_cli('read', 'onyx', 'page')
-  assert(code == 1, 'expected a nonzero exit')
-  parsed = JSON.parse(out)
-  assert(parsed['code'] == 'USAGE', "expected USAGE, got #{out}")
-  assert(parsed['error'].include?('list-pages onyx'), "expected list-pages named, got #{parsed['error'].inspect}")
-  assert(requests.values.sum == before, 'a bare read page reached the server')
-end
-
-check('read page with no KEY but --branch passes the branch through to the list-pages hint') do
-  out, = run_cli('read', 'onyx', 'page', '--branch', 'seo')
-  assert(JSON.parse(out)['error'].include?('list-pages onyx --branch seo'), "got #{out}")
+# pc_4ab84e17: `read SLUG page` with no KEY is the server's listing now --
+# every route on the branch, unchanged ones included.
+check('read page with no KEY asks the server for the listing') do
+  out, _err, code = run_cli('read', 'onyx', 'page', '--branch', 'seo')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  assert(JSON.parse(out).dig('data', 'keys') == %w[/ /about /contact], "got #{out}")
+  assert(last_args['read'] == { 'kind' => 'page', 'branch' => 'seo' }, "got #{last_args['read'].inspect}")
 end
 
 check('read collection with a KEY is unaffected by the page-only usage check') do
@@ -1071,7 +1080,29 @@ end
 # round 2: list-pages, guide, heads, the version handshake
 # =============================================================================
 
-check('list-pages composes a listing out of describe_site\'s pending.changes plus one read per key') do
+check('list-pages lists every route from the server listing, unchanged ones included') do
+  before = requests["#{TOKEN_ONYX} describe_site"]
+  out, err, code = run_cli('list-pages', 'onyx')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  data = JSON.parse(out)['data']
+  assert(data['pages'] == [ { 'key' => '/', 'title' => 'Home' }, { 'key' => '/about', 'title' => 'About' },
+                            { 'key' => '/contact', 'title' => 'Contact' } ], "got #{data['pages'].inspect}")
+  assert(data['collections'] == [ { 'key' => 'blog' } ], "got #{data['collections'].inspect}")
+  assert(err.include?('3 page(s), 1 collection(s)'), "got #{err.inspect}")
+  assert(!err.include?('pc_4ab84e17'), 'the old known-limitation note is gone')
+  assert(requests["#{TOKEN_ONYX} describe_site"] == before, 'no describe needed any more')
+end
+
+check('list-pages --metadata prints each page\'s whole metadata') do
+  out, = run_cli('list-pages', 'onyx', '--metadata')
+  about = JSON.parse(out)['data']['pages'].find { |p| p['key'] == '/about' }
+  assert(about['metadata'] == { 'title' => 'About', 'noindex' => true }, "got #{about.inspect}")
+end
+
+# The rest of this block plays a server without the listing read, where
+# list-pages falls back to composing describe_site's pending diff.
+check('list-pages falls back to describe_site\'s pending.changes plus one read per key on an older server') do
+  no_listing_read = true
   out, err, code = run_cli('list-pages', 'onyx')
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
   data = JSON.parse(out)['data']
@@ -1094,6 +1125,35 @@ end
 check('list-pages --branch is passed through to describe_site') do
   run_cli('list-pages', 'onyx', '--branch', 'seo')
   assert(last_args['describe_site'] == { 'branch' => 'seo' }, "got #{last_args['describe_site'].inspect}")
+  no_listing_read = false
+end
+
+# pc_100540cd: launching JIT took 32 hand-built patch_metadata changes.
+check('meta sends one patch_metadata whose key is the pattern, CAS from the listing read') do
+  head_before = branch_heads['draft']
+  out, _err, code = run_cli('meta', 'onyx', '*', '--unset', 'noindex', '--set', 'unlisted=false',
+                            '--set', 'author=Vincent Justice')
+  assert(code == 0, "expected exit 0, got #{code}: #{out}")
+  save = last_args['save']
+  assert(save['changes'] == [ { 'op' => 'patch_metadata', 'kind' => 'page', 'key' => '*',
+                                'set' => { 'unlisted' => false, 'author' => 'Vincent Justice' },
+                                'unset' => %w[noindex] } ], "got #{save['changes'].inspect}")
+  assert(save['branch'] == 'draft', "got #{save.inspect}")
+  assert(save['expected'] == head_before, "expected comes from the listing read, got #{save['expected']}")
+  assert(last_args['read'] == { 'kind' => 'page', 'branch' => 'draft' }, "got #{last_args['read'].inspect}")
+end
+
+check('meta needs a key and at least one --set or --unset') do
+  out, _err, code = run_cli('meta', 'onyx', '/blog/*')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "got #{code}: #{out}")
+  out, _err, code = run_cli('meta', 'onyx', '/', '--set', 'novalue')
+  assert(code == 1 && JSON.parse(out)['error'].include?('FIELD=VALUE'), "got #{code}: #{out}")
+end
+
+check('meta --dry-run and --kind pass through') do
+  run_cli('meta', 'onyx', '*', '--kind', 'layout', '--set', 'title=X', '--dry-run')
+  save = last_args['save']
+  assert(save['dry_run'] == true && save['changes'].first['kind'] == 'layout', "got #{save.inspect}")
 end
 
 check('guide with no topic lists topics as the raw envelope') do
@@ -1305,6 +1365,8 @@ check('wait-preview polls describe_site until the branch preview is ready') do
   out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
   assert(code == 0, "expected exit 0 on a ready preview, got #{code}: #{out}")
   assert(JSON.parse(out).dig('data', 'preview_status') == 'ready', "got #{out}")
+  # describe's own shape too, so one jq path reads either (pc_100540cd).
+  assert(JSON.parse(out).dig('data', 'branches').is_a?(Array), "expected describe's branches, got #{out}")
   assert(requests["#{TOKEN_ONYX} describe_site"] == before + 3, 'expected three polls, one per queued status')
 end
 

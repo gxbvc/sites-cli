@@ -31,7 +31,8 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `describe SLUG [PATH] [--branch B]` (alias: `describe_site`) | `describe_site` | read | both |
 | `read SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]` | `read` | read | v2 |
 | `schema SLUG [config\|page\|collection\|redirect\|changes]` | `read {kind: schema}` | read | v2 |
-| `list-pages SLUG [--branch B]` | `describe_site + read xN` | read | v2 |
+| `list-pages SLUG [--branch B] [--metadata]` | `read {kind: page} + read {kind: collection}` | read | v2 |
+| `meta SLUG KEY\|PATTERN --set F=V... --unset F... [--kind page\|layout] [--branch B] [--dry-run]` | `save {patch_metadata}` | draft | v2 |
 | `guide SLUG [TOPIC] [--format text\|json]` | `read {kind: guide}` | read | v2 |
 | `heads SLUG ROUTE... [--branch B]` | `read {kind: prepared, keys}` | read | v2 |
 | `save SLUG --changes FILE \| --page KEY --html FILE ... [--dry-run]` | `save` | draft | v2 |

@@ -750,14 +750,71 @@ rescue *NETWORK_ERRORS => e
 end
 
 # -----------------------------------------------------------------------------
-# list-pages: there is no dedicated route-listing tool yet (pc_4ab84e17: "I
-# recovered them from build diagnostics"). This composes one out of
-# describe_site's own `pending.changes` -- the same map_diff against live
-# `diff` reports -- plus one `read` per key it names, for format/title/digest.
-# A branch that already matches live (published, nothing pending) has nothing
-# pending to name, so it lists nothing; that gap is said on stderr rather than
-# hidden, because it is a real limit of composing this from existing surfaces,
-# not a bug in the composition.
+# list-pages: `read {kind: page}` with no key lists every route on the
+# branch, unchanged ones included, and fields: [metadata] brings each page's
+# metadata in the same call (pc_4ab84e17). `read {kind: collection}` lists the
+# collections. --metadata prints each page's whole metadata, which is how to
+# see which routes a `meta` pattern will touch.
+#
+# A server from before that read answers 422 to a page read with no key; then
+# this falls back to the old composition below, which can only see what
+# differs from live.
+# -----------------------------------------------------------------------------
+def cmd_list_pages(slug, branch, with_metadata: false)
+  args = { 'kind' => 'page', 'fields' => %w[metadata] }
+  args['branch'] = branch if branch
+  data, err = api_call(slug, 'read', args)
+  return cmd_list_pending_pages(slug, branch) if err && err[:status] == 422
+  return fail_with(err) if err
+  remember_branch_state(slug, data)
+
+  metadata = data['metadata'].is_a?(Hash) ? data['metadata'] : {}
+  pages = Array(data['keys']).map do |key|
+    entry = { 'key' => key, 'title' => metadata.dig(key, 'title') }.compact
+    with_metadata ? entry.merge('metadata' => metadata[key] || {}) : entry
+  end
+  listed, collection_err = api_call(slug, 'read', args.except('fields').merge('kind' => 'collection'))
+  collections = collection_err ? [] : Array(listed['keys']).map { |key| { 'key' => key } }
+
+  $stderr.puts("list-pages: #{pages.size} page(s), #{collections.size} collection(s) on #{data['branch']}")
+  success('site' => slug, 'branch' => data['branch'], 'expected' => data['expected'],
+          'pages' => pages, 'collections' => collections)
+end
+
+# meta: --set FIELD=VALUE reads VALUE as JSON when it parses (true, false,
+# null, 3, "quoted", [..], {..}) and as a plain string otherwise, so
+# `--set noindex=true` is a boolean and `--set author=Vincent` a string.
+def meta_change(kind, key, sets, unsets)
+  set = {}
+  sets.each do |pair|
+    field, value = pair.split('=', 2)
+    return [nil, api_error("--set takes FIELD=VALUE, got #{pair.inspect}", code: 'USAGE')] if value.nil? || field.empty?
+    set[field] = begin
+      JSON.parse(value)
+    rescue JSON::ParserError
+      value
+    end
+  end
+  change = { 'op' => 'patch_metadata', 'kind' => kind, 'key' => key }
+  change['set'] = set if set.any?
+  change['unset'] = unsets if unsets.any?
+  [change, nil]
+end
+
+# The listing read answers the branch head, which is the CAS a one-change save
+# wants, so `meta` needs no describe first. A server without the listing read
+# falls back to what this CLI last remembered.
+def meta_expected(slug, kind, branch)
+  data, err = api_call(slug, 'read', { 'kind' => kind, 'branch' => branch })
+  return resolve_expected(slug, branch, nil) if err && err[:status] == 422
+  return [nil, err] if err
+  [data['expected'], nil]
+end
+
+# The pre-listing composition: describe_site's own `pending.changes` -- the
+# same map_diff against live `diff` reports -- plus one `read` per key it
+# names. A route unchanged since the last publish is invisible to it, which
+# stderr says.
 # -----------------------------------------------------------------------------
 # `read`'s `kind` is singular ("page", "collection"); the namespaces
 # map_diff groups `changes` under (SiteSnapshot::NAMESPACES) are plural
@@ -765,7 +822,7 @@ end
 # would silently get wrong and read zero keys from a branch full of them.
 LISTABLE_NAMESPACES = { 'page' => 'pages', 'collection' => 'collections' }.freeze
 
-def cmd_list_pages(slug, branch)
+def cmd_list_pending_pages(slug, branch)
   args = {}
   args['branch'] = branch if branch
   data, err = api_call(slug, 'describe_site', args)
@@ -800,7 +857,7 @@ def cmd_list_pages(slug, branch)
 
   $stderr.puts("list-pages: #{pages.size} page(s), #{collections.size} collection(s) -- built from what " \
                "differs from live on #{resolved_branch}; a route unchanged since the last publish has no " \
-               'listing primitive yet (pc_4ab84e17) and will not appear here')
+               'listing read on this server yet (pc_4ab84e17) and will not appear here')
   success('site' => slug, 'branch' => resolved_branch, 'pages' => pages, 'collections' => collections)
 end
 
@@ -1616,13 +1673,17 @@ def cmd_wait_preview(slug, branch, timeout)
     # second describe people ran straight after it was for (pc_6280b825,
     # pc_f4d60acf): the head the build stored, whether the forms script is in
     # it, and the URL the shell said the page is canonically at.
-    payload = { 'site' => slug, 'branch' => branch, 'preview_status' => status,
-                'preview_url' => entry['preview_url'] || data['preview_url'],
-                'diagnostics' => entry['diagnostics'] || data['diagnostics'] || [],
-                'head_preview' => entry['head_preview'] || data['head_preview'],
-                'integrations' => entry['integrations'] || data['integrations'],
-                'canonical_url' => data['canonical_url'] || entry['canonical_url'],
-                'review' => entry['review'] }
+    #
+    # It answers in describe's own shape, with the selected branch's summary
+    # on top, so one jq path (`.data.branches[]`, `.data.live`) reads either
+    # command's output (pc_100540cd).
+    payload = data.merge('site' => slug, 'branch' => branch, 'preview_status' => status,
+                         'preview_url' => entry['preview_url'] || data['preview_url'],
+                         'diagnostics' => entry['diagnostics'] || data['diagnostics'] || [],
+                         'head_preview' => entry['head_preview'] || data['head_preview'],
+                         'integrations' => entry['integrations'] || data['integrations'],
+                         'canonical_url' => data['canonical_url'] || entry['canonical_url'],
+                         'review' => entry['review'])
 
     return success(payload) if status == 'ready'
     return success(payload.merge('message' => PROVISIONING_NOTE)) if status == 'provisioning'
@@ -2831,7 +2892,8 @@ SUBCOMMANDS = [
   [%w[describe describe_site], 'SLUG [PATH] [--branch B]', 'describe_site', 'read', 'both'],
   [%w[read], 'SLUG KIND [KEY] [--branch B] [--fields f] [--lines a,b] [--at SNAP] [--keys a,b]', 'read', 'read', 'v2'],
   [%w[schema], "SLUG [#{SCHEMA_PARTS.join('|')}]", 'read {kind: schema}', 'read', 'v2'],
-  [%w[list-pages], 'SLUG [--branch B]', 'describe_site + read xN', 'read', 'v2'],
+  [%w[list-pages], 'SLUG [--branch B] [--metadata]', 'read {kind: page} + read {kind: collection}', 'read', 'v2'],
+  [%w[meta], 'SLUG KEY|PATTERN --set F=V... --unset F... [--kind page|layout] [--branch B] [--dry-run]', 'save {patch_metadata}', 'draft', 'v2'],
   [%w[guide], 'SLUG [TOPIC] [--format text|json]', 'read {kind: guide}', 'read', 'v2'],
   [%w[heads], 'SLUG ROUTE... [--branch B]', 'read {kind: prepared, keys}', 'read', 'v2'],
   [%w[save], 'SLUG --changes FILE | --page KEY --html FILE ... [--dry-run]', 'save', 'draft', 'v2'],
@@ -2911,10 +2973,17 @@ def usage
       sites-cli schema SLUG [config|page|collection|redirect|changes]
       sites-cli validate-config FILE --site SLUG
                                             the fetched schema, run locally, before any write
-      sites-cli list-pages SLUG [--branch B]
-                                            routes with format, title, digest -- built from
-                                            describe_site's own pending diff, since there is
-                                            no dedicated listing tool yet (pc_4ab84e17)
+      sites-cli list-pages SLUG [--branch B] [--metadata]
+                                            every route on the branch with its title;
+                                            --metadata adds each page's whole metadata.
+                                            `read SLUG KIND` with no KEY lists any kind
+      sites-cli meta SLUG KEY|PATTERN [--set FIELD=VALUE]... [--unset FIELD]...
+                     [--kind page|layout] [--branch B] [--dry-run]
+                                            one patch_metadata save. PATTERN is "*" (every
+                                            key), "/*" (every page) or "/blog/*" (every page
+                                            below /blog). VALUE is JSON when it parses
+                                            (true, 3, "x"), else a string. Then publish.
+                                            e.g. meta jit '*' --unset noindex
       sites-cli guide SLUG [TOPIC] [--format text|json]
                                             prose the server generates from one Ruby
                                             constant, e.g. `guide SLUG forms`. No TOPIC
@@ -3112,13 +3181,8 @@ def run_v2(command, argv)
     # that are bound, which is how `push` skips files that have not changed.
     # `prepared` with --keys is the bulk head read `heads` wraps (round 2).
     return failure('--keys reads many assets or many prepared heads at once, so it only takes kind "asset" or "prepared"', code: 'USAGE') if keys.any? && !%w[asset prepared].include?(kind)
-    # A bare `read SLUG page` used to be a 422 invalid_key with nothing to do
-    # about it (pc_4ab84e17: "I recovered them from build diagnostics"). Name
-    # the command that actually answers "what routes does this site have".
-    if kind == 'page' && key.nil? && keys.empty?
-      return failure("read page needs a KEY (a route like / or /about) -- `sites-cli list-pages #{slug}" \
-                     "#{branch ? " --branch #{branch}" : ''}` lists the routes this CLI can see", code: 'USAGE')
-    end
+    # A bare `read SLUG page` (any kind but config, with no KEY) is the
+    # server's listing: every key of that kind on the branch (pc_4ab84e17).
 
     args = base.merge('kind' => kind)
     if keys.any?
@@ -3596,16 +3660,47 @@ def run(argv)
     return fail_with(flag_err) if flag_err
     return cmd_tools(slug)
 
-  # -- list-pages: composes a route listing out of describe_site's own pending
-  #    diff and one read per key, because there is no dedicated tool yet
+  # -- list-pages: every route on the branch, from the server's listing read
   #    (pc_4ab84e17) --
   when 'list-pages'
     slug = argv.shift
     return failure('list-pages requires SLUG', code: 'USAGE') unless slug
     branch = opt(argv, '--branch')
+    with_metadata = flag?(argv, '--metadata')
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
-    return cmd_list_pages(slug, branch)
+    return cmd_list_pages(slug, branch, with_metadata: with_metadata)
+
+  # -- meta: one patch_metadata change. KEY may be a pattern the server
+  #    expands to every matching key on the branch ("*", "/*", "/blog/*"), so
+  #    one command sets or unsets any metadata field across a site
+  #    (pc_100540cd) --
+  when 'meta'
+    slug = argv.shift
+    branch = opt(argv, '--branch') || DEFAULT_BRANCH
+    kind = opt(argv, '--kind') || 'page'
+    sets = opt_all(argv, '--set')
+    unsets = split_list(opt_all(argv, '--unset'))
+    message = opt(argv, '--message')
+    dry_run = flag?(argv, '--dry-run')
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+
+    key = argv.shift
+    unless slug && key && (sets.any? || unsets.any?)
+      return failure('meta requires SLUG KEY-OR-PATTERN and at least one --set FIELD=VALUE or --unset FIELD',
+                     code: 'USAGE')
+    end
+    change, err = meta_change(kind, key, sets, unsets)
+    return fail_with(err) if err
+    expected, err = meta_expected(slug, kind, branch)
+    return fail_with(err) if err
+
+    args = { 'branch' => branch, 'expected' => expected, 'idempotency_key' => SecureRandom.uuid,
+             'changes' => [change] }
+    args['message'] = message if message
+    args['dry_run'] = true if dry_run
+    return tool_call(slug, 'save', args, remember: !dry_run)
 
   # -- guide: prose that used to live only in AGENTS.md (which drifts) is now
   #    a server resource too, read {kind: guide}. No topic lists topics --
