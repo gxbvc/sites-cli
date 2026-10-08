@@ -55,7 +55,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `list-sites [SLUG] [--search QUERY]` | `list_sites` | read | platform, or a site door with SLUG |
 | `users [--search QUERY] [--cursor ID]` | `search_users` | manage_access + GXB staff | platform |
 | `members SLUG` | `list_members` | manage_access | both |
-| `grant SLUG --email EMAIL\|--auth-user-id ID --role viewer\|editor\|admin [--read-submissions]` | `grant_access` | manage_access | both |
+| `grant SLUG --email EMAIL\|--auth-user-id ID --role viewer\|editor\|publisher\|admin [--read-submissions]` | `grant_access` | manage_access | both |
 | `revoke SLUG --email EMAIL\|--auth-user-id ID --yes` | `revoke_access` | manage_access | both |
 | `webhook-secret SLUG [--rotate]` | `webhook_secret` | manage_access | v2 |
 | `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
