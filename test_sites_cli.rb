@@ -2706,6 +2706,26 @@ check('fragment lifts a local classic script in <head> into config.scripts inste
   end
 end
 
+check('fragment moves same-origin head scripts into the body without dropping them') do
+  html = '<html><head><script src="/js/app-v3.js" defer></script>' \
+         '<script src="/assets/gxb-c0d5921b.js" defer></script>' \
+         '<script src="https://third.party/x.js"></script></head>' \
+         '<body><p>hi</p></body></html>'
+  with_page_file(html) do |_dir, path|
+    out, err, code = run_cli('fragment', path)
+    assert(code.zero?, "expected exit 0: #{out}")
+    data = JSON.parse(out)['data']
+    body = data['body']
+    assert(body.include?('<script src="/js/app-v3.js" defer></script>'), "same-origin head script lost: #{body}")
+    assert(body.include?('<script src="/assets/gxb-c0d5921b.js" defer></script>'), "platform head script lost: #{body}")
+    assert(body.index('/js/app-v3.js') < body.index('<p>hi</p>'), "head scripts should precede the page: #{body}")
+    assert(Array(data['config']['scripts']).empty?,
+           "root-relative scripts must not become config scripts: #{data['config']}")
+    assert(!err.include?('third-party script(s) in <head> went with the head: /'), "same-origin script warned: #{err}")
+    assert(err.include?('https://third.party/x.js'), "external head script was not warned: #{err}")
+  end
+end
+
 check('fragment preserves the platform script and same-origin page scripts') do
   html = '<!doctype html><html><head><title>Gateway</title></head><body>' \
          '<main><script src="/assets/gxb-c0d5921b.js" defer></script>' \
@@ -2926,15 +2946,15 @@ end
 # -- save --page --html --config ----------------------------------------------
 
 check('save --page --html keeps platform and same-origin scripts; --changes skips conversion') do
-  html = '<!doctype html><html><head><title>Gateway</title></head><body>' \
-         '<main><script src="/assets/gxb-c0d5921b.js" defer></script>' \
-         '<script src="/js/app-v3.js" defer></script></main></body></html>'
+  html = '<!doctype html><html><head><title>Gateway</title>' \
+         '<script src="/assets/gxb-c0d5921b.js" defer></script>' \
+         '<script src="/js/app-v3.js" defer></script></head><body><main><p>Hi</p></main></body></html>'
   with_page_file(html) do |dir, path|
     _out, err, code = run_cli('save', 'onyx', '--page', '/', '--html', path)
     assert(code == 0, "save failed: #{err}")
     body = last_args['save']['changes'][0]['document']['body']
     assert(body.include?('/assets/gxb-c0d5921b.js') && body.include?('/js/app-v3.js'), "scripts changed: #{body}")
-    assert(body.start_with?('<div>'), "source main did not become a div inside the shell main: #{body}")
+    assert(body.include?('<div><p>Hi</p></div>'), "source main did not become a div inside the shell main: #{body}")
     assert(!err.include?('third-party script'), "same-origin scripts warned: #{err}")
 
     changes = File.join(dir, 'raw.json')

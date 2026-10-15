@@ -2429,6 +2429,17 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
     (rel & %w[stylesheet icon preconnect preload dns-prefetch manifest]).any? ? '' : tag
   end
 
+  # The head is discarded. Preserve same-origin scripts that do not have an
+  # asset binding (for example public_files and platform gxb.js) in the body.
+  head_scripts_to_keep = head.scan(SCRIPT_TAG).filter_map do |tag, inner|
+    src = tag[/\bsrc=["']([^"']+)["']/i, 1]
+    next unless src&.start_with?('/') && !src.start_with?('//')
+    next if local_asset(src, prefix) || src.include?(ANALYTICS_HOST)
+
+    "#{tag}#{inner}</script>"
+  end
+  body = "#{head_scripts_to_keep.join("\n")}\n#{body}" if head_scripts_to_keep.any?
+
   head_scripts, body_scripts = [head, body].map do |markup|
     markup.scan(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/i).flatten
           .reject { |src| local_asset(src, prefix) || (src.start_with?('/') && !src.start_with?('//')) ||
