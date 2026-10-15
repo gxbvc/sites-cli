@@ -60,6 +60,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `webhook-secret SLUG [--rotate]` | `webhook_secret` | manage_access | v2 |
 | `create-site SLUG --name NAME` | `create_site` | draft + GXB staff | platform |
 | `platform-tools` | `GET /api/v1/platform/tools` | none | platform |
+| `describe-platform` | `describe_platform` | read | platform |
 | `tools SLUG` | `GET /api/v1/tools` | none | both |
 | `upload SLUG FILE [FILE...]` | `upload_asset + complete_upload` | draft | v2 |
 | `push SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]` | `read + upload xN + save` | draft | v2 |
@@ -592,10 +593,14 @@ already send.
 
 A versioned page is a JSON document whose `body` is a **fragment**: the shell
 owns `<!doctype>`, `<html>`, `<head>`, `<title>`, `<meta>`, the one import map
-and `<main id="main">`, and every asset reference is a `{{ asset:path }}` tag
-rather than a URL. A page authored as a standalone HTML file has to be taken
+and `<main id="main">`. Tenant asset references use `{{ asset:path }}` rather
+than a URL; the platform's `/assets/gxb-*.js` remains a same-origin URL.
+A page authored as a standalone HTML file has to be taken
 apart before it can be saved, and doing that by hand is how a site ends up with
-a duplicated `id="main"` or a stylesheet nothing loads.
+a duplicated `id="main"` or a stylesheet nothing loads. Conversion changes a source
+`<main>` to `<div>` because the shell already wraps the fragment in `<main id="main">`.
+To preserve the body exactly as authored, use `save SLUG --changes FILE` with
+raw page documents. This bypasses HTML conversion.
 
 `fragment FILE|- [--prefix assets/] [--page KEY] [--title T]
 [--append-changes FILE] [--wrap-body] [--lift-json-ld]`
@@ -635,7 +640,7 @@ sites-cli save onyx --changes /tmp/changes.json --message "twelve pages, one sna
 | `<style>` (head or body) | the page document's `css` |
 | `<a href="#main">` | dropped -- the shell emits its own skip link |
 | `<main id="main" class="x">` ... `</main>` | `<div class="x">` ... `</div>` |
-| `src`/`href`/`data-asset`/`poster`/`data-src` = `assets/x`, `./assets/x`, `/assets/x` | `{{ asset:assets/x }}` |
+| `src`/`href`/`data-asset`/`poster`/`data-src` = `assets/x`, `./assets/x`, `/assets/x` | `{{ asset:assets/x }}` except the platform's `/assets/gxb-*.js` and `.mjs`, which remain same-origin paths |
 
 Everything else is left alone, including the page's own inline `<script>`.
 Every line above is reported on stderr. **The warnings are the things that

@@ -525,6 +525,9 @@ server.mount_proc('/') do |req, res|
       case tool
       when 'search_users'
         res.body = JSON.generate(users: [{ auth_user_id: 'auth-uuid', name: 'Dirk', email: 'dirk@example.com' }], next_cursor: nil)
+      when 'describe_platform'
+        res.body = JSON.generate(modules: [{ key: 'gateway', state: 'approved hosts only' }],
+          guide: 'https://sites.gxb.vc/guides/app')
       when 'list_sites'
         res.status = 200
         res.body = JSON.generate(sites: [
@@ -1537,6 +1540,14 @@ check('platform-tools reads the two schemas from the server, not from this file'
   names = JSON.parse(out).dig('data', 'tools').map { |t| t['name'] }
   assert(names.sort == %w[create_site list_sites], "got #{names.inspect}")
   assert(requests["#{TOKEN_USER} platform:index"] == 1, 'expected a GET at the platform endpoint')
+end
+
+check('describe-platform calls describe_platform at the personal-token door') do
+  out, _err, code = run_cli('describe-platform', env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
+  assert(code == 0, "expected exit 0: #{out}")
+  assert(JSON.parse(out).dig('data', 'modules', 0, 'key') == 'gateway', "got #{out}")
+  assert(requests["#{TOKEN_USER} platform:describe_platform"] == 1, 'expected the platform POST')
+  assert(last_args['platform:describe_platform'] == {}, 'expected empty arguments')
 end
 
 check('create-site with no personal bearer refuses locally and names the runner command') do
@@ -2695,6 +2706,23 @@ check('fragment lifts a local classic script in <head> into config.scripts inste
   end
 end
 
+check('fragment preserves the platform script and same-origin page scripts') do
+  html = '<!doctype html><html><head><title>Gateway</title></head><body>' \
+         '<main><script src="/assets/gxb-c0d5921b.js" defer></script>' \
+         '<script src="/js/app-v3.js" defer></script><script src="//cdn.example.com/js.js"></script>' \
+         '</main></body></html>'
+  with_page_file(html) do |_dir, path|
+    out, err, code = run_cli('fragment', path)
+    assert(code == 0, "expected exit 0: #{out}")
+    body = JSON.parse(out).dig('data', 'body')
+    assert(body.include?('src="/assets/gxb-c0d5921b.js"'), "platform script changed: #{body}")
+    assert(body.include?('src="/js/app-v3.js"'), "same-origin script changed: #{body}")
+    assert(!body.include?('{{ asset:assets/gxb-'), "platform script became an asset: #{body}")
+    assert(!err.include?('third-party script(s) left in the body, which will load from someone else\'s origin on every page view: /js/'), "same-origin script called third-party: #{err}")
+    assert(err.include?('//cdn.example.com/js.js'), "external script was not warned: #{err}")
+  end
+end
+
 check('fragment rewrites every local assets/ reference to {{ asset: }} and leaves nothing of the shell') do
   with_page_file do |_dir, path|
     body = JSON.parse(run_cli('fragment', path).first).dig('data', 'body')
@@ -2896,6 +2924,27 @@ check('fragment leaves a body that is already a fragment alone, except for asset
 end
 
 # -- save --page --html --config ----------------------------------------------
+
+check('save --page --html keeps platform and same-origin scripts; --changes skips conversion') do
+  html = '<!doctype html><html><head><title>Gateway</title></head><body>' \
+         '<main><script src="/assets/gxb-c0d5921b.js" defer></script>' \
+         '<script src="/js/app-v3.js" defer></script></main></body></html>'
+  with_page_file(html) do |dir, path|
+    _out, err, code = run_cli('save', 'onyx', '--page', '/', '--html', path)
+    assert(code == 0, "save failed: #{err}")
+    body = last_args['save']['changes'][0]['document']['body']
+    assert(body.include?('/assets/gxb-c0d5921b.js') && body.include?('/js/app-v3.js'), "scripts changed: #{body}")
+    assert(body.start_with?('<div>'), "source main did not become a div inside the shell main: #{body}")
+    assert(!err.include?('third-party script'), "same-origin scripts warned: #{err}")
+
+    changes = File.join(dir, 'raw.json')
+    raw = [{ op: 'put', kind: 'page', key: '/', document: { format: 'html', metadata: { title: 'Raw' }, body: html } }]
+    File.write(changes, JSON.generate(raw))
+    _out, err, code = run_cli('save', 'onyx', '--changes', changes)
+    assert(code == 0, "raw save failed: #{err}")
+    assert(last_args['save']['changes'][0]['document']['body'] == html, 'raw --changes converted the source main')
+  end
+end
 
 check('save --page --html --config builds the two-change payload by itself') do
   with_page_file do |dir, path|

@@ -2137,6 +2137,8 @@ def collapse(text) = text.to_s.gsub(/\s+/, ' ').strip
 def local_asset(reference, prefix)
   path = reference.to_s.strip.sub(%r{\A\./}, '').sub(%r{\A/}, '')
   return nil if reference.to_s.match?(%r{\A[a-z][a-z0-9+.-]*://}i) || reference.to_s.start_with?('//')
+  # /assets/gxb-*.js is served by the platform, not bound in this site's snapshot.
+  return nil if reference.to_s.match?(%r{\A/assets/gxb-[a-z0-9-]+\.(?:js|mjs)\z}i)
   path.start_with?(prefix) ? path : nil
 end
 
@@ -2429,7 +2431,8 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
 
   head_scripts, body_scripts = [head, body].map do |markup|
     markup.scan(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/i).flatten
-          .reject { |src| local_asset(src, prefix) || src.include?(ANALYTICS_HOST) }.uniq
+          .reject { |src| local_asset(src, prefix) || (src.start_with?('/') && !src.start_with?('//')) ||
+                          src.include?(ANALYTICS_HOST) }.uniq
   end
   if head_scripts.any?
     warnings << "third-party script(s) in <head> went with the head: #{head_scripts.join(', ')}. The shell owns " \
@@ -2457,10 +2460,15 @@ def html_to_fragment(html, prefix: 'assets/', wrap_body: false, lift_json_ld: fa
   referenced = []
   pattern = /\b(#{ASSET_ATTRIBUTES.join('|')})=["'](?:\.?\/)?(#{Regexp.escape(prefix)}[^"'{}\s]*)["']/i
   body = body.gsub(pattern) do
+    original = Regexp.last_match(0)
     attribute = Regexp.last_match(1)
     path = Regexp.last_match(2)
-    referenced << path
-    %(#{attribute}="{{ asset:#{path} }}")
+    if original.match?(%r{=["']/assets/gxb-[a-z0-9-]+\.(?:js|mjs)["']\z}i)
+      original # Platform JS is served by this host, not bound as a tenant asset.
+    else
+      referenced << path
+      %(#{attribute}="{{ asset:#{path} }}")
+    end
   end
   referenced.uniq!
   notes << "rewrote #{referenced.size} reference(s) to {{ asset: }} (#{referenced.join(', ')})" if referenced.any?
@@ -2921,6 +2929,7 @@ SUBCOMMANDS = [
   [%w[webhook-secret], 'SLUG [--rotate]', 'webhook_secret', 'manage_access', 'v2'],
   [%w[create-site], 'SLUG --name NAME', 'create_site', 'draft + GXB staff', 'platform'],
   [%w[platform-tools], '', 'GET /api/v1/platform/tools', 'none', 'platform'],
+  [%w[describe-platform], '', 'describe_platform', 'read', 'platform'],
   [%w[tools], 'SLUG', 'GET /api/v1/tools', 'none', 'both'],
   [%w[upload], 'SLUG FILE [FILE...]', 'upload_asset + complete_upload', 'draft', 'v2'],
   [%w[push], 'SLUG DIR [--branch B] [--prefix P] [--dry-run] [--offline]', 'read + upload xN + save', 'draft', 'v2'],
@@ -3074,7 +3083,8 @@ def usage
       sites-cli list-sites                       every site you can read
       sites-cli list-sites SLUG                  ask through that site's door instead
       sites-cli create-site SLUG --name NAME     GXB staff only
-      sites-cli platform-tools                   the two schemas, from the server
+      sites-cli platform-tools                   the platform tool schemas, from the server
+      sites-cli describe-platform               module states and app guide, from the server
       sites-cli tools SLUG                       the site tools, from the server
 
     Every tool subcommand also takes --json FILE (or --json -) to supply the
@@ -3560,6 +3570,11 @@ def run(argv)
     flag_err = unknown_flags(argv, command)
     return fail_with(flag_err) if flag_err
     return cmd_platform_tools
+
+  when 'describe-platform'
+    flag_err = unknown_flags(argv, command)
+    return fail_with(flag_err) if flag_err
+    return platform_tool_call('_platform', 'describe_platform', {}, 'describe-platform')
 
   when 'create-site'
     base, err = json_arguments(argv)
