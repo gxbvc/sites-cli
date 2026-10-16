@@ -689,7 +689,7 @@ sites-cli save onyx --config ./config.json \
 | `--collection KEY FILE` | a `put collection` |
 | `--redirect FROM TO` | a `put redirect` |
 | `--delete KIND KEY` | a `delete` |
-| `--asset KEY FILE-or-DIGEST` | a `put asset`. A file is hashed locally; `save` binds digests and uploads nothing, so `upload` or `push` the bytes first |
+| `--asset KEY FILE-or-DIGEST` | a `put asset`. A file is hashed locally; `save` binds digests but does not upload bytes. Run `push` (or `upload`) first; an unseen digest fails with `unknown_asset` |
 
 `--changes FILE` still takes a raw array, and `--changes` together with the
 document flags is a usage error: one of them would have to win. `--dry-run`
@@ -931,7 +931,7 @@ still fails the check.
 | `SITES_CLI_TOKEN` | -- | personal bearer (`sk_user_...`): the platform tools, and the fallback for any slug with no site token |
 | `SITES_CLI_BROWSER` | `agent-browser` | the browser binary `check` drives |
 
-`--prod` on a runner command requires `kamal-cli` on PATH.
+`create` without `--prod` stops with a hint to use `create-site`, the versioned platform door. `create --prod` makes a legacy production site, not a versioned one, and requires `kamal-cli` on PATH.
 
 ## Testing
 

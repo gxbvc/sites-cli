@@ -1685,8 +1685,10 @@ def cmd_wait_preview(slug, branch, timeout)
                          'canonical_url' => data['canonical_url'] || entry['canonical_url'],
                          'review' => entry['review'])
 
-    return success(payload) if status == 'ready'
-    return success(payload.merge('message' => PROVISIONING_NOTE)) if status == 'provisioning'
+    $stderr.puts(payload['preview_url']) if payload['preview_url'] && !PREVIEW_PENDING.include?(status)
+    if status == 'ready' || status == 'provisioning'
+      return success(status == 'ready' ? payload : payload.merge('message' => PROVISIONING_NOTE))
+    end
 
     if PREVIEW_FAILED.include?(status)
       return failure("preview #{status} for #{slug}/#{branch}", code: status.upcase, body: payload)
@@ -1699,6 +1701,7 @@ def cmd_wait_preview(slug, branch, timeout)
                      code: status.nil? ? 'PREVIEW_MISSING' : 'PREVIEW_UNKNOWN', body: payload)
     end
     if Time.now >= deadline
+      $stderr.puts(payload['preview_url']) if payload['preview_url']
       return failure("preview still #{status} for #{slug}/#{branch} after #{timeout}s", code: 'PREVIEW_TIMEOUT', body: payload)
     end
 
@@ -2771,8 +2774,9 @@ def render_save_item(type, payload)
     elsif File.file?(value)
       # save binds a digest; it never sends bytes. Saying so here is cheaper
       # than a 422 unknown_asset after the snapshot is made.
-      $stderr.puts("save: #{key} is bound to the sha256 of #{value}. `save` binds digests and uploads nothing -- " \
-                   "if the platform has never seen these bytes, `sites-cli upload SLUG #{value}` (or `push`) first.")
+      $stderr.puts("save: #{key} uses the sha256 of #{value}. If the platform has not seen these bytes, " \
+                   "run `sites-cli push SLUG DIR` or `sites-cli upload SLUG #{value}` first; " \
+                   "a first save otherwise fails with unknown_asset. `save` does not upload bytes.")
       [{ 'op' => 'put', 'kind' => 'asset', 'key' => key, 'digest' => sha256_file(value) }, nil]
     else
       [nil, api_error("--asset #{key} takes a sha256 or a local file, and #{value.inspect} is neither",
@@ -3417,6 +3421,7 @@ def run(argv)
     team = opt(argv, '--team')
     slug = argv.find { |a| a != '--prod' }
     return failure("create requires SLUG", code: 'USAGE') unless slug
+    return failure('create is the legacy production runner; use `sites-cli create-site SLUG --name NAME` at the platform door for a versioned site, or pass --prod to create a legacy site', code: 'USAGE') unless prod
     return cmd_create(slug, name, team, prod: prod)
 
   # -- describe_site is one tool on both contracts: the server answers in the
@@ -3597,7 +3602,7 @@ def run(argv)
     return failure("create-site requires SLUG --name NAME", code: 'USAGE') unless slug && name
     return platform_tool_call(slug, 'create_site', base.merge('slug' => slug, 'name' => name), 'create-site',
                               "Creating a site is GXB staff only. The runner command " \
-                              "`sites-cli create #{slug} --name #{name.inspect}` needs no token at all.")
+                              "`sites-cli create #{slug} --name #{name.inspect} --prod` creates a legacy production site and needs no personal token.")
 
   # -- the two site tools with no subcommand until now. list_submissions asks
   #    for read_submissions, which is its own capability: a plain `read` token

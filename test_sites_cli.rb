@@ -1365,8 +1365,9 @@ end
 check('wait-preview polls describe_site until the branch preview is ready') do
   preview_queue.replace(%w[queued building ready])
   before = requests["#{TOKEN_ONYX} describe_site"]
-  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  out, err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
   assert(code == 0, "expected exit 0 on a ready preview, got #{code}: #{out}")
+  assert(err.lines.map(&:strip).include?('https://abcdefghijklmn-onyx.gxbsites.com'), "expected the URL alone on stderr, got #{err}")
   assert(JSON.parse(out).dig('data', 'preview_status') == 'ready', "got #{out}")
   # describe's own shape too, so one jq path reads either (pc_100540cd).
   assert(JSON.parse(out).dig('data', 'branches').is_a?(Array), "expected describe's branches, got #{out}")
@@ -1375,8 +1376,9 @@ end
 
 check('wait-preview exits nonzero on an invalid preview and prints the diagnostics payload') do
   preview_queue.replace(%w[building invalid])
-  out, _err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
+  out, err, code = run_cli('wait-preview', 'onyx', '--timeout', '30')
   assert(code == 1, "expected exit 1 on an invalid preview, got #{code}: #{out}")
+  assert(err.lines.map(&:strip).include?('https://abcdefghijklmn-onyx.gxbsites.com'), "expected the failed preview URL on its own line: #{err}")
   parsed = JSON.parse(out)
   assert(parsed['code'] == 'INVALID', "expected code INVALID, got #{parsed['code'].inspect}")
   assert(parsed.dig('body', 'preview_status') == 'invalid', "expected the final payload in the body, got #{out}")
@@ -1515,6 +1517,14 @@ check('the personal bearer can also come from the _platform entry in tokens.json
   end
 end
 
+check('create without --prod names the versioned platform door instead of starting a runner') do
+  out, err, code = run_cli('create', 'newsite')
+  assert(code == 1, "expected usage failure, got #{code}: #{out}")
+  assert(err.empty?, "expected no runner trace: #{err}")
+  parsed = JSON.parse(out)
+  assert(parsed['error'].include?('create-site') && parsed['error'].include?('--prod') && parsed['error'].include?('platform door'), "got #{out}")
+end
+
 check('create-site posts create_site to the platform door and remembers the new draft head') do
   out, _err, code = run_cli('create-site', 'newsite', '--name', 'New Site', env: { 'SITES_CLI_TOKEN' => TOKEN_USER })
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
@@ -1556,7 +1566,7 @@ check('create-site with no personal bearer refuses locally and names the runner 
   assert(code == 1, 'expected a nonzero exit')
   parsed = JSON.parse(out)
   assert(parsed['code'] == 'NO_TOKEN', "expected NO_TOKEN, got #{out}")
-  assert(parsed['error'].include?('sites-cli create newsite'), 'expected the runner fallback to be named')
+  assert(parsed['error'].include?('sites-cli create newsite') && parsed['error'].include?('--prod'), 'expected the legacy production runner fallback to be named')
   assert(parsed['error'].include?('/profile'), 'expected the place a personal token is minted')
   assert(requests.values.sum == before, 'create-site reached the server with no bearer')
 end
