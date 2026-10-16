@@ -2955,7 +2955,7 @@ SUBCOMMANDS = [
   [%w[list], '[SLUG] [--prod]', 'rails runner, or list_files with SLUG', 'staff / read', 'both'],
   [%w[show], 'SLUG [--prod]', 'rails runner', 'staff', 'both'],
   [%w[open], 'SLUG [--prod]', 'rails runner', 'staff', 'both'],
-  [%w[create], 'SLUG [--name N] [--team T] [--prod]', 'rails runner', 'staff', 'legacy'],
+  [%w[create], 'SLUG [--name N] [--team T] --prod', 'production rails runner', 'staff', 'legacy'],
   [%w[list_files], 'SLUG [--prefix P]', 'list_files', 'read', 'legacy'],
   [%w[read_file], 'SLUG PATH [--view live]', 'read_file', 'read', 'legacy'],
   [%w[write_file write], 'SLUG PATH --content C | --file FILE', 'write_file', 'draft', 'legacy'],
@@ -2984,8 +2984,8 @@ def usage
       sites-cli list [--prod]              List tenant sites
       sites-cli show SLUG [--prod]         Show a tenant site
       sites-cli open SLUG [--prod]         Print URL; with --prod, open it
-      sites-cli create SLUG [--name NAME] [--team TEAM] [--prod]
-                                            Staff-only: create an empty site
+      sites-cli create SLUG [--name NAME] [--team TEAM] --prod
+                                            Staff-only legacy production site; no local create
 
     Versioned sites (plan 30) -- each posts the same-named MCP tool to
     POST /api/v1/tools and prints the raw {ok, data} envelope:
@@ -3130,8 +3130,8 @@ def usage
 
     A site token at the platform door is a 403, printed verbatim, and so is a
     site token naming a different site. A site you cannot read is a 404, never
-    a 403. The runner command `sites-cli create SLUG --name NAME` still works
-    without any token.
+    a 403. `sites-cli create SLUG --prod` makes a legacy production site
+    without a token. Local legacy creation is no longer supported by create.
 
     Legacy file-API sites (plan 24):
       sites-cli describe_site SLUG [PATH]           alias: describe SLUG PATH
@@ -3421,7 +3421,7 @@ def run(argv)
     team = opt(argv, '--team')
     slug = argv.find { |a| a != '--prod' }
     return failure("create requires SLUG", code: 'USAGE') unless slug
-    return failure('create is the legacy production runner; use `sites-cli create-site SLUG --name NAME` at the platform door for a versioned site, or pass --prod to create a legacy site', code: 'USAGE') unless prod
+    return failure('create no longer makes local legacy sites through the dev Rails runner. Use `sites-cli create-site SLUG --name NAME` at the platform door for a versioned site, or pass --prod to create a legacy production site', code: 'USAGE') unless prod
     return cmd_create(slug, name, team, prod: prod)
 
   # -- describe_site is one tool on both contracts: the server answers in the
@@ -3601,8 +3601,8 @@ def run(argv)
     slug = argv.shift || base['slug']
     return failure("create-site requires SLUG --name NAME", code: 'USAGE') unless slug && name
     return platform_tool_call(slug, 'create_site', base.merge('slug' => slug, 'name' => name), 'create-site',
-                              "Creating a site is GXB staff only. The runner command " \
-                              "`sites-cli create #{slug} --name #{name.inspect} --prod` creates a legacy production site and needs no personal token.")
+                              "Creating a site is GXB staff only. " \
+                              "For a versioned site, get a personal token at https://sites.gxb.vc/profile or use the GXB connector. `sites-cli create #{slug} --name #{name.inspect} --prod` creates a legacy production site, not a versioned one, and needs no personal token.")
 
   # -- the two site tools with no subcommand until now. list_submissions asks
   #    for read_submissions, which is its own capability: a plain `read` token

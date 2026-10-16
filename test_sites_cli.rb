@@ -1522,7 +1522,7 @@ check('create without --prod names the versioned platform door instead of starti
   assert(code == 1, "expected usage failure, got #{code}: #{out}")
   assert(err.empty?, "expected no runner trace: #{err}")
   parsed = JSON.parse(out)
-  assert(parsed['error'].include?('create-site') && parsed['error'].include?('--prod') && parsed['error'].include?('platform door'), "got #{out}")
+  assert(parsed['error'].include?('create-site') && parsed['error'].include?('--prod') && parsed['error'].include?('platform door') && parsed['error'].include?('no longer makes local legacy sites'), "got #{out}")
 end
 
 check('create-site posts create_site to the platform door and remembers the new draft head') do
@@ -1560,13 +1560,14 @@ check('describe-platform calls describe_platform at the personal-token door') do
   assert(last_args['platform:describe_platform'] == {}, 'expected empty arguments')
 end
 
-check('create-site with no personal bearer refuses locally and names the runner command') do
+check('create-site with no personal bearer names token and connector before the legacy runner option') do
   before = requests.values.sum
   out, _err, code = run_cli('create-site', 'newsite', '--name', 'New Site')
   assert(code == 1, 'expected a nonzero exit')
   parsed = JSON.parse(out)
   assert(parsed['code'] == 'NO_TOKEN', "expected NO_TOKEN, got #{out}")
-  assert(parsed['error'].include?('sites-cli create newsite') && parsed['error'].include?('--prod'), 'expected the legacy production runner fallback to be named')
+  assert(parsed['error'].include?('https://sites.gxb.vc/profile') && parsed['error'].include?('GXB connector'), 'expected versioned credential options')
+  assert(parsed['error'].include?('sites-cli create newsite') && parsed['error'].include?('--prod') && parsed['error'].include?('not a versioned one'), 'expected the legacy production runner fallback to be labeled')
   assert(parsed['error'].include?('/profile'), 'expected the place a personal token is minted')
   assert(requests.values.sum == before, 'create-site reached the server with no bearer')
 end

@@ -71,7 +71,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `list [SLUG] [--prod]` | `rails runner, or list_files with SLUG` | staff / read | both |
 | `show SLUG [--prod]` | `rails runner` | staff | both |
 | `open SLUG [--prod]` | `rails runner` | staff | both |
-| `create SLUG [--name N] [--team T] [--prod]` | `rails runner` | staff | legacy |
+| `create SLUG [--name N] [--team T] --prod` | `production rails runner` | staff | legacy |
 | `list_files SLUG [--prefix P]` | `list_files` | read | legacy |
 | `read_file SLUG PATH [--view live]` | `read_file` | read | legacy |
 | `write_file SLUG PATH --content C \| --file FILE` (alias: `write`) | `write_file` | draft | legacy |
@@ -931,7 +931,7 @@ still fails the check.
 | `SITES_CLI_TOKEN` | -- | personal bearer (`sk_user_...`): the platform tools, and the fallback for any slug with no site token |
 | `SITES_CLI_BROWSER` | `agent-browser` | the browser binary `check` drives |
 
-`create` without `--prod` stops with a hint to use `create-site`, the versioned platform door. `create --prod` makes a legacy production site, not a versioned one, and requires `kamal-cli` on PATH.
+`create` without `--prod` stops with a hint to use `create-site`, the versioned platform door. It no longer makes local legacy sites through the dev Rails runner. `create --prod` makes a legacy production site, not a versioned one, and requires `kamal-cli` on PATH. Get a personal token for `create-site` at https://sites.gxb.vc/profile or use the GXB connector.
 
 ## Testing
 
