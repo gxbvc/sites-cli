@@ -50,9 +50,11 @@ nothing ever prints a Ruby backtrace.
 - **A 409 `branch_changed` is never retried and never updates that cache**, and
   neither does a `read --at` or a `save --dry-run`. A 409 prints the structured
   body and exits 1. Rerun `describe`, look at what moved, then save again.
-- **`--review` never defaults.** The last review printed for a slug+branch is
-  remembered separately and only `--review last` spends it, so publishing a
-  stale candidate is always deliberate.
+- **`--review` never defaults.** `--review last` means the review most recently
+  proposed or saved for the slug, on any branch (never silently `draft`); with
+  `--branch B` it means B's review. It prints the branch, keys and age first,
+  and refuses a review older than an hour or one the state cannot rank, so
+  publishing a stale candidate is always deliberate.
 - **One `save` carries as many documents as you name.** `--page KEY --html
   FILE`, `--markdown`, `--config`, `--collection`, `--redirect`, `--delete` and
   `--asset` all repeat and keep their order, and the whole command is one

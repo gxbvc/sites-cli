@@ -339,7 +339,7 @@ server.mount_proc('/') do |req, res|
         res.body = JSON.generate(site: payload['site'] || 'onyx', branch: branch, expected: heads[branch],
           snapshot_created: true, changed_keys: Array(args['changes']).map { |c| "#{c['kind']}:#{c['key']}" },
           preview_status: 'queued', preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com',
-          review: nil)
+          review: (Array(args['changes']).any? { |c| c['key'] == '/ready-review' } ? (branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}") : nil))
       else
         res.status = 409
         res.body = JSON.generate(error: 'branch_changed', path: nil, version: nil,
@@ -361,14 +361,24 @@ server.mount_proc('/') do |req, res|
         expected: branch_heads[branch], changes: { pages: { added: [ '/about' ] } }, keys: 1, truncated: false)
     when 'publish'
       if args['review']
+        # A real review names its own branch (Site::ReviewToken). The stub's
+        # tokens spell it: rev_subset is draft's, rev_subset_<branch> another's.
+        review_branch = args['review'][/\Arev_subset_(.+)\z/, 1] || 'draft'
+        if args['branch'] && args['branch'] != review_branch
+          res.status = 422
+          res.body = JSON.generate(error: 'review_branch_mismatch', branch: args['branch'], review_branch: review_branch,
+            message: "this review was minted for branch #{review_branch}, not #{args['branch']}; nothing was published")
+          next
+        end
         publications += 1
         res.status = 200
         res.body = JSON.generate(published: true, publication: publications,
-          live_url: 'https://onyx.gxbsites.com', cache_convergence_seconds: 60)
+          live_url: 'https://onyx.gxbsites.com', cache_convergence_seconds: 60,
+          branch: review_branch, included: [ "page:/#{review_branch}" ])
       elsif args['keys']
         branch = args['branch'] || 'draft'
         res.status = 200
-        res.body = JSON.generate(published: false, review: 'rev_subset', site: 'onyx',
+        res.body = JSON.generate(published: false, review: (branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}"), site: 'onyx',
           branch: branch, expected: branch_heads[branch],
           preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com', preview_status: 'queued',
           included: args['keys'], left_on_branch: [ 'page:/' ])
@@ -1321,6 +1331,174 @@ check('a save whose build is not ready drops the remembered review rather than l
     assert(code == 0, "expected exit 0, got #{code}: #{out}")
     assert(state['last_review:onyx:draft'].nil?, "an explicit review:null left #{state['last_review:onyx:draft'].inspect} behind")
   end
+end
+
+# -----------------------------------------------------------------------------
+# publish --review last (the Oct 16 incident, site trigg): `last` has to mean
+# the review proposed most recently for the slug, on whatever branch that was,
+# never the one remembered for the default branch. Reviews are spent only after
+# saying what is about to go live, and a stale one is refused.
+# -----------------------------------------------------------------------------
+
+def forget_all_reviews!
+  st = state
+  st.delete_if { |key, _| key.start_with?('last_review', 'review_meta:') }
+  File.write(STATE_PATH, JSON.pretty_generate(st))
+end
+
+def edit_state
+  st = state
+  yield st
+  File.write(STATE_PATH, JSON.pretty_generate(st))
+end
+
+check('publish --review last without --branch spends the review proposed most recently, not the draft one') do
+  forget_all_reviews!
+  run_cli('create-branch', 'onyx', 'thanks', '--from', 'live')
+  # An older proposal on draft, the one the incident spent by mistake...
+  run_cli('publish', 'onyx', '--keys', 'page:/about')
+  assert(state['last_review:onyx:draft'] == 'rev_subset', 'expected the draft proposal remembered')
+  # ...then the candidate the agent actually meant, on another branch.
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'expected the thanks proposal remembered')
+
+  before = requests.values.sum
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_thanks', "spent #{last_args['publish']['review'].inspect}, not the thanks proposal")
+  assert(last_args['publish']['branch'] == 'thanks', "expected the CLI to name the branch to the server, got #{last_args['publish'].inspect}")
+  assert(requests.values.sum == before + 1, 'expected exactly one request')
+  assert(err.include?('thanks'), "expected the branch on stderr, got #{err.inspect}")
+  assert(err.include?('page:/thanks'), "expected the included keys on stderr, got #{err.inspect}")
+  assert(err.match?(/\b\d+\s*(s|sec|second|m|min|minute)/i), "expected the proposal's age on stderr, got #{err.inspect}")
+  assert(state['last_review:onyx:thanks'].nil?, 'a spent review stayed in the cache')
+  assert(state['last_review:onyx:draft'] == 'rev_subset', 'the draft review must be untouched')
+end
+
+check('after spending it, --review last does not fall back to the old draft review') do
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 1, 'expected a refusal')
+  assert(JSON.parse(out)['code'] == 'NO_LAST_REVIEW', "got #{out}")
+  assert(JSON.parse(out)['error'].include?('--branch draft'), "expected the draft review offered by name, got #{out}")
+  assert(requests.values.sum == before, 'a refused publish reached the server')
+end
+
+check('publish --review last --branch B spends the review remembered for B, whatever was proposed last') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/about')
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft')
+
+  assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset', "got #{last_args['publish'].inspect}")
+  assert(last_args['publish']['branch'] == 'draft', "expected the branch sent to the server, got #{last_args['publish'].inspect}")
+  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'the other branch review must be untouched')
+end
+
+check('a remembered review older than an hour is refused before any request, and an explicit token still works') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  edit_state do |st|
+    meta = st['review_meta:onyx:thanks']
+    assert(meta.is_a?(Hash), "expected the CLI to remember when it was proposed, got #{meta.inspect}")
+    meta['at'] = Time.now.to_i - 3 * 3600
+    st['last_review_branch:onyx']['at'] = Time.now.to_i - 3 * 3600 if st['last_review_branch:onyx'].is_a?(Hash)
+  end
+
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 1, 'expected a refusal')
+  assert(JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "got #{out}")
+  assert(JSON.parse(out)['error'].include?('thanks'), "expected the branch named, got #{out}")
+  assert(requests.values.sum == before, 'a stale review reached the server')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks')
+  assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "an explicit --branch must not skip the age limit, got #{out}")
+  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'a refused review must stay remembered')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_subset_thanks', '--branch', 'thanks')
+  assert(code == 0, "an explicit token is the escape hatch, got #{code}: #{out}")
+end
+
+check('a remembered review with no recorded age (state from an older CLI) is refused as too old') do
+  forget_all_reviews!
+  edit_state { |st| st['last_review:onyx:draft'] = 'rev_subset' }
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft')
+
+  assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "got #{out}")
+  assert(JSON.parse(out)['error'].include?('unknown'), "expected the unknown age said, got #{out}")
+end
+
+check('two remembered reviews and nothing saying which is newest is refused with the options listed') do
+  forget_all_reviews!
+  # describe remembers branches[].review for every branch, without proposing any of them.
+  run_cli('describe', 'onyx')
+  assert(state.keys.count { |k| k.start_with?('last_review:onyx:') } >= 2, 'expected several remembered reviews')
+
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 1, 'expected a refusal')
+  assert(JSON.parse(out)['code'] == 'AMBIGUOUS_REVIEW', "got #{out}")
+  assert(JSON.parse(out)['error'].include?('--branch draft'), "expected the options listed, got #{out}")
+  assert(JSON.parse(out)['error'].include?('--branch thanks'), "expected the options listed, got #{out}")
+  assert(requests.values.sum == before, 'an ambiguous publish reached the server')
+end
+
+check('a save that returns a review makes that branch the one --review last means') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/about')
+  Dir.mktmpdir do |dir|
+    changes = File.join(dir, 'changes.json')
+    File.write(changes, JSON.generate([ { op: 'put', kind: 'page', key: '/ready-review', document: { format: 'html', metadata: { title: 'R' }, body: '<p>r</p>' } } ]))
+    out, _err, code = run_cli('save', 'onyx', '--changes', changes, '--branch', 'thanks')
+    assert(code == 0, "got #{code}: #{out}")
+  end
+  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'expected the save review remembered for thanks')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "got #{code}: #{out}")
+  assert(last_args['publish']['review'] == 'rev_subset_thanks', "got #{last_args['publish'].inspect}")
+end
+
+check('an explicit token for another branch is refused by the server when --branch disagrees, and nothing is forgotten') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/about')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_subset', '--branch', 'thanks')
+
+  assert(code == 1, "expected the server's refusal to fail the command, got #{out}")
+  assert(last_args['publish']['branch'] == 'thanks', "the CLI must send the branch it was given, got #{last_args['publish'].inspect}")
+  assert(JSON.parse(out).dig('body', 'error') == 'review_branch_mismatch', "got #{out}")
+  assert(state['last_review:onyx:draft'] == 'rev_subset', 'a refused publish must keep the review')
+end
+
+check('an explicit token spent without --branch forgets the review of the branch the server says it belonged to') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_subset_thanks')
+
+  assert(code == 0, "got #{code}: #{out}")
+  assert(state['last_review:onyx:thanks'].nil?, 'the spent review stayed remembered under its own branch')
+  assert(state['last_review_branch:onyx'].nil?, 'the last-review pointer outlived its review')
+end
+
+check('archive-branch clears the last-review pointer and the age record of the archived branch') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  assert(state['review_meta:onyx:thanks'], 'expected an age record')
+
+  run_cli('archive-branch', 'onyx', 'thanks')
+
+  assert(state['review_meta:onyx:thanks'].nil?, 'the age record of an archived branch stayed')
+  assert(state['last_review_branch:onyx'].nil?, 'the pointer to an archived branch stayed')
 end
 
 check('publish SLUG PATH still uses the legacy expected_version contract') do

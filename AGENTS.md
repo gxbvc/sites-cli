@@ -153,7 +153,17 @@ All three access commands need `manage_access` and use the same tools as Chat.
 - **`--review` never defaults.** A review is a binding to one exact candidate,
   so it is remembered under its own key and only `--review last` spends it.
   `publish --review last` with nothing remembered fails locally (`NO_REVIEW`)
-  with no request. A `save` whose build is not ready answers `review: null`,
+  with no request. Without `--branch` it means the review most recently
+  proposed (`publish --keys`) or saved (`save`, `merge-live`) for that slug, on
+  any branch, tracked in `last_review_branch:<slug>`; it never falls back to
+  `draft`. Before it spends anything it prints the branch, the keys (for a
+  proposal) and the age to stderr, and it sends the branch to the server, which
+  refuses a review minted for another branch (422 `review_branch_mismatch`). A
+  review older than an hour or of unknown age is `REVIEW_TOO_OLD`; with no
+  last-review pointer (older state file, spent review, describe output only) it
+  is `NO_LAST_REVIEW` (one remembered review) or `AMBIGUOUS_REVIEW` (several),
+  each listing the `--branch` choices. `--review last --branch B` uses B's
+  review, with the same age limit. A `save` whose build is not ready answers `review: null`,
   which drops the remembered one rather than leaving `last` pointed at a
   candidate that no longer describes the branch.
 - `--idempotency-key` defaults to a fresh UUID.
@@ -225,6 +235,8 @@ with no entry of its own. `state.json` is one flat map with two key shapes:
 |---|---|---|
 | `expected:<slug>:<branch>` | branch head CAS token (`snap_...`) | every 2xx v2 response carrying `branch`+`expected`, and every `branches[]` entry in `describe`. Never a `read --at` response, never a `save --dry-run`, never a 409 body |
 | `last_review:<slug>:<branch>` | the last `review` this CLI printed for that branch | every 2xx response carrying `branch`+`review` (`describe`, `save`, `create-branch`, `merge-live`, `resolve-merge`, `publish --keys`, `wait-preview`). An explicit `review: null` deletes it; so does a `publish --review` that spends it |
+| `review_meta:<slug>:<branch>` | `{at, included}`: when that review was proposed or first seen, and the keys of a `publish --keys` proposal | beside `last_review`. A describe that sees the same token again leaves `at` alone. Deleted with the review |
+| `last_review_branch:<slug>` | `{branch, at}`: the branch `--review last` means | only `publish --keys`, `save` and `merge-live`, never describe. Deleted when that branch's review is spent, nulled or archived |
 | `<slug>/<path>` | legacy file version | `read_file`, `write_file`, `edit_file`, `write_file --file` |
 
 A review is never written under an `expected:` key and is never sent unless
@@ -714,9 +726,12 @@ next: preview it, then `sites-cli publish onyx --review last` (or --review "<tok
 ```
 
 `publish SLUG --review TOKEN` is the call that swaps live to the exact
-candidate that review binds. `--review last` spends the review this CLI last
-printed for that slug+branch and then forgets it, because a spent review
-publishes nothing the second time (409 `upstream_changed`). A review from
+candidate that review binds. `--review last` spends the review this CLI most
+recently proposed or saved for that slug (on any branch, never silently
+`draft`), says the branch, keys and age on stderr first, then forgets it,
+because a spent review publishes nothing the second time (409
+`upstream_changed`). The answer names the `branch` and the `included` keys that
+went live. A review from
 `save` covers the whole branch delta, so passing it with a narrower `--keys`
 list is 422 `review_mismatch`.
 
