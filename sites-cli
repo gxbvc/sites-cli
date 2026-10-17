@@ -1216,7 +1216,8 @@ def resolve_last_review(slug, branch, whole_branch: false)
     found = remembered_review(state, slug, branch, scope, whole_branch: whole_branch)
     if found.nil?
       return [nil, api_error("no review remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` " \
-                             "and pass branches[].review, or take the review a save or a `publish --keys` returned",
+                             "and pass branches[].review, or take the review a save returned. For a subset, propose with " \
+                             "`sites-cli publish #{slug} --branch #{branch} --keys KEYS`",
                              code: 'NO_REVIEW')]
     end
   end
@@ -1230,14 +1231,29 @@ end
 # open_reviews (the review's own `included`). [included, removed, listed, err]:
 # `listed` is nil when the server sends no open_reviews at all (an older one),
 # so the keys are unknown, and false when it does and this token is not there.
+# The server leaves a branch with nothing pending out of open_reviews, so a
+# token that is the branch's own current review in `branches[]` with
+# pending_keys 0 (and live not moved past it) is open with no keys: that is a
+# republish of the same snapshot, which the domain flow needs. `info` carries
+# :empty for that case and :kind for the open_reviews entry.
 def whole_branch_keys(slug, branch, token)
   data, err = api_call(slug, 'describe_site', { 'branch' => branch })
-  return [nil, nil, nil, err] if err
-  remember_branch_state(slug, data)
-  return [nil, nil, nil, nil] unless data.is_a?(Hash) && data['open_reviews'].is_a?(Array)
-  entry = data['open_reviews'].find { |r| r.is_a?(Hash) && r['review'] == token }
-  return [nil, nil, false, nil] unless entry
-  [Array(entry['included']), Array(entry['removed']), true, nil]
+  return [nil, nil, nil, err, {}] if err
+  begin
+    remember_branch_state(slug, data)
+  rescue SystemCallError => e
+    return [nil, nil, nil, api_error("nothing was published: local state is not writable (#{e.class}), so the review could not be checked",
+                                     code: 'INTERNAL'), {}]
+  end
+  return [nil, nil, nil, nil, {}] unless data.is_a?(Hash)
+  entry = Array(data['open_reviews']).find { |r| r.is_a?(Hash) && r['review'] == token }
+  return [Array(entry['included']), Array(entry['removed']), true, nil, { kind: entry['kind'] }] if entry
+  own = Array(data['branches']).find { |b| b.is_a?(Hash) && b['name'] == branch }
+  if own && own['review'] == token && own['pending_keys'] == 0 && !own['needs_merge']
+    return [[], [], true, nil, { empty: true }]
+  end
+  return [nil, nil, nil, nil, {}] unless data['open_reviews'].is_a?(Array)
+  [nil, nil, false, nil, {}]
 end
 
 # `--review last --branch B` with no proposal for B in this pane is B's whole
@@ -1246,17 +1262,25 @@ end
 # the caller says --whole-branch (or passes the token).
 def check_whole_branch_review(slug, found, whole_branch)
   branch = found[:branch]
-  included, removed, listed, err = whole_branch_keys(slug, branch, found[:review])
+  included, removed, listed, err, info = whole_branch_keys(slug, branch, found[:review])
   return err if err
-  shown = included ? (included.empty? ? '(none)' : included.join(', ')) : 'unknown (this server does not list open_reviews)'
-  $stderr.puts("publish: #{slug}/#{branch} review #{found[:review]} covers everything pending on #{branch}: #{shown}")
-  $stderr.puts("publish: it would remove from live: #{removed.join(', ')}") if removed.to_a.any?
   if listed == false
-    return api_error("the review remembered for #{slug}/#{branch} is not open on the server any more (the branch or live moved, " \
-                     "or the build is not ready). Run `sites-cli describe #{slug} --branch #{branch}`, check open_reviews, and propose " \
+    return api_error("the review remembered for #{slug}/#{branch} is neither in the server's open_reviews nor the current review of " \
+                     "#{branch} with nothing pending, so it was not published: the branch or live moved since it was made, or its build " \
+                     "is not ready. Run `sites-cli describe #{slug} --branch #{branch}`, check open_reviews, and propose " \
                      "again with `sites-cli publish #{slug} --branch #{branch} --keys KEYS` if you meant a subset.",
                      code: 'REVIEW_NOT_OPEN')
   end
+  shown = included ? (included.empty? ? '(none)' : included.join(', ')) : 'unknown (this server does not list open_reviews)'
+  if info[:empty]
+    $stderr.puts("publish: #{slug}/#{branch}: nothing pending: republishing the same snapshot (no keys change)")
+  else
+    what = info[:kind] == 'proposal' ? 'is a proposal that covers' : 'covers everything pending on'
+    $stderr.puts("publish: #{slug}/#{branch} review #{found[:review]} #{what} #{branch}: #{shown}")
+    # open_reviews cuts `included` at 100 keys without saying so
+    $stderr.puts("publish: (the server lists at most 100 keys; run `sites-cli diff #{slug} --branch #{branch}` for all of them)") if included.to_a.size >= 100
+  end
+  $stderr.puts("publish: it would remove from live: #{removed.join(', ')}") if removed.to_a.any?
   return nil if whole_branch
   api_error("`--review last --branch #{branch}` has no proposal of yours to spend, so it means the WHOLE branch: " \
             "everything pending on #{branch} (#{shown}). Nothing was published. If you meant a subset, propose it again with " \
@@ -1294,7 +1318,13 @@ def cmd_publish_review(slug, review, branch, base, idempotency, keys: [], whole_
   # 409 upstream_changed. Every slot and pane that remembered this exact token
   # is cleared, so an explicit token for another branch changes nothing else.
   begin
-    update_state { |state| forget_spent_review!(state, slug, review) } if data['published']
+    if data['published']
+      update_state do |state|
+        forget_spent_review!(state, slug, review)
+        # a whole-branch spend moved live: a proposal for this branch was built on the old live
+        drop_proposals!(state, slug, branch: branch) if whole_branch && branch
+      end
+    end
     remember_branch_state(slug, data)
   rescue SystemCallError => e
     # The publish happened; only the local cache failed. Say so, do not report INTERNAL.

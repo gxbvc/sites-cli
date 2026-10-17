@@ -68,6 +68,7 @@ publications = 0
 # other (full-branch) review binds everything pending on its branch.
 proposed_keys = {}
 omit_open_reviews = false
+empty_delta_branches = []                      # branches equal to live: the server lists no open review for them
 saved_reviews = {}                             # branch => the review its last ready save answered
 FULL_BRANCH_KEYS = %w[page:/about page:/muncie page:/thanks].freeze
 preview_queue = []                             # statuses wait-preview walks through
@@ -204,11 +205,12 @@ server.mount_proc('/') do |req, res|
         live: nil,
         branches: branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' }.map { |name, head|
           { name: name, expected: head, preview_status: status,
-            preview_url: "https://abcdefghijklmn-onyx.gxbsites.com", diagnostics: [], review: (saved_reviews[name] || "rev_#{head}") }
+            preview_url: "https://abcdefghijklmn-onyx.gxbsites.com", diagnostics: [], review: (saved_reviews[name] || "rev_#{head}"),
+            pending_keys: (empty_delta_branches.include?(name) ? 0 : FULL_BRANCH_KEYS.size) }
         },
         # open_reviews: each branch's whole-branch review with the keys it
         # would publish, as describe_site lists them.
-        open_reviews: (omit_open_reviews ? nil : branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' }.map { |name, head|
+        open_reviews: (omit_open_reviews ? nil : branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' || empty_delta_branches.include?(name) }.map { |name, head|
           { branch: name, kind: 'branch', included: FULL_BRANCH_KEYS, removed: [], age_seconds: 5, review: (saved_reviews[name] || "rev_#{head}") }
         }),
         pending: { branch: args['branch'] || 'draft', against: 'live', keys: 1, truncated: false,
@@ -1622,6 +1624,54 @@ check('--whole-branch refuses a review that describe does not list as open, and 
   out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
   assert(code == 0, "got #{code}: #{out}#{err}")
   omit_open_reviews = false
+end
+
+check('--whole-branch republishes a branch equal to live (no open_reviews entry, pending_keys 0), and says so') do
+  forget_all_reviews!
+  empty_delta_branches << 'draft'
+  run_cli('describe', 'onyx')
+  publishes = requests.select { |k, _| k.end_with?(' publish') }.values.sum
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft')
+  assert(code == 1 && JSON.parse(out)['code'] == 'WHOLE_BRANCH_REVIEW', "got #{code}: #{out}")
+  assert(requests.select { |k, _| k.end_with?(' publish') }.values.sum == publishes, 'a refused publish reached the server')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(err.include?('nothing pending: republishing the same snapshot'), "got #{err.inspect}")
+  assert(last_args['publish']['branch'] == 'draft' && !last_args['publish'].key?('keys'), "got #{last_args['publish'].inspect}")
+  empty_delta_branches.clear
+end
+
+check('--whole-branch still refuses a foreign token on a branch equal to live, and one with pending keys that open_reviews omits') do
+  forget_all_reviews!
+  empty_delta_branches << 'draft'
+  run_cli('describe', 'onyx')
+  edit_state { |st| st['last_review:onyx:draft'] = 'rev_foreign_token' }
+  publishes = requests.select { |k, _| k.end_with?(' publish') }.values.sum
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  parsed = JSON.parse(out)
+  assert(code == 1 && parsed['code'] == 'REVIEW_NOT_OPEN', "got #{code}: #{out}")
+  assert(!parsed['error'].include?('does not list open_reviews') && parsed['error'].include?('neither in the server'), "wrong reason: #{out}")
+  empty_delta_branches.clear
+
+  # pending keys > 0 and the review is not in open_reviews: stays refused
+  forget_all_reviews!
+  run_cli('describe', 'onyx')
+  edit_state { |st| st['last_review:onyx:draft'] = 'rev_foreign_token' }
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_NOT_OPEN', "got #{code}: #{out}")
+  assert(requests.select { |k, _| k.end_with?(' publish') }.values.sum == publishes, 'a refused publish reached the server')
+end
+
+check('a branch with pending keys still lists them before a whole-branch spend; a whole-branch spend drops the pane proposal') do
+  forget_all_reviews!
+  run_cli('describe', 'onyx')
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'draft')
+  assert(state.keys.any? { |k| k.start_with?('proposal:') && k.end_with?(':onyx:draft') }, 'expected a proposal for draft')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(err.include?('everything pending on draft: page:/about, page:/muncie, page:/thanks'), "got #{err.inspect}")
+  assert(!err.include?('nothing pending'), "got #{err.inspect}")
+  assert(state.keys.none? { |k| k.start_with?('proposal:') && k.end_with?(':onyx:draft') }, 'the proposal built on the old live must be dropped')
 end
 
 check('--whole-branch needs `--review last --branch B`') do
