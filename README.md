@@ -23,7 +23,7 @@ sites-cli save onyx --config config.json \
   --page /about --html about.html       # one changes array, one snapshot, one build
 sites-cli wait-preview onyx             # 1 on invalid/failed/revoked
 sites-cli check https://<token>--onyx.gxbsites.com --against https://onyx.com
-sites-cli publish onyx --review last    # or --review "$REVIEW"
+sites-cli publish onyx --review last --branch draft   # a save's review; or --review "$REVIEW"
 sites-cli connect-domain onyx onyx.com  # prints the DNS record to publish
 sites-cli list-submissions onyx         # needs a read_submissions token
 
@@ -50,11 +50,14 @@ nothing ever prints a Ruby backtrace.
 - **A 409 `branch_changed` is never retried and never updates that cache**, and
   neither does a `read --at` or a `save --dry-run`. A 409 prints the structured
   body and exits 1. Rerun `describe`, look at what moved, then save again.
-- **`--review` never defaults.** `--review last` means the review most recently
-  proposed or saved for the slug, on any branch (never silently `draft`); with
-  `--branch B` it means B's review. It prints the branch, keys and age first,
-  and refuses a review older than an hour or one the state cannot rank, so
-  publishing a stale candidate is always deliberate.
+- **`--review` never defaults.** Bare `--review last` is exactly the review
+  your last `publish --keys` from this terminal pane printed (never silently
+  `draft`); describe, wait-preview, save and other agents cannot change it.
+  It sends that proposal's keys with the review, so the server refuses any
+  other candidate. A review from a save needs `--review last --branch B` or
+  its token. It prints the branch, keys and age first, and refuses a review
+  older than an hour or of unknown age, so publishing a stale candidate is
+  always deliberate.
 - **One `save` carries as many documents as you name.** `--page KEY --html
   FILE`, `--markdown`, `--config`, `--collection`, `--redirect`, `--delete` and
   `--asset` all repeat and keep their order, and the whole command is one

@@ -62,6 +62,12 @@ branch_heads = { 'draft' => 'snap_head0', 'live' => 'snap_live0' }
 new_site_heads = {}                            # slug => {branch => head}
 bound_assets = {}                              # "branch:key" => digest bound on that branch
 publications = 0
+# The server's review_mismatch guard (Site::Versioned::Publishing#assert_review_keys!):
+# a review binds one candidate, and `keys` sent beside it must describe that
+# same candidate. A subset proposal binds the keys it was proposed with; any
+# other (full-branch) review binds everything pending on its branch.
+proposed_keys = {}
+FULL_BRANCH_KEYS = %w[page:/about page:/muncie page:/thanks].freeze
 preview_queue = []                             # statuses wait-preview walks through
 fail_batch_read = false                        # a test arms this to play a pre-slice-E server
 # list-pages composes itself out of describe_site's own pending diff; a test
@@ -370,13 +376,21 @@ server.mount_proc('/') do |req, res|
             message: "this review was minted for branch #{review_branch}, not #{args['branch']}; nothing was published")
           next
         end
+        candidate = proposed_keys[args['review']] || FULL_BRANCH_KEYS
+        if args['keys'] && Array(args['keys']).sort != candidate.sort
+          res.status = 422
+          res.body = JSON.generate(error: 'review_mismatch', keys: Array(args['keys']).sort,
+            message: 'this review binds a different candidate than those keys describe; nothing was published')
+          next
+        end
         publications += 1
         res.status = 200
         res.body = JSON.generate(published: true, publication: publications,
           live_url: 'https://onyx.gxbsites.com', cache_convergence_seconds: 60,
-          branch: review_branch, included: [ "page:/#{review_branch}" ])
+          branch: review_branch, included: (proposed_keys[args['review']] || [ "page:/#{review_branch}" ]))
       elsif args['keys']
         branch = args['branch'] || 'draft'
+        proposed_keys[branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}"] = Array(args['keys'])
         res.status = 200
         res.body = JSON.generate(published: false, review: (branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}"), site: 'onyx',
           branch: branch, expected: branch_heads[branch],
@@ -714,7 +728,10 @@ ENV_OVERRIDES = {
   'SITES_CLI_CONFIG_DIR' => CONFIG_DIR,
   # nil unsets it in the child: a personal token in the developer's own shell
   # would otherwise become a silent fallback and change what these checks mean.
-  'SITES_CLI_TOKEN' => nil
+  'SITES_CLI_TOKEN' => nil,
+  # The pane the developer runs these tests from would otherwise scope every
+  # proposal. Checks that care set their own.
+  'HERDR_PANE_ID' => nil
 }.freeze
 
 def run_cli(*args, env: {}, stdin: nil)
@@ -1062,10 +1079,11 @@ check('archive-branch removes the branch\'s expected and last_review entries fro
   # Fabricate a remembered review for it the way a save or publish --keys
   # would, so there is something for archive-branch to clean up.
   run_cli('publish', 'onyx', '--keys', 'page:/about', '--branch', 'withreview')
-  assert(state['last_review:onyx:withreview'], 'expected a review remembered before archiving')
+  assert(state['proposal:shared:onyx:withreview'], 'expected a proposal remembered before archiving')
 
   run_cli('archive-branch', 'onyx', 'withreview')
   assert(state['expected:onyx:withreview'].nil?, 'expected the archived branch\'s CAS token gone from state.json')
+  assert(state['proposal:shared:onyx:withreview'].nil?, 'expected the archived branch\'s proposal gone from state.json')
   assert(state['last_review:onyx:withreview'].nil?, 'expected the archived branch\'s review gone from state.json')
 end
 
@@ -1298,18 +1316,25 @@ check('publish --keys defaults --expected to the remembered head and never treat
   assert(err.include?('--review'), "expected the next step to name publish --review, got #{err.inspect}")
 end
 
-check('the review from a published:false is remembered under last_review, never as an expected token') do
-  assert(state['last_review:onyx:draft'] == 'rev_subset', "got #{state['last_review:onyx:draft'].inspect}")
+check('the review from a published:false is remembered as a proposal, never as an expected token') do
+  proposal = state['proposal:shared:onyx:draft']
+  assert(proposal.is_a?(Hash), "got #{state.keys.inspect}")
+  assert(proposal['review'] == 'rev_subset', "got #{proposal.inspect}")
+  assert(proposal['keys'] == [ 'page:/about', 'asset:assets/x.js' ], "got #{proposal.inspect}")
+  assert(proposal['at'].is_a?(Integer), "got #{proposal.inspect}")
+  assert(state['last_proposal:shared:onyx']['branch'] == 'draft', "got #{state['last_proposal:shared:onyx'].inspect}")
   assert(state['expected:onyx:draft'] == branch_heads['draft'], 'a review overwrote the branch head token')
-  assert(state.values.count('rev_subset') == 1, 'the review was cached under more than one key')
+  assert(state['last_review:onyx:draft'] != 'rev_subset', 'a proposal must not land in the branch review slot describe writes')
 end
 
-check('publish --review last spends the remembered review and then forgets it') do
+check('publish --review last spends the remembered proposal with its keys and then forgets it') do
   out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
   assert(code == 0, "expected exit 0, got #{code}: #{out}")
   assert(last_args['publish']['review'] == 'rev_subset', "got #{last_args['publish'].inspect}")
+  assert(last_args['publish']['keys'] == [ 'page:/about', 'asset:assets/x.js' ], "got #{last_args['publish'].inspect}")
   assert(JSON.parse(out).dig('data', 'published') == true, 'expected published:true')
-  assert(state['last_review:onyx:draft'].nil?, 'a spent review stayed in the cache')
+  assert(state['proposal:shared:onyx:draft'].nil?, 'a spent proposal stayed in the cache')
+  assert(state['last_proposal:shared:onyx'].nil?, 'the pointer outlived its proposal')
 end
 
 check('publish --review last with nothing remembered fails locally with no request') do
@@ -1334,15 +1359,17 @@ check('a save whose build is not ready drops the remembered review rather than l
 end
 
 # -----------------------------------------------------------------------------
-# publish --review last (the Oct 16 incident, site trigg): `last` has to mean
-# the review proposed most recently for the slug, on whatever branch that was,
-# never the one remembered for the default branch. Reviews are spent only after
-# saying what is about to go live, and a stale one is refused.
+# publish --review last (the Oct 16 incident, site trigg, and review 1 of the
+# fix). `last` spends exactly the proposal `publish --keys` printed, nothing a
+# describe, wait-preview, save or merge-live wrote, and it sends the proposal's
+# keys so the server's review_mismatch guard can refuse a swapped candidate.
+# Reviews are spent only after saying what is about to go live, and a stale
+# one is refused. The pointer is per terminal pane ($HERDR_PANE_ID).
 # -----------------------------------------------------------------------------
 
 def forget_all_reviews!
   st = state
-  st.delete_if { |key, _| key.start_with?('last_review', 'review_meta:') }
+  st.delete_if { |key, _| key.start_with?('last_review', 'review_meta:', 'proposal:', 'last_proposal:') }
   File.write(STATE_PATH, JSON.pretty_generate(st))
 end
 
@@ -1352,15 +1379,29 @@ def edit_state
   File.write(STATE_PATH, JSON.pretty_generate(st))
 end
 
-check('publish --review last without --branch spends the review proposed most recently, not the draft one') do
+def ready_review_changes(dir)
+  changes = File.join(dir, 'changes.json')
+  File.write(changes, JSON.generate([ { op: 'put', kind: 'page', key: '/ready-review', document: { format: 'html', metadata: { title: 'R' }, body: '<p>r</p>' } } ]))
+  changes
+end
+
+def old_proposal!(branch, seconds_ago)
+  edit_state do |st|
+    record = st.find { |key, _| key.start_with?('proposal:') && key.end_with?(":onyx:#{branch}") }&.last
+    assert(record.is_a?(Hash), "expected a proposal record for #{branch}, got #{st.keys.grep(/proposal/).inspect}")
+    record['at'] = Time.now.to_i - seconds_ago
+    pointer = st.find { |key, _| key.start_with?('last_proposal:') && key.end_with?(':onyx') }&.last
+    pointer['at'] = record['at'] if pointer.is_a?(Hash)
+  end
+end
+
+check('publish --review last without --branch spends the proposal made most recently, not the draft one') do
   forget_all_reviews!
   run_cli('create-branch', 'onyx', 'thanks', '--from', 'live')
   # An older proposal on draft, the one the incident spent by mistake...
   run_cli('publish', 'onyx', '--keys', 'page:/about')
-  assert(state['last_review:onyx:draft'] == 'rev_subset', 'expected the draft proposal remembered')
   # ...then the candidate the agent actually meant, on another branch.
   run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
-  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'expected the thanks proposal remembered')
 
   before = requests.values.sum
   out, err, code = run_cli('publish', 'onyx', '--review', 'last')
@@ -1368,15 +1409,16 @@ check('publish --review last without --branch spends the review proposed most re
   assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
   assert(last_args['publish']['review'] == 'rev_subset_thanks', "spent #{last_args['publish']['review'].inspect}, not the thanks proposal")
   assert(last_args['publish']['branch'] == 'thanks', "expected the CLI to name the branch to the server, got #{last_args['publish'].inspect}")
+  assert(last_args['publish']['keys'] == [ 'page:/thanks' ], "expected the proposal's keys sent with the review, got #{last_args['publish'].inspect}")
   assert(requests.values.sum == before + 1, 'expected exactly one request')
   assert(err.include?('thanks'), "expected the branch on stderr, got #{err.inspect}")
   assert(err.include?('page:/thanks'), "expected the included keys on stderr, got #{err.inspect}")
   assert(err.match?(/\b\d+\s*(s|sec|second|m|min|minute)/i), "expected the proposal's age on stderr, got #{err.inspect}")
-  assert(state['last_review:onyx:thanks'].nil?, 'a spent review stayed in the cache')
-  assert(state['last_review:onyx:draft'] == 'rev_subset', 'the draft review must be untouched')
+  assert(state['proposal:shared:onyx:thanks'].nil?, 'a spent proposal stayed in the cache')
+  assert(state['proposal:shared:onyx:draft'].is_a?(Hash), 'the draft proposal must be untouched')
 end
 
-check('after spending it, --review last does not fall back to the old draft review') do
+check('after spending it, --review last does not fall back to the old draft proposal') do
   before = requests.values.sum
   out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
 
@@ -1386,7 +1428,7 @@ check('after spending it, --review last does not fall back to the old draft revi
   assert(requests.values.sum == before, 'a refused publish reached the server')
 end
 
-check('publish --review last --branch B spends the review remembered for B, whatever was proposed last') do
+check('publish --review last --branch B spends the proposal for B, whatever was proposed last') do
   forget_all_reviews!
   run_cli('publish', 'onyx', '--keys', 'page:/about')
   run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
@@ -1396,32 +1438,175 @@ check('publish --review last --branch B spends the review remembered for B, what
   assert(code == 0, "expected exit 0, got #{code}: #{out}#{err}")
   assert(last_args['publish']['review'] == 'rev_subset', "got #{last_args['publish'].inspect}")
   assert(last_args['publish']['branch'] == 'draft', "expected the branch sent to the server, got #{last_args['publish'].inspect}")
-  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'the other branch review must be untouched')
+  assert(last_args['publish']['keys'] == [ 'page:/about' ], "got #{last_args['publish'].inspect}")
+  assert(state['proposal:shared:onyx:thanks'].is_a?(Hash), 'the other branch proposal must be untouched')
 end
 
-check('a remembered review older than an hour is refused before any request, and an explicit token still works') do
+# Review 1, MUST 1: describe writes branches[].review (the full-branch review)
+# into the branch's review slot, which used to be the slot `last` spent.
+check('a proposal survives describe and wait-preview: last spends the subset, with its real keys') do
+  forget_all_reviews!
+  run_cli('create-branch', 'onyx', 'pb', '--from', 'live')
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  run_cli('describe', 'onyx')
+  preview_queue << 'ready'
+  run_cli('wait-preview', 'onyx', '--branch', 'pb', '--timeout', '5')
+  assert(state['last_review:onyx:pb'] != 'rev_subset_pb', 'the test needs describe to have written the full-branch review')
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_pb', "spent #{last_args['publish']['review'].inspect}, not the subset proposal")
+  assert(last_args['publish']['keys'] == [ 'page:/muncie' ], "got #{last_args['publish'].inspect}")
+  assert(err.include?('page:/muncie'), "expected the real keys on stderr, got #{err.inspect}")
+  assert(!err.include?('not recorded'), "the keys were recorded, got #{err.inspect}")
+end
+
+# Review 1, MUST 2: the server refuses a review whose candidate is not the one
+# the keys describe. The stub models that guard (proposed_keys / FULL_BRANCH_KEYS).
+check('last sends the remembered keys, so a swapped candidate is refused by the server and nothing is forgotten') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/about')
+  edit_state { |st| st['proposal:shared:onyx:draft']['review'] = 'rev_snap_head0' } # a full-branch token
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 1, "expected the server's refusal to fail the command, got #{code}: #{out}")
+  assert(last_args['publish']['keys'] == [ 'page:/about' ], "the CLI did not send the keys, got #{last_args['publish'].inspect}")
+  assert(JSON.parse(out).dig('body', 'error') == 'review_mismatch', "got #{out}")
+  assert(state['proposal:shared:onyx:draft'].is_a?(Hash), 'a refused publish must keep the proposal')
+end
+
+check('without the keys the same swap would publish everything: the stub guard is real') do
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_snap_head0')
+  assert(code == 0, "an explicit token without keys is not checked, got #{code}: #{out}")
+  assert(JSON.parse(out).dig('data', 'included') == [ 'page:/draft' ], "got #{out}")
+end
+
+# Review 1, MUST 3: only `publish --keys` writes the pointer.
+check('a save on another branch does not move what last means') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  Dir.mktmpdir do |dir|
+    out, _err, code = run_cli('save', 'onyx', '--changes', ready_review_changes(dir))
+    assert(code == 0, "got #{code}: #{out}")
+  end
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_pb', "last followed the save to #{last_args['publish']['review'].inspect}")
+  assert(last_args['publish']['branch'] == 'pb', "got #{last_args['publish'].inspect}")
+end
+
+check('merge-live does not move what last means either') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  run_cli('merge-live', 'onyx', '--expected-live', '1')
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_pb', "got #{last_args['publish'].inspect}")
+end
+
+check('a save with a ready review alone is not something --review last spends without --branch; the refusal says how') do
+  forget_all_reviews!
+  Dir.mktmpdir do |dir|
+    out, _err, code = run_cli('save', 'onyx', '--changes', ready_review_changes(dir), '--branch', 'thanks')
+    assert(code == 0, "got #{code}: #{out}")
+  end
+  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'expected the save review remembered for thanks')
+
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 1, "expected a refusal, got #{code}: #{out}")
+  assert(%w[NO_LAST_REVIEW AMBIGUOUS_REVIEW].include?(JSON.parse(out)['code']), "got #{out}")
+  assert(JSON.parse(out)['error'].include?('--review last --branch thanks'), "the refusal must name the command, got #{out}")
+  assert(requests.values.sum == before, 'a refused publish reached the server')
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_thanks', "got #{last_args['publish'].inspect}")
+  assert(!last_args['publish'].key?('keys'), "a save review covers the whole branch; no keys are known, got #{last_args['publish'].inspect}")
+  assert(err.include?('saved'), "expected the review to be called saved, got #{err.inspect}")
+  assert(err.include?('not recorded'), "expected 'keys: not recorded' for a full-branch review, got #{err.inspect}")
+end
+
+check('a save on the branch of a proposal drops that proposal: the candidate it bound is gone') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  Dir.mktmpdir do |dir|
+    run_cli('save', 'onyx', '--changes', ready_review_changes(dir), '--branch', 'pb')
+  end
+  assert(state['proposal:shared:onyx:pb'].nil?, 'a proposal outlived a save on its branch')
+  assert(state['last_proposal:shared:onyx'].nil?, 'the pointer outlived its proposal')
+end
+
+check('the pointer is per terminal pane: another pane does not spend this one\'s proposal') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks', env: { 'HERDR_PANE_ID' => 'pane-a' })
+  assert(state.keys.any? { |k| k.start_with?('proposal:pane-a:onyx:') }, "expected a pane-scoped proposal, got #{state.keys.inspect}")
+
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', env: { 'HERDR_PANE_ID' => 'pane-b' })
+  assert(code == 1, "pane-b has proposed nothing, got #{code}: #{out}")
+  assert(%w[NO_REVIEW NO_LAST_REVIEW AMBIGUOUS_REVIEW].include?(JSON.parse(out)['code']), "got #{out}")
+  assert(requests.values.sum == before, 'a refused publish reached the server')
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 1, "a process outside any pane shares no pane's proposal, got #{code}: #{out}")
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', env: { 'HERDR_PANE_ID' => 'pane-a' })
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_thanks', "got #{last_args['publish'].inspect}")
+end
+
+check('without a pane id, proposals share one key and last still works') do
   forget_all_reviews!
   run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
-  edit_state do |st|
-    meta = st['review_meta:onyx:thanks']
-    assert(meta.is_a?(Hash), "expected the CLI to remember when it was proposed, got #{meta.inspect}")
-    meta['at'] = Time.now.to_i - 3 * 3600
-    st['last_review_branch:onyx']['at'] = Time.now.to_i - 3 * 3600 if st['last_review_branch:onyx'].is_a?(Hash)
-  end
+  assert(state['proposal:shared:onyx:thanks'].is_a?(Hash), "got #{state.keys.inspect}")
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+end
+
+check('a remembered proposal older than an hour is refused before any request; the message gives the exact commands') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  old_proposal!('thanks', 3 * 3600)
 
   before = requests.values.sum
   out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
   assert(code == 1, 'expected a refusal')
-  assert(JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "got #{out}")
-  assert(JSON.parse(out)['error'].include?('thanks'), "expected the branch named, got #{out}")
+  parsed = JSON.parse(out)
+  assert(parsed['code'] == 'REVIEW_TOO_OLD', "got #{out}")
+  assert(parsed['error'].include?('thanks'), "expected the branch named, got #{out}")
+  assert(parsed['error'].include?('proposed'), "a proposal is called proposed, got #{out}")
+  assert(parsed['error'].include?('sites-cli publish onyx --review rev_subset_thanks --branch thanks'), "expected the explicit command, got #{out}")
+  assert(parsed['error'].include?('page:/thanks'), "expected the keys, got #{out}")
+  assert(parsed['error'].include?('same review'), "expected re-proposing the same keys to be explained, got #{out}")
   assert(requests.values.sum == before, 'a stale review reached the server')
 
   out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks')
   assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "an explicit --branch must not skip the age limit, got #{out}")
-  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'a refused review must stay remembered')
+  assert(state['proposal:shared:onyx:thanks'].is_a?(Hash), 'a refused review must stay remembered')
 
   out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_subset_thanks', '--branch', 'thanks')
   assert(code == 0, "an explicit token is the escape hatch, got #{code}: #{out}")
+end
+
+check('an old review that only describe showed is "first seen", never "proposed", and the refusal does not tell you to propose again') do
+  forget_all_reviews!
+  run_cli('describe', 'onyx')
+  edit_state { |st| st['review_meta:onyx:thanks']['at'] = Time.now.to_i - 3 * 3600 }
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks')
+  parsed = JSON.parse(out)
+  assert(code == 1 && parsed['code'] == 'REVIEW_TOO_OLD', "got #{out}")
+  assert(parsed['error'].include?('first seen'), "expected 'first seen', got #{out}")
+  assert(!parsed['error'].include?('proposed'), "describe proposed nothing, got #{out}")
+  assert(parsed['error'].include?("describe onyx --branch thanks"), "expected describe named as the way to see the current review, got #{out}")
+  assert(parsed['error'].include?('--review'), "expected the explicit command, got #{out}")
 end
 
 check('a remembered review with no recorded age (state from an older CLI) is refused as too old') do
@@ -1434,7 +1619,32 @@ check('a remembered review with no recorded age (state from an older CLI) is ref
   assert(JSON.parse(out)['error'].include?('unknown'), "expected the unknown age said, got #{out}")
 end
 
-check('two remembered reviews and nothing saying which is newest is refused with the options listed') do
+check('a proposal dated in the future (clock jump) is refused, not treated as brand new') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  old_proposal!('thanks', -86_400)
+
+  before = requests.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_TOO_OLD', "got #{code}: #{out}")
+  assert(JSON.parse(out)['error'].include?('unknown'), "expected the age called unknown, got #{out}")
+  assert(requests.values.sum == before, 'a future-dated review reached the server')
+end
+
+check('an empty key list prints "keys: (none)" and sends no keys') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  edit_state { |st| st['proposal:shared:onyx:thanks']['keys'] = [] }
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last')
+
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(err.include?('keys: (none)'), "got #{err.inspect}")
+  assert(!last_args['publish'].key?('keys'), "an empty list must not be sent, got #{last_args['publish'].inspect}")
+end
+
+check('two branches with reviews and nothing saying which is newest is refused with the options listed') do
   forget_all_reviews!
   # describe remembers branches[].review for every branch, without proposing any of them.
   run_cli('describe', 'onyx')
@@ -1450,23 +1660,6 @@ check('two remembered reviews and nothing saying which is newest is refused with
   assert(requests.values.sum == before, 'an ambiguous publish reached the server')
 end
 
-check('a save that returns a review makes that branch the one --review last means') do
-  forget_all_reviews!
-  run_cli('publish', 'onyx', '--keys', 'page:/about')
-  Dir.mktmpdir do |dir|
-    changes = File.join(dir, 'changes.json')
-    File.write(changes, JSON.generate([ { op: 'put', kind: 'page', key: '/ready-review', document: { format: 'html', metadata: { title: 'R' }, body: '<p>r</p>' } } ]))
-    out, _err, code = run_cli('save', 'onyx', '--changes', changes, '--branch', 'thanks')
-    assert(code == 0, "got #{code}: #{out}")
-  end
-  assert(state['last_review:onyx:thanks'] == 'rev_subset_thanks', 'expected the save review remembered for thanks')
-
-  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
-
-  assert(code == 0, "got #{code}: #{out}")
-  assert(last_args['publish']['review'] == 'rev_subset_thanks', "got #{last_args['publish'].inspect}")
-end
-
 check('an explicit token for another branch is refused by the server when --branch disagrees, and nothing is forgotten') do
   forget_all_reviews!
   run_cli('publish', 'onyx', '--keys', 'page:/about')
@@ -1476,29 +1669,52 @@ check('an explicit token for another branch is refused by the server when --bran
   assert(code == 1, "expected the server's refusal to fail the command, got #{out}")
   assert(last_args['publish']['branch'] == 'thanks', "the CLI must send the branch it was given, got #{last_args['publish'].inspect}")
   assert(JSON.parse(out).dig('body', 'error') == 'review_branch_mismatch', "got #{out}")
-  assert(state['last_review:onyx:draft'] == 'rev_subset', 'a refused publish must keep the review')
+  assert(state['proposal:shared:onyx:draft'].is_a?(Hash), 'a refused publish must keep the proposal')
 end
 
-check('an explicit token spent without --branch forgets the review of the branch the server says it belonged to') do
+check('an explicit token spent without --branch forgets the proposal and every slot that held it, in every pane') do
   forget_all_reviews!
-  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks', env: { 'HERDR_PANE_ID' => 'pane-a' })
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks', env: { 'HERDR_PANE_ID' => 'pane-b' })
+  edit_state { |st| st['last_review:onyx:other'] = 'rev_subset_thanks'; st['review_meta:onyx:other'] = { 'at' => Time.now.to_i } }
 
   out, _err, code = run_cli('publish', 'onyx', '--review', 'rev_subset_thanks')
 
   assert(code == 0, "got #{code}: #{out}")
-  assert(state['last_review:onyx:thanks'].nil?, 'the spent review stayed remembered under its own branch')
-  assert(state['last_review_branch:onyx'].nil?, 'the last-review pointer outlived its review')
+  leftovers = state.keys.grep(/\A(proposal|last_proposal|last_review|review_meta):.*onyx/)
+  assert(leftovers.empty?, "a spent review stayed remembered under #{leftovers.inspect}")
 end
 
-check('archive-branch clears the last-review pointer and the age record of the archived branch') do
+check('archive-branch clears the proposal, the pointer and the age record of the archived branch') do
   forget_all_reviews!
   run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
-  assert(state['review_meta:onyx:thanks'], 'expected an age record')
+  assert(state['proposal:shared:onyx:thanks'], 'expected a proposal')
 
   run_cli('archive-branch', 'onyx', 'thanks')
 
+  assert(state['proposal:shared:onyx:thanks'].nil?, 'the proposal of an archived branch stayed')
+  assert(state['last_proposal:shared:onyx'].nil?, 'the pointer to an archived branch stayed')
   assert(state['review_meta:onyx:thanks'].nil?, 'the age record of an archived branch stayed')
-  assert(state['last_review_branch:onyx'].nil?, 'the pointer to an archived branch stayed')
+end
+
+# Review 1, SHOULD 1: state.json is shared by every agent on this Mac.
+check('eight concurrent proposals all survive: state.json writes are locked and atomic') do
+  forget_all_reviews!
+  names = %w[c1 c2 c3 c4 c5 c6 c7 c8]
+  names.map { |b| Thread.new { run_cli('publish', 'onyx', '--keys', 'page:/x', '--branch', b, '--expected', 'snap_head0') } }.each(&:join)
+
+  kept = names.count { |b| state["proposal:shared:onyx:#{b}"].is_a?(Hash) }
+  assert(kept == 8, "lost #{8 - kept} of 8 concurrent proposals")
+  assert(Dir.children(CONFIG_DIR).grep(/\.tmp\z/).empty?, "a temp file was left behind: #{Dir.children(CONFIG_DIR).inspect}")
+  mode = File.stat(STATE_PATH).mode & 0o777
+  assert(mode == 0o600, "state.json must stay 0600, got #{mode.to_s(8)}")
+end
+
+check('save_json writes a temp file and renames it, so a reader never sees a half-written state.json') do
+  source = File.read(CLI)
+  body = source[/^def save_json.*?^end/m].to_s
+  assert(body.include?('File.rename'), 'expected save_json to rename a finished temp file into place')
+  assert(source.include?('flock'), 'expected a lock around state.json read-modify-write')
 end
 
 check('publish SLUG PATH still uses the legacy expected_version contract') do

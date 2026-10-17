@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.4.3'
+VERSION = '2.4.4'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
@@ -252,10 +252,38 @@ def load_json(path)
   File.file?(path) ? (JSON.parse(File.read(path)) rescue {}) : {}
 end
 
+# Written to a temp file in the same directory and renamed into place, so a
+# reader (or a crash) never sees half a file. A half-read state.json parses as
+# {} and the next writer would save that back over every remembered token.
 def save_json(path, data)
   FileUtils.mkdir_p(File.dirname(path))
-  File.write(path, JSON.pretty_generate(data))
-  File.chmod(0o600, path)
+  tmp = "#{path}.#{Process.pid}.#{SecureRandom.hex(4)}.tmp"
+  begin
+    File.open(tmp, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(JSON.pretty_generate(data)) }
+    File.rename(tmp, path)
+  ensure
+    File.delete(tmp) if File.exist?(tmp)
+  end
+end
+
+STATE_LOCK_PATH = "#{STATE_PATH}.lock"
+
+# state.json is shared by every agent on this Mac, and a read-modify-write of
+# it from two processes loses one of the writes (7 of 8 reviews survived in
+# review 1). Every change goes through here: take the lock, read, yield the
+# state, save it if the block changed it. The block's value is returned. Do not
+# call update_state from inside the block (a second flock on the same file
+# from the same process would wait for the first).
+def update_state
+  FileUtils.mkdir_p(File.dirname(STATE_LOCK_PATH))
+  File.open(STATE_LOCK_PATH, File::RDWR | File::CREAT, 0o600) do |lock|
+    lock.flock(File::LOCK_EX)
+    state = load_json(STATE_PATH)
+    before = Marshal.load(Marshal.dump(state))
+    result = yield state
+    save_json(STATE_PATH, state) unless state == before
+    result
+  end
 end
 
 # Credentials live outside this git checkout (~/.config, not ~/tools/sites-cli)
@@ -314,9 +342,7 @@ def state_key(slug, path) = "#{slug}/#{path}"
 
 def remember_version(slug, path, version)
   return unless version
-  state = load_json(STATE_PATH)
-  state[state_key(slug, path)] = version
-  save_json(STATE_PATH, state)
+  update_state { |state| state[state_key(slug, path)] = version }
 end
 
 def cached_version(slug, path) = load_json(STATE_PATH)[state_key(slug, path)]
@@ -334,54 +360,76 @@ def review_key(slug, branch) = "last_review:#{slug}:#{branch}"
 
 def cached_expected(slug, branch) = load_json(STATE_PATH)[expected_key(slug, branch)]
 
-def cached_review(slug, branch) = load_json(STATE_PATH)[review_key(slug, branch)]
-
-# What the CLI knows about a remembered review beyond the token: when it was
-# proposed (or first seen) and, for a `publish --keys` proposal, which keys it
-# carries. `publish --review last` prints both before it spends anything, and
-# refuses a review older than REVIEW_MAX_AGE.
+# What the CLI knows about a review in a branch's slot: when it saw it and
+# whether that was a save (`saved`: an act on the branch) or only a describe or
+# a wait-preview (`seen`: it keeps the time it was first seen, so polling
+# cannot make an old review look new). A slot review covers everything pending
+# on the branch, so it never carries keys.
 def review_meta_key(slug, branch) = "review_meta:#{slug}:#{branch}"
 
-# The one branch whose review `--review last` means for a slug: the branch of
-# the most recent proposal or save, written only by those, never by describe.
-# Without it `last` would have to guess a branch, and guessing `draft` is what
-# put the wrong changes live on Oct 16 (ticket 1930).
-def last_review_branch_key(slug) = "last_review_branch:#{slug}"
-
 REVIEW_MAX_AGE = 3600
+CLOCK_TOLERANCE = 60
 
-# Mutates `state` and does not save it. `explicit` is an act on this branch
-# (a proposal or a save); it always stamps the time and, with `mark_last`,
-# becomes the branch `last` means. A review merely seen again in a describe
-# keeps the time it was first seen, so polling cannot make an old review look
-# new.
-def store_review!(state, slug, branch, review, included: nil, explicit: false, mark_last: false)
-  changed = state[review_key(slug, branch)] != review
-  state[review_key(slug, branch)] = review
-  if explicit || changed
-    meta = { 'at' => Time.now.to_i }
-    meta['included'] = included if included
-    state[review_meta_key(slug, branch)] = meta
-  end
-  state[last_review_branch_key(slug)] = { 'branch' => branch, 'at' => Time.now.to_i } if explicit && mark_last
+# A proposal is what `publish --keys` printed: the exact review token, the keys
+# its candidate carries, and when. It has its own slot, which only
+# `publish --keys` writes. describe and wait-preview write the branch slot with
+# the full-branch review, and used to overwrite the proposal there, so `last`
+# spent everything pending on the branch (review 1, MUST 1). Nothing but a
+# newer proposal, a spend, a save on that branch or an archive touches it.
+#
+# state.json is shared by every agent on this Mac, so proposals are scoped to
+# the terminal pane that made them ($HERDR_PANE_ID; processes without one
+# share the key "shared"). A save by another lane can no longer change what
+# `--review last` means here.
+def pane_scope
+  pane = ENV['HERDR_PANE_ID'].to_s.gsub(/[^A-Za-z0-9._-]/, '_')
+  pane.empty? ? 'shared' : pane
 end
 
-# A review that is spent, replaced by null, or whose branch is archived is not
-# a review any more, and neither is a pointer to it.
-def drop_review!(state, slug, branch)
-  removed = [state.delete(review_key(slug, branch)), state.delete(review_meta_key(slug, branch))].any?
-  pointer = state[last_review_branch_key(slug)]
-  if pointer.is_a?(Hash) && pointer['branch'] == branch
-    state.delete(last_review_branch_key(slug))
+def proposal_key(scope, slug, branch) = "proposal:#{scope}:#{slug}:#{branch}"
+
+# {branch, at}: the branch whose proposal `--review last` means in this pane.
+def proposal_pointer_key(scope, slug) = "last_proposal:#{scope}:#{slug}"
+
+def drop_branch_review!(state, slug, branch)
+  [state.delete(review_key(slug, branch)), state.delete(review_meta_key(slug, branch))].any?
+end
+
+# Any pane's proposals for the slug, narrowed to a branch (it moved or went
+# away) or to a token (it was spent: spent is spent for every pane).
+def drop_proposals!(state, slug, branch: nil, review: nil)
+  pattern = /\Aproposal:([^:]+):#{Regexp.escape(slug)}:(.+)\z/
+  removed = false
+  state.keys.each do |key|
+    match = pattern.match(key) or next
+    record = state[key]
+    next if branch && match[2] != branch
+    next if review && !(record.is_a?(Hash) && record['review'] == review)
+    state.delete(key)
     removed = true
+    pointer = state[proposal_pointer_key(match[1], slug)]
+    state.delete(proposal_pointer_key(match[1], slug)) if pointer.is_a?(Hash) && pointer['branch'] == match[2]
   end
   removed
 end
 
-def forget_review(slug, branch)
-  state = load_json(STATE_PATH)
-  return unless drop_review!(state, slug, branch)
-  save_json(STATE_PATH, state)
+# Mutates `state` and does not save it. `explicit` is an act on this branch (a
+# save); it always stamps the time. A review merely seen again in a describe
+# keeps the time it was first seen.
+def store_review!(state, slug, branch, review, explicit: false)
+  changed = state[review_key(slug, branch)] != review
+  state[review_key(slug, branch)] = review
+  return unless explicit || changed
+  state[review_meta_key(slug, branch)] = { 'at' => Time.now.to_i, 'source' => explicit ? 'saved' : 'seen' }
+end
+
+# A spent review is not a review any more, in whatever slot or pane held it.
+def forget_spent_review!(state, slug, review)
+  prefix = "last_review:#{slug}:"
+  state.keys.select { |key| key.start_with?(prefix) && state[key] == review }.each do |key|
+    drop_branch_review!(state, slug, key.delete_prefix(prefix))
+  end
+  drop_proposals!(state, slug, review: review)
 end
 
 # An archived branch is out of service (nothing is deleted, no asset URL stops
@@ -390,10 +438,11 @@ end
 # corpse: the next `create-branch` reusing that name would inherit CAS/review
 # state from a branch that no longer exists (pc_6e8f551e).
 def forget_branch_state(slug, branch)
-  state = load_json(STATE_PATH)
-  removed_expected = state.delete(expected_key(slug, branch))
-  removed_review = drop_review!(state, slug, branch)
-  save_json(STATE_PATH, state) if removed_expected || removed_review
+  update_state do |state|
+    state.delete(expected_key(slug, branch))
+    drop_branch_review!(state, slug, branch)
+    drop_proposals!(state, slug, branch: branch)
+  end
 end
 
 # Called only with a 2xx body. A 409 branch_changed also carries the current
@@ -404,9 +453,16 @@ end
 # `data['name']` is the site's display name on describe_site, so only
 # `data['branch']` names a branch at the top level; inside `branches[]` it is
 # `name`. An explicit `"review": null` (a save whose build is not ready yet)
-# drops the remembered review instead of leaving `--review last` pointed at a
-# candidate that no longer describes this branch.
-def remember_branch_state(slug, data, mark_last: false)
+# drops the branch's remembered review instead of leaving `--review last
+# --branch B` pointed at a candidate that no longer describes this branch.
+#
+# `moved` is a response about an act that moved one branch's head (a save, a
+# merge-live, a resolve-merge): a proposal on that branch bound a candidate
+# built from the old head, so it is forgotten. A describe never does that, even
+# when it shows `review: null` for a build that is still queued.
+# `reviews: false` is a `publish --keys` answer, whose `review` is a proposal
+# (remember_proposal) and not the branch's own review.
+def remember_branch_state(slug, data, moved: false, reviews: true)
   return unless data.is_a?(Hash)
 
   # [name, entry, top_level]: only a response about one branch (a save, a
@@ -414,20 +470,20 @@ def remember_branch_state(slug, data, mark_last: false)
   entries = [[data['branch'], data, true]]
   Array(data['branches']).each { |b| entries << [b['name'], b, false] if b.is_a?(Hash) }
 
-  state = load_json(STATE_PATH)
-  before = state.dup
-  entries.each do |name, entry, top|
-    next if name.to_s.empty?
-    state[expected_key(slug, name)] = entry['expected'] unless entry['expected'].to_s.empty?
-    next unless entry.key?('review')
-    review = entry['review'].to_s
-    if review.empty?
-      drop_review!(state, slug, name)
-    else
-      store_review!(state, slug, name, review, explicit: top && mark_last, mark_last: mark_last)
+  update_state do |state|
+    entries.each do |name, entry, top|
+      next if name.to_s.empty?
+      state[expected_key(slug, name)] = entry['expected'] unless entry['expected'].to_s.empty?
+      drop_proposals!(state, slug, branch: name) if top && moved
+      next unless reviews && entry.key?('review')
+      review = entry['review'].to_s
+      if review.empty?
+        drop_branch_review!(state, slug, name)
+      else
+        store_review!(state, slug, name, review, explicit: top && moved)
+      end
     end
   end
-  save_json(STATE_PATH, state) unless state == before
 end
 
 def resolve_expected(slug, branch, given)
@@ -551,7 +607,7 @@ def tool_call(slug, tool, arguments, credential: nil, remember: true, path: TOOL
     note_if_server_predates_round2(tool, arguments, err)
     return fail_with(err)
   end
-  remember_branch_state(slug, data, mark_last: %w[save merge_live].include?(tool)) if remember
+  remember_branch_state(slug, data, moved: %w[save merge_live resolve_merge].include?(tool)) if remember
   success(data)
 end
 
@@ -1026,11 +1082,14 @@ end
 # `--review` it hands back is the only thing that moves live.
 # -----------------------------------------------------------------------------
 
-def remember_review(slug, branch, review, included: nil)
+def remember_proposal(slug, branch, review, keys)
   return if review.to_s.empty?
-  state = load_json(STATE_PATH)
-  store_review!(state, slug, branch, review, included: included, explicit: true, mark_last: true)
-  save_json(STATE_PATH, state)
+  scope = pane_scope
+  now = Time.now.to_i
+  update_state do |state|
+    state[proposal_key(scope, slug, branch)] = { 'review' => review, 'keys' => keys, 'at' => now }
+    state[proposal_pointer_key(scope, slug)] = { 'branch' => branch, 'at' => now }
+  end
 end
 
 def describe_age(seconds)
@@ -1040,94 +1099,152 @@ def describe_age(seconds)
   "#{seconds / 3600}h"
 end
 
-# "draft (3m old, page:/about)" -- one remembered review, for a message.
-def review_summary(slug, branch, state)
-  meta = state[review_meta_key(slug, branch)]
-  age = meta.is_a?(Hash) && meta['at'] ? [Time.now.to_i - meta['at'].to_i, 0].max : nil
-  keys = meta.is_a?(Hash) && meta['included'].is_a?(Array) ? meta['included'].join(', ') : nil
-  "#{branch} (proposed #{describe_age(age)} ago#{keys ? ", keys: #{keys}" : ''})"
+# Seconds since `at`, or nil when nothing says (no time recorded) or the time
+# is in the future, which a clock jump makes look brand new.
+def review_age(at)
+  return nil unless at.is_a?(Numeric)
+  delta = Time.now.to_i - at.to_i
+  return nil if delta < -CLOCK_TOLERANCE
+  [delta, 0].max
 end
 
-def remembered_review_branches(slug, state)
-  prefix = "last_review:#{slug}:"
-  state.keys.select { |key| key.start_with?(prefix) }.map { |key| key.delete_prefix(prefix) }.sort
-end
+REVIEW_HOW = { 'proposed' => 'proposed', 'saved' => 'saved', 'seen' => 'first seen' }.freeze
 
-def review_options(slug, state)
-  remembered_review_branches(slug, state).map do |name|
-    "  sites-cli publish #{slug} --review last --branch #{name}    # #{review_summary(slug, name, state)}"
-  end.join("\n")
-end
-
-# `last` is the review most recently proposed (or saved) for this slug, on
-# whatever branch that was -- not the review for the default branch. Without
-# --branch it is the branch the per-slug pointer names. If there is no
-# pointer (a state file from an older CLI, a spent review, or nothing but
-# describe output) the state cannot say which review is newest, so this
-# refuses and lists them rather than guessing.
-def resolve_last_review(slug, branch)
-  state = load_json(STATE_PATH)
-  if branch.nil?
-    pointer = state[last_review_branch_key(slug)]
-    branch = pointer['branch'] if pointer.is_a?(Hash)
-    if branch.nil? || state[review_key(slug, branch)].nil?
-      names = remembered_review_branches(slug, state)
-      if names.empty?
-        return [nil, nil, api_error("no review remembered for #{slug} -- run `sites-cli describe #{slug} --branch BRANCH` " \
-                                    "and pass branches[].review, or take the review a save or a `publish --keys` returned",
-                                    code: 'NO_REVIEW')]
-      end
-      code = names.size > 1 ? 'AMBIGUOUS_REVIEW' : 'NO_LAST_REVIEW'
-      return [nil, nil, api_error("`--review last` needs to know which branch you mean: nothing was proposed or saved for #{slug} " \
-                                  "since the last publish, and #{names.size == 1 ? 'one review is' : 'several reviews are'} remembered. " \
-                                  "Name the branch:\n#{review_options(slug, state)}\n" \
-                                  "or propose again with `publish --keys`, or pass the review token itself.",
-                                  code: code)]
-    end
+# The review `--review last` would spend for a branch, or nil. A proposal made
+# from this pane wins over the branch's own slot, which describe and save write.
+# `keys` is the list the review's candidate carries when the CLI knows it
+# (a proposal), nil when the review covers whatever is pending on the branch.
+def remembered_review(state, slug, branch, scope)
+  proposal = state[proposal_key(scope, slug, branch)]
+  if proposal.is_a?(Hash) && !proposal['review'].to_s.empty?
+    return { review: proposal['review'], branch: branch, keys: Array(proposal['keys']), at: proposal['at'], source: 'proposed' }
   end
 
   review = state[review_key(slug, branch)]
-  unless review
-    return [nil, nil, api_error("no review remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` " \
-                                "and pass branches[].review, or take the review a save or a `publish --keys` returned",
-                                code: 'NO_REVIEW')]
-  end
-
+  return nil if review.to_s.empty?
   meta = state[review_meta_key(slug, branch)]
-  age = meta.is_a?(Hash) && meta['at'] ? [Time.now.to_i - meta['at'].to_i, 0].max : nil
-  if age.nil? || age > REVIEW_MAX_AGE
-    return [nil, nil, api_error("the review remembered for #{slug}/#{branch} is #{age.nil? ? 'of unknown age' : "#{describe_age(age)} old"} " \
-                                "(the limit is #{REVIEW_MAX_AGE / 60} minutes), so it was not published. Propose again with " \
-                                "`sites-cli publish #{slug} --branch #{branch} --keys ...` and review the new preview, or pass " \
-                                "the review token itself with --review TOKEN.",
-                                code: 'REVIEW_TOO_OLD')]
-  end
-  [review, branch, nil, meta, age]
+  meta = {} unless meta.is_a?(Hash)
+  { review: review, branch: branch, keys: nil, at: meta['at'], source: meta['source'] == 'saved' ? 'saved' : 'seen' }
 end
 
-def cmd_publish_review(slug, review, branch, base, idempotency)
+def review_keys_text(found)
+  keys = found[:keys]
+  return "not recorded (the review covers everything pending on #{found[:branch]})" if keys.nil?
+  keys.empty? ? '(none)' : keys.join(', ')
+end
+
+# "draft (proposed 3m ago, keys: page:/about)" -- one remembered review, for a message.
+def review_summary(found)
+  age = review_age(found[:at])
+  "#{found[:branch]} (#{REVIEW_HOW[found[:source]]} #{age ? "#{describe_age(age)} ago" : 'at an unknown time'}, keys: #{review_keys_text(found)})"
+end
+
+def remembered_review_branches(slug, state, scope)
+  slots = state.keys.select { |key| key.start_with?("last_review:#{slug}:") }.map { |key| key.delete_prefix("last_review:#{slug}:") }
+  proposals = state.keys.select { |key| key.start_with?("proposal:#{scope}:#{slug}:") }.map { |key| key.delete_prefix("proposal:#{scope}:#{slug}:") }
+  (slots + proposals).uniq.sort
+end
+
+def review_options(slug, state, scope)
+  remembered_review_branches(slug, state, scope).filter_map do |name|
+    found = remembered_review(state, slug, name, scope) or next
+    "  sites-cli publish #{slug} --review last --branch #{name}    # #{review_summary(found)}"
+  end.join("\n")
+end
+
+# Too old to spend on the strength of `last`. The server rechecks the branch
+# head, live and the build on every publish, so age is not what makes a review
+# dangerous; it is the human check that went with it. Say what it was and give
+# the exact way to spend it anyway.
+def review_too_old(slug, found, age)
+  how = REVIEW_HOW[found[:source]]
+  when_text = age.nil? ? "#{how} at an unknown time (none was recorded, or it is in the future)" : "#{how} #{describe_age(age)} ago"
+  branch = found[:branch]
+  explicit = "sites-cli publish #{slug} --review #{found[:review]} --branch #{branch}"
+  head = "the review remembered for #{slug}/#{branch} was #{when_text} (the limit is #{REVIEW_MAX_AGE / 60} minutes), so it was not published."
+  if found[:source] == 'proposed'
+    keys = found[:keys].to_a
+    again = "sites-cli publish #{slug} --branch #{branch} --keys #{keys.join(',')}"
+    return api_error("#{head} It binds the keys #{keys.empty? ? '(none recorded)' : keys.join(', ')}. To publish exactly that, " \
+                     "pass the token yourself: `#{explicit}`. Or propose the same keys again with `#{again}`: when nothing " \
+                     'has changed it returns the same review, so the preview already checked still applies.',
+                     code: 'REVIEW_TOO_OLD')
+  end
+  api_error("#{head} It covers everything pending on #{branch}. Look at the branch with `sites-cli describe #{slug} --branch #{branch}`, " \
+            "check that branches[].review is the review you mean, and pass it yourself: `#{explicit}`.",
+            code: 'REVIEW_TOO_OLD')
+end
+
+# `last` is the review proposed most recently, with `publish --keys`, from this
+# terminal pane -- never one a describe, wait-preview, save or merge-live wrote,
+# and never one another pane proposed. With --branch B it is B's proposal, else
+# B's own review from a save or a describe (which covers everything pending on
+# B). With nothing to go on it refuses and lists what is remembered, rather
+# than guessing: guessing `draft` is what put the wrong changes live on Oct 16
+# (ticket 1930).
+def resolve_last_review(slug, branch)
+  state = load_json(STATE_PATH)
+  scope = pane_scope
+  found = nil
+
+  if branch.nil?
+    pointer = state[proposal_pointer_key(scope, slug)]
+    name = pointer['branch'] if pointer.is_a?(Hash)
+    found = remembered_review(state, slug, name, scope) if name && state[proposal_key(scope, slug, name)].is_a?(Hash)
+    if found.nil?
+      names = remembered_review_branches(slug, state, scope)
+      if names.empty?
+        return [nil, api_error("no review remembered for #{slug} -- run `sites-cli describe #{slug} --branch BRANCH` " \
+                               "and pass branches[].review, or take the review a save or a `publish --keys` returned",
+                               code: 'NO_REVIEW')]
+      end
+      code = names.size > 1 ? 'AMBIGUOUS_REVIEW' : 'NO_LAST_REVIEW'
+      return [nil, api_error("`--review last` without --branch spends the review you last proposed with `publish --keys` from this " \
+                             "terminal, and there is none for #{slug} (it was spent, saved over, or proposed somewhere else). " \
+                             "A review from a save or a describe needs its branch named. #{names.size == 1 ? 'One review is' : 'Several reviews are'} remembered:\n" \
+                             "#{review_options(slug, state, scope)}\n" \
+                             "or propose again with `publish --keys`, or pass the review token itself.",
+                             code: code)]
+    end
+  else
+    found = remembered_review(state, slug, branch, scope)
+    if found.nil?
+      return [nil, api_error("no review remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` " \
+                             "and pass branches[].review, or take the review a save or a `publish --keys` returned",
+                             code: 'NO_REVIEW')]
+    end
+  end
+
+  age = review_age(found[:at])
+  return [nil, review_too_old(slug, found, age)] if age.nil? || age > REVIEW_MAX_AGE
+  [found, nil, age]
+end
+
+def cmd_publish_review(slug, review, branch, base, idempotency, keys: [])
   if review == 'last'
-    review, branch, err, meta, age = resolve_last_review(slug, branch)
+    found, err, age = resolve_last_review(slug, branch)
     return fail_with(err) if err
-    keys = meta.is_a?(Hash) && meta['included'].is_a?(Array) ? meta['included'].join(', ') : "not recorded (the review covers what is pending on #{branch})"
-    $stderr.puts("publish: spending the review for #{slug} branch #{branch}, proposed #{describe_age(age)} ago; keys: #{keys}")
+    review = found[:review]
+    branch = found[:branch]
+    $stderr.puts("publish: spending the review for #{slug} branch #{branch}, #{REVIEW_HOW[found[:source]]} #{describe_age(age)} ago; " \
+                 "keys: #{review_keys_text(found)}")
     base = base.merge('branch' => branch)
+    # The server refuses a review whose candidate is not the one these keys
+    # describe (review_mismatch). Sending what was proposed makes that guard
+    # work for `last` too, on the server that is live today.
+    base = base.merge('keys' => found[:keys]) if found[:keys].to_a.any? && keys.empty? && !base.key?('keys')
   elsif branch
     base = base.merge('branch' => branch)
   end
+  base = base.merge('keys' => keys) if keys.any?
 
   data, err = api_call(slug, 'publish', base.merge('review' => review,
                                                    'idempotency_key' => idempotency || SecureRandom.uuid))
   return fail_with(err) if err
   # A spent review is not a review any more -- publishing with it again is a
-  # 409 upstream_changed. Only the branches that remembered this exact token
-  # are cleared, so an explicit token for another branch changes nothing.
-  if data['published']
-    state = load_json(STATE_PATH)
-    remembered_review_branches(slug, state).each do |name|
-      forget_review(slug, name) if state[review_key(slug, name)] == review
-    end
-  end
+  # 409 upstream_changed. Every slot and pane that remembered this exact token
+  # is cleared, so an explicit token for another branch changes nothing else.
+  update_state { |state| forget_spent_review!(state, slug, review) } if data['published']
   remember_branch_state(slug, data)
   # publication is a site-wide sequence, not this site's own count, so a jump
   # from 12 to 38 is normal -- every other tenant's publish moved it too --
@@ -1143,14 +1260,14 @@ end
 def cmd_publish_keys(slug, branch, args)
   data, err = api_call(slug, 'publish', args)
   return fail_with(err) if err
-  remember_branch_state(slug, data)
+  remember_branch_state(slug, data, reviews: false)
   code = success(data)
   return code unless data['published'] == false
 
   # A proposal is a real 200 and the CLI did exactly what it was asked, so this
   # exits 0 -- but published:false is never "shipped", and the second call is
   # the one that flips live.
-  remember_review(slug, branch, data['review'], included: Array(data['included']))
+  remember_proposal(slug, data['branch'] || branch, data['review'], Array(data['included']))
   included = Array(data['included']).size
   left = Array(data['left_on_branch']).size
   $stderr.puts("published: false -- live is unchanged. #{included} key(s) in the candidate, #{left} left on #{branch}.")
@@ -3237,12 +3354,14 @@ def usage
     retried and never updates that cache -- rerun describe and look at it.
     --idempotency-key defaults to a fresh UUID.
 
-    --review never defaults. `--review last` means the review most recently
-    proposed or saved for that slug, on whatever branch that was (with
-    --branch B it means B's review); it prints the branch, the keys and the
-    age to stderr first, and refuses one older than an hour, or when the
-    state cannot say which review is newest. Pass the token itself to
-    publish anything else.
+    --review never defaults. Bare `--review last` means the review that the
+    most recent `publish --keys` from this terminal pane ($HERDR_PANE_ID)
+    printed, spent with that proposal's keys so the server refuses any other
+    candidate; describe, wait-preview, save and merge-live never change it.
+    With --branch B it means B's own review (a save's or a describe's, which
+    covers everything pending on B). It prints the branch, the keys and the
+    age to stderr first, and refuses one older than an hour or of unknown
+    age. Pass the token itself to publish anything else.
 
     publish --expected --keys proposes a candidate and answers published:false.
     That is a 200 and exit 0, and live is untouched: the second call,
@@ -3301,8 +3420,8 @@ def usage
         --message "onyx, three pages"
       sites-cli wait-preview onyx
       sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
-      sites-cli publish onyx --review last
-      sites-cli connect-domain onyx onyxmodular.com   # then verify-domain, then publish again
+      sites-cli publish onyx --review last --branch draft
+      sites-cli connect-domain onyx onyxmodular.com   # then verify-domain, describe, publish --review last --branch draft
 
     A preview hostname is <token>--onyx.gxbsites.com (two dashes). Grants
     minted before 2026-09-22 use one dash and still resolve.
@@ -3619,7 +3738,7 @@ def run(argv)
     path = argv.shift
 
     if review
-      return cmd_publish_review(slug, review, branch, base, idempotency)
+      return cmd_publish_review(slug, review, branch, base, idempotency, keys: keys)
     end
     if keys.any? || expected_flag
       expected, err = resolve_expected(slug, branch || DEFAULT_BRANCH, expected_flag)

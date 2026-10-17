@@ -150,22 +150,27 @@ All three access commands need `manage_access` and use the same tools as Chat.
   a head read uses; caching it would hand the next `save` a token for a
   snapshot the branch is not on. Nor does `save --dry-run`: a rehearsal makes
   no snapshot, so it leaves no local state.
-- **`--review` never defaults.** A review is a binding to one exact candidate,
-  so it is remembered under its own key and only `--review last` spends it.
-  `publish --review last` with nothing remembered fails locally (`NO_REVIEW`)
-  with no request. Without `--branch` it means the review most recently
-  proposed (`publish --keys`) or saved (`save`, `merge-live`) for that slug, on
-  any branch, tracked in `last_review_branch:<slug>`; it never falls back to
-  `draft`. Before it spends anything it prints the branch, the keys (for a
-  proposal) and the age to stderr, and it sends the branch to the server, which
-  refuses a review minted for another branch (422 `review_branch_mismatch`). A
-  review older than an hour or of unknown age is `REVIEW_TOO_OLD`; with no
-  last-review pointer (older state file, spent review, describe output only) it
-  is `NO_LAST_REVIEW` (one remembered review) or `AMBIGUOUS_REVIEW` (several),
-  each listing the `--branch` choices. `--review last --branch B` uses B's
-  review, with the same age limit. A `save` whose build is not ready answers `review: null`,
-  which drops the remembered one rather than leaving `last` pointed at a
-  candidate that no longer describes the branch.
+- **`--review` never defaults.** A review is a binding to one exact candidate.
+  Without `--branch`, `--review last` means exactly one thing: the review
+  that the most recent `publish --keys` **from this terminal pane**
+  (`$HERDR_PANE_ID`; a process without one shares the key `shared`) printed.
+  It is kept in a proposal record (token, keys, time) that only `publish
+  --keys` writes. describe, wait-preview, save, merge-live and another lane's
+  commands never change it. Before it spends anything it prints the branch,
+  the keys and the age to stderr. It sends the branch **and the proposal's
+  keys** with the review, so the server refuses a swapped candidate (422
+  `review_mismatch`, `review_branch_mismatch`). It never falls back to
+  `draft`. A review from a `save` or a describe is not what bare `last`
+  means: spend it with `--review last --branch B` or the token itself. With
+  nothing to go on, `last` fails locally with no request: `NO_REVIEW`
+  (nothing remembered), `NO_LAST_REVIEW` (one review remembered) or
+  `AMBIGUOUS_REVIEW` (several), each listing the `--branch` choices. A review
+  older than an hour, of unknown age, or dated in the future is
+  `REVIEW_TOO_OLD`; the refusal prints the exact explicit command. Re-proposing
+  the same keys returns the same review when nothing changed. A `save` whose
+  build is not ready answers `review: null`, which drops the branch's
+  remembered review; a save or merge-live on a branch also drops that branch's
+  proposal, because its candidate was built from the old head.
 - `--idempotency-key` defaults to a fresh UUID.
 - Every tool subcommand also takes `--json FILE` or `--json -` (stdin) to
   supply the whole arguments object; explicit flags override individual keys.
@@ -234,9 +239,14 @@ with no entry of its own. `state.json` is one flat map with two key shapes:
 | Key | Value | Written by |
 |---|---|---|
 | `expected:<slug>:<branch>` | branch head CAS token (`snap_...`) | every 2xx v2 response carrying `branch`+`expected`, and every `branches[]` entry in `describe`. Never a `read --at` response, never a `save --dry-run`, never a 409 body |
-| `last_review:<slug>:<branch>` | the last `review` this CLI printed for that branch | every 2xx response carrying `branch`+`review` (`describe`, `save`, `create-branch`, `merge-live`, `resolve-merge`, `publish --keys`, `wait-preview`). An explicit `review: null` deletes it; so does a `publish --review` that spends it |
-| `review_meta:<slug>:<branch>` | `{at, included}`: when that review was proposed or first seen, and the keys of a `publish --keys` proposal | beside `last_review`. A describe that sees the same token again leaves `at` alone. Deleted with the review |
-| `last_review_branch:<slug>` | `{branch, at}`: the branch `--review last` means | only `publish --keys`, `save` and `merge-live`, never describe. Deleted when that branch's review is spent, nulled or archived |
+| `last_review:<slug>:<branch>` | the last full-branch `review` this CLI printed for that branch | every 2xx response carrying `branch`+`review` (`describe`, `save`, `create-branch`, `merge-live`, `resolve-merge`, `wait-preview`), never a `publish --keys` proposal. An explicit `review: null` deletes it; so does a `publish --review` that spends it |
+| `review_meta:<slug>:<branch>` | `{at, source}`: when that review was first seen (`seen`) or saved (`saved`) | beside `last_review`. A describe that sees the same token again leaves `at` alone. Deleted with the review |
+| `proposal:<pane>:<slug>:<branch>` | `{review, keys, at}`: what `publish --keys` printed; `<pane>` is `$HERDR_PANE_ID` or `shared` | only `publish --keys`. Deleted when the token is spent (in every pane), by a save or merge-live on that branch, or by archive-branch |
+| `last_proposal:<pane>:<slug>` | `{branch, at}`: the branch bare `--review last` means in that pane | only `publish --keys`. Deleted with its proposal |
+
+Every change to `state.json` takes an `flock` on `state.json.lock` and is
+written to a temp file and renamed, so concurrent agents do not lose each
+other's tokens.
 | `<slug>/<path>` | legacy file version | `read_file`, `write_file`, `edit_file`, `write_file --file` |
 
 A review is never written under an `expected:` key and is never sent unless
@@ -518,7 +528,8 @@ sites-cli list-domains onyx                    # canonical_url, every claim, wha
 sites-cli connect-domain onyx onyxmodular.com  # creates the claim, prints the record to publish
 # publish that TXT record at the registrar, wait for DNS
 sites-cli verify-domain onyx onyxmodular.com   # 200 {verified:true}, or 200 {verified:false, checked:[...]}
-sites-cli publish onyx --review last           # republish: the artifact is built for a host
+sites-cli describe onyx --branch draft         # the first publish used up the old review; this shows the new one
+sites-cli publish onyx --review last --branch draft   # republish: the artifact is built for a host
 ```
 
 `connect-domain` prints one copyable line on stderr:
@@ -726,14 +737,15 @@ next: preview it, then `sites-cli publish onyx --review last` (or --review "<tok
 ```
 
 `publish SLUG --review TOKEN` is the call that swaps live to the exact
-candidate that review binds. `--review last` spends the review this CLI most
-recently proposed or saved for that slug (on any branch, never silently
-`draft`), says the branch, keys and age on stderr first, then forgets it,
-because a spent review publishes nothing the second time (409
-`upstream_changed`). The answer names the `branch` and the `included` keys that
-went live. A review from
-`save` covers the whole branch delta, so passing it with a narrower `--keys`
-list is 422 `review_mismatch`.
+candidate that review binds. `--review last` spends the review that the most
+recent `publish --keys` from this terminal pane printed (never silently
+`draft`), says the branch, keys and age on stderr first, sends those keys
+and that branch with the review, then forgets it, because a spent review
+publishes nothing the second time (409 `upstream_changed`). The answer names
+the `branch`, the `included` keys that went live and `removed`, the keys that
+left live. A review from `save` covers the whole branch delta, so passing it
+with a narrower `--keys` list is 422 `review_mismatch`. To spend a save's
+review: `publish SLUG --review last --branch B`, or the token itself.
 
 ## wait-preview
 
@@ -857,12 +869,13 @@ sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
 
 # 5. publish the whole branch delta
 sites-cli describe onyx                       # remembers branches[].review
-sites-cli publish onyx --review last
+sites-cli publish onyx --review last --branch draft   # the branch's whole delta
 
 # 6. the public URL
 sites-cli connect-domain onyx onyxmodular.com # prints the TXT record to publish
 sites-cli verify-domain onyx onyxmodular.com  # once DNS has propagated
-sites-cli publish onyx --review last          # the artifact is built for a host
+sites-cli describe onyx --branch draft        # the first publish used up the old review
+sites-cli publish onyx --review last --branch draft   # the artifact is built for a host
 ```
 
 To see the conversion before committing to it, `sites-cli fragment
@@ -872,7 +885,7 @@ no request. To ship one page and its assets first, publish is two calls:
 ```bash
 sites-cli publish onyx --keys page:/about     # 200 published:false + its own review
 sites-cli wait-preview onyx                   # the candidate has its own build
-sites-cli publish onyx --review last          # this is what flips live
+sites-cli publish onyx --review last          # spends THAT proposal (its keys), not the whole draft
 ```
 
 A missing static dependency (`BufferGeometryUtils.js`) makes the `save`
@@ -921,10 +934,12 @@ for route in / /about /services /contact; do
 done
 
 # 5. Publish, then move the hostname.
-sites-cli publish SLUG --review last
+sites-cli describe SLUG
+sites-cli publish SLUG --review last --branch draft
 sites-cli connect-domain SLUG SOURCE
 sites-cli verify-domain SLUG SOURCE
-sites-cli publish SLUG --review last
+sites-cli describe SLUG --branch draft      # the first publish used up the old review
+sites-cli publish SLUG --review last --branch draft
 ```
 
 Read every `fragment` warning before step 3 finishes. Each one in that table is
