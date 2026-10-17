@@ -67,6 +67,8 @@ publications = 0
 # same candidate. A subset proposal binds the keys it was proposed with; any
 # other (full-branch) review binds everything pending on its branch.
 proposed_keys = {}
+omit_open_reviews = false
+saved_reviews = {}                             # branch => the review its last ready save answered
 FULL_BRANCH_KEYS = %w[page:/about page:/muncie page:/thanks].freeze
 preview_queue = []                             # statuses wait-preview walks through
 fail_batch_read = false                        # a test arms this to play a pre-slice-E server
@@ -202,8 +204,13 @@ server.mount_proc('/') do |req, res|
         live: nil,
         branches: branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' }.map { |name, head|
           { name: name, expected: head, preview_status: status,
-            preview_url: "https://abcdefghijklmn-onyx.gxbsites.com", diagnostics: [], review: "rev_#{head}" }
+            preview_url: "https://abcdefghijklmn-onyx.gxbsites.com", diagnostics: [], review: (saved_reviews[name] || "rev_#{head}") }
         },
+        # open_reviews: each branch's whole-branch review with the keys it
+        # would publish, as describe_site lists them.
+        open_reviews: (omit_open_reviews ? nil : branch_heads.reject { |name, _| archived_branches.include?(name) || name == 'live' }.map { |name, head|
+          { branch: name, kind: 'branch', included: FULL_BRANCH_KEYS, removed: [], age_seconds: 5, review: (saved_reviews[name] || "rev_#{head}") }
+        }),
         pending: { branch: args['branch'] || 'draft', against: 'live', keys: 1, truncated: false,
                   changes: pending_changes })
     when 'read'
@@ -339,13 +346,14 @@ server.mount_proc('/') do |req, res|
         Array(args['changes']).each do |c|
           bound_assets["#{branch}:#{c['key']}"] = c['digest'] if c['kind'] == 'asset' && c['op'] == 'put'
         end
+        saved_reviews.delete(branch)
         res.status = 200
         # A fresh snapshot has no ready build yet, so `review` is an explicit
         # null (slice D's save payload), which must drop any remembered one.
         res.body = JSON.generate(site: payload['site'] || 'onyx', branch: branch, expected: heads[branch],
           snapshot_created: true, changed_keys: Array(args['changes']).map { |c| "#{c['kind']}:#{c['key']}" },
           preview_status: 'queued', preview_url: 'https://abcdefghijklmn-onyx.gxbsites.com',
-          review: (Array(args['changes']).any? { |c| c['key'] == '/ready-review' } ? (branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}") : nil))
+          review: (Array(args['changes']).any? { |c| c['key'] == '/ready-review' } ? (saved_reviews[branch] = (branch == 'draft' ? 'rev_subset' : "rev_subset_#{branch}")) : nil))
       else
         res.status = 409
         res.body = JSON.generate(error: 'branch_changed', path: nil, version: nil,
@@ -369,7 +377,7 @@ server.mount_proc('/') do |req, res|
       if args['review']
         # A real review names its own branch (Site::ReviewToken). The stub's
         # tokens spell it: rev_subset is draft's, rev_subset_<branch> another's.
-        review_branch = args['review'][/\Arev_subset_(.+)\z/, 1] || 'draft'
+        review_branch = args['review'][/\Arev_(?:subset|whole)_(.+)\z/, 1] || 'draft'
         if args['branch'] && args['branch'] != review_branch
           res.status = 422
           res.body = JSON.generate(error: 'review_branch_mismatch', branch: args['branch'], review_branch: review_branch,
@@ -1424,7 +1432,9 @@ check('after spending it, --review last does not fall back to the old draft prop
 
   assert(code == 1, 'expected a refusal')
   assert(JSON.parse(out)['code'] == 'NO_LAST_REVIEW', "got #{out}")
-  assert(JSON.parse(out)['error'].include?('--branch draft'), "expected the draft review offered by name, got #{out}")
+  assert(JSON.parse(out)['error'].include?('draft (proposed'), "expected the draft review described, got #{out}")
+  assert(!JSON.parse(out)['error'].include?('--review last --branch'), "the refusal must not offer a last --branch command, got #{out}")
+  assert(JSON.parse(out)['error'].include?('publish onyx --branch BRANCH --keys KEYS'), "expected the re-propose command, got #{out}")
   assert(requests.values.sum == before, 'a refused publish reached the server')
 end
 
@@ -1522,15 +1532,111 @@ check('a save with a ready review alone is not something --review last spends wi
   out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
   assert(code == 1, "expected a refusal, got #{code}: #{out}")
   assert(%w[NO_LAST_REVIEW AMBIGUOUS_REVIEW].include?(JSON.parse(out)['code']), "got #{out}")
-  assert(JSON.parse(out)['error'].include?('--review last --branch thanks'), "the refusal must name the command, got #{out}")
+  assert(!JSON.parse(out)['error'].include?('--review last --branch'), "the refusal must not offer a last --branch command, got #{out}")
+  assert(JSON.parse(out)['error'].include?('thanks (saved'), "expected the remembered review described, got #{out}")
+  assert(JSON.parse(out)['error'].include?('--keys KEYS'), "expected the re-propose command, got #{out}")
   assert(requests.values.sum == before, 'a refused publish reached the server')
 
-  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'thanks', '--whole-branch')
   assert(code == 0, "got #{code}: #{out}#{err}")
   assert(last_args['publish']['review'] == 'rev_subset_thanks', "got #{last_args['publish'].inspect}")
   assert(!last_args['publish'].key?('keys'), "a save review covers the whole branch; no keys are known, got #{last_args['publish'].inspect}")
   assert(err.include?('saved'), "expected the review to be called saved, got #{err.inspect}")
   assert(err.include?('not recorded'), "expected 'keys: not recorded' for a full-branch review, got #{err.inspect}")
+end
+
+# Ticket 1974 / review 2 MUST 1: the Oct 16 outcome by another road. A save on B
+# drops this pane's subset proposal; `--review last --branch B` then used to
+# fall back to B's whole-branch review and publish everything pending on B.
+check('incident: propose on B, save on B drops it, `last` and `last --branch B` both refuse and publish nothing') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  Dir.mktmpdir do |dir|
+    run_cli('save', 'onyx', '--changes', ready_review_changes(dir), '--branch', 'pb')
+  end
+  assert(state['proposal:shared:onyx:pb'].nil?, 'the save must have dropped the proposal')
+  assert(state['last_review:onyx:pb'] == 'rev_subset_pb', 'the save left the branch review in the slot')
+  publishes = requests.select { |k, _| k.end_with?(' publish') }.values.sum
+
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last')
+  parsed = JSON.parse(out)
+  assert(code == 1 && %w[NO_LAST_REVIEW AMBIGUOUS_REVIEW].include?(parsed['code']), "bare last must refuse, got #{out}")
+  assert(!parsed['error'].include?('--review last --branch'), "the refusal must not suggest `last --branch`, got #{out}")
+  assert(parsed['error'].include?('publish onyx --branch BRANCH --keys KEYS'), "expected the re-propose command, got #{out}")
+  assert(parsed['error'].include?('token itself'), "expected the explicit-token way out, got #{out}")
+
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'pb')
+  parsed = JSON.parse(out)
+  assert(code == 1 && parsed['code'] == 'WHOLE_BRANCH_REVIEW', "last --branch B must refuse a whole-branch review, got #{code}: #{out}")
+  assert(parsed['error'].include?('--whole-branch'), "expected the way out named, got #{out}")
+  assert(err.include?('page:/about, page:/muncie, page:/thanks'), "expected the review's keys printed on stderr, got #{err.inspect}")
+  assert(parsed['error'].include?('page:/thanks'), "expected the keys in the refusal, got #{out}")
+  assert(requests.select { |k, _| k.end_with?(' publish') }.values.sum == publishes, 'a refused publish reached the server')
+end
+
+check('incident: --whole-branch spends the branch review, prints its keys, and sends no keys') do
+  # the state of the previous check: a save's whole-branch review on pb, no proposal
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'pb', '--whole-branch')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_pb', "got #{last_args['publish'].inspect}")
+  assert(last_args['publish']['branch'] == 'pb', "got #{last_args['publish'].inspect}")
+  assert(!last_args['publish'].key?('keys'), "got #{last_args['publish'].inspect}")
+  assert(err.include?('everything pending on pb: page:/about, page:/muncie, page:/thanks'), "expected the keys printed, got #{err.inspect}")
+end
+
+check('a proposal for B in this pane is still spent by `last --branch B` without --whole-branch') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'pb')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] == 'rev_subset_pb' && last_args['publish']['keys'] == [ 'page:/muncie' ], "got #{last_args['publish'].inspect}")
+end
+
+check('--whole-branch beside a proposal for B spends B\'s whole review, not the proposal') do
+  forget_all_reviews!
+  saved_reviews.clear
+  saved_reviews['pb'] = 'rev_whole_pb' # a save's whole-branch review, distinct from the proposal's token
+  run_cli('describe', 'onyx')
+  run_cli('publish', 'onyx', '--keys', 'page:/muncie', '--branch', 'pb')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'pb', '--whole-branch')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  assert(last_args['publish']['review'] != 'rev_subset_pb', "spent the proposal, got #{last_args['publish'].inspect}")
+  assert(!last_args['publish'].key?('keys'), "got #{last_args['publish'].inspect}")
+end
+
+check('--whole-branch refuses a review that describe does not list as open, and works against a server with no open_reviews') do
+  forget_all_reviews!
+  run_cli('describe', 'onyx')
+  edit_state { |st| st['last_review:onyx:draft'] = 'rev_stale_token' }
+  publishes = requests.select { |k, _| k.end_with?(' publish') }.values.sum
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  assert(code == 1 && JSON.parse(out)['code'] == 'REVIEW_NOT_OPEN', "got #{code}: #{out}")
+  assert(requests.select { |k, _| k.end_with?(' publish') }.values.sum == publishes, 'a refused publish reached the server')
+
+  forget_all_reviews!
+  omit_open_reviews = true
+  run_cli('describe', 'onyx')
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft')
+  assert(code == 1 && JSON.parse(out)['code'] == 'WHOLE_BRANCH_REVIEW', "got #{code}: #{out}")
+  assert(err.include?('unknown (this server does not list open_reviews)'), "got #{err.inspect}")
+  out, err, code = run_cli('publish', 'onyx', '--review', 'last', '--branch', 'draft', '--whole-branch')
+  assert(code == 0, "got #{code}: #{out}#{err}")
+  omit_open_reviews = false
+end
+
+check('--whole-branch needs `--review last --branch B`') do
+  out, _err, code = run_cli('publish', 'onyx', '--review', 'last', '--whole-branch')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "got #{out}")
+  out, _err, code = run_cli('publish', 'onyx', '--whole-branch')
+  assert(code == 1 && JSON.parse(out)['code'] == 'USAGE', "got #{out}")
+end
+
+check('REVIEW_TOO_OLD for a proposal gives the explicit command with its keys') do
+  forget_all_reviews!
+  run_cli('publish', 'onyx', '--keys', 'page:/thanks', '--branch', 'thanks')
+  old_proposal!('thanks', 2 * 3600)
+  out, _err, _code = run_cli('publish', 'onyx', '--review', 'last')
+  assert(JSON.parse(out)['error'].include?('--review rev_subset_thanks --branch thanks --keys page:/thanks'), "got #{out}")
 end
 
 check('a save on the branch of a proposal drops that proposal: the candidate it bound is gone') do
@@ -1655,8 +1761,9 @@ check('two branches with reviews and nothing saying which is newest is refused w
 
   assert(code == 1, 'expected a refusal')
   assert(JSON.parse(out)['code'] == 'AMBIGUOUS_REVIEW', "got #{out}")
-  assert(JSON.parse(out)['error'].include?('--branch draft'), "expected the options listed, got #{out}")
-  assert(JSON.parse(out)['error'].include?('--branch thanks'), "expected the options listed, got #{out}")
+  assert(JSON.parse(out)['error'].include?('draft (first seen'), "expected the options listed, got #{out}")
+  assert(!JSON.parse(out)['error'].include?('--review last --branch'), "the refusal must not offer a last --branch command, got #{out}")
+  assert(JSON.parse(out)['error'].include?('thanks (first seen'), "expected the options listed, got #{out}")
   assert(requests.values.sum == before, 'an ambiguous publish reached the server')
 end
 

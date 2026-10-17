@@ -33,7 +33,7 @@ require 'uri'
 require 'securerandom'
 require 'digest'
 
-VERSION = '2.4.4'
+VERSION = '2.4.5'
 SITES_ROOT = File.expand_path(ENV.fetch('SITES_ROOT', File.expand_path('~/projects/sites')))
 
 # A worker thread that dies prints its own backtrace to stderr and takes the
@@ -1114,8 +1114,8 @@ REVIEW_HOW = { 'proposed' => 'proposed', 'saved' => 'saved', 'seen' => 'first se
 # from this pane wins over the branch's own slot, which describe and save write.
 # `keys` is the list the review's candidate carries when the CLI knows it
 # (a proposal), nil when the review covers whatever is pending on the branch.
-def remembered_review(state, slug, branch, scope)
-  proposal = state[proposal_key(scope, slug, branch)]
+def remembered_review(state, slug, branch, scope, whole_branch: false)
+  proposal = whole_branch ? nil : state[proposal_key(scope, slug, branch)]
   if proposal.is_a?(Hash) && !proposal['review'].to_s.empty?
     return { review: proposal['review'], branch: branch, keys: Array(proposal['keys']), at: proposal['at'], source: 'proposed' }
   end
@@ -1145,10 +1145,13 @@ def remembered_review_branches(slug, state, scope)
   (slots + proposals).uniq.sort
 end
 
+# What is remembered, never a command to run. The old `--review last --branch B`
+# line was how a dropped subset proposal turned into the whole branch going
+# live (ticket 1974).
 def review_options(slug, state, scope)
   remembered_review_branches(slug, state, scope).filter_map do |name|
     found = remembered_review(state, slug, name, scope) or next
-    "  sites-cli publish #{slug} --review last --branch #{name}    # #{review_summary(found)}"
+    "  #{review_summary(found)}"
   end.join("\n")
 end
 
@@ -1164,6 +1167,7 @@ def review_too_old(slug, found, age)
   head = "the review remembered for #{slug}/#{branch} was #{when_text} (the limit is #{REVIEW_MAX_AGE / 60} minutes), so it was not published."
   if found[:source] == 'proposed'
     keys = found[:keys].to_a
+    explicit += " --keys #{keys.join(',')}" if keys.any?
     again = "sites-cli publish #{slug} --branch #{branch} --keys #{keys.join(',')}"
     return api_error("#{head} It binds the keys #{keys.empty? ? '(none recorded)' : keys.join(', ')}. To publish exactly that, " \
                      "pass the token yourself: `#{explicit}`. Or propose the same keys again with `#{again}`: when nothing " \
@@ -1182,7 +1186,7 @@ end
 # B). With nothing to go on it refuses and lists what is remembered, rather
 # than guessing: guessing `draft` is what put the wrong changes live on Oct 16
 # (ticket 1930).
-def resolve_last_review(slug, branch)
+def resolve_last_review(slug, branch, whole_branch: false)
   state = load_json(STATE_PATH)
   scope = pane_scope
   found = nil
@@ -1200,14 +1204,16 @@ def resolve_last_review(slug, branch)
       end
       code = names.size > 1 ? 'AMBIGUOUS_REVIEW' : 'NO_LAST_REVIEW'
       return [nil, api_error("`--review last` without --branch spends the review you last proposed with `publish --keys` from this " \
-                             "terminal, and there is none for #{slug} (it was spent, saved over, or proposed somewhere else). " \
-                             "A review from a save or a describe needs its branch named. #{names.size == 1 ? 'One review is' : 'Several reviews are'} remembered:\n" \
+                             "terminal, and there is none for #{slug} (it was spent, saved over, or proposed somewhere else; a save or " \
+                             "merge-live on the branch drops it). #{names.size == 1 ? 'This review is' : 'These reviews are'} remembered, " \
+                             "none of them a proposal you can spend with `last`:\n" \
                              "#{review_options(slug, state, scope)}\n" \
-                             "or propose again with `publish --keys`, or pass the review token itself.",
+                             "Propose again with `sites-cli publish #{slug} --branch BRANCH --keys KEYS`, then run bare `--review last` " \
+                             "in this same terminal. Or check the keys (`sites-cli describe #{slug}`, open_reviews) and pass the review token itself.",
                              code: code)]
     end
   else
-    found = remembered_review(state, slug, branch, scope)
+    found = remembered_review(state, slug, branch, scope, whole_branch: whole_branch)
     if found.nil?
       return [nil, api_error("no review remembered for #{slug}/#{branch} -- run `sites-cli describe #{slug} --branch #{branch}` " \
                              "and pass branches[].review, or take the review a save or a `publish --keys` returned",
@@ -1220,10 +1226,53 @@ def resolve_last_review(slug, branch)
   [found, nil, age]
 end
 
-def cmd_publish_review(slug, review, branch, base, idempotency, keys: [])
+# The keys a whole-branch review would publish, from describe_site's
+# open_reviews (the review's own `included`). [included, removed, listed, err]:
+# `listed` is nil when the server sends no open_reviews at all (an older one),
+# so the keys are unknown, and false when it does and this token is not there.
+def whole_branch_keys(slug, branch, token)
+  data, err = api_call(slug, 'describe_site', { 'branch' => branch })
+  return [nil, nil, nil, err] if err
+  remember_branch_state(slug, data)
+  return [nil, nil, nil, nil] unless data.is_a?(Hash) && data['open_reviews'].is_a?(Array)
+  entry = data['open_reviews'].find { |r| r.is_a?(Hash) && r['review'] == token }
+  return [nil, nil, false, nil] unless entry
+  [Array(entry['included']), Array(entry['removed']), true, nil]
+end
+
+# `--review last --branch B` with no proposal for B in this pane is B's whole
+# review: everything pending on B, whoever saved it. After a save drops a
+# subset proposal that is the Oct 16 outcome, so it is shown and refused unless
+# the caller says --whole-branch (or passes the token).
+def check_whole_branch_review(slug, found, whole_branch)
+  branch = found[:branch]
+  included, removed, listed, err = whole_branch_keys(slug, branch, found[:review])
+  return err if err
+  shown = included ? (included.empty? ? '(none)' : included.join(', ')) : 'unknown (this server does not list open_reviews)'
+  $stderr.puts("publish: #{slug}/#{branch} review #{found[:review]} covers everything pending on #{branch}: #{shown}")
+  $stderr.puts("publish: it would remove from live: #{removed.join(', ')}") if removed.to_a.any?
+  if listed == false
+    return api_error("the review remembered for #{slug}/#{branch} is not open on the server any more (the branch or live moved, " \
+                     "or the build is not ready). Run `sites-cli describe #{slug} --branch #{branch}`, check open_reviews, and propose " \
+                     "again with `sites-cli publish #{slug} --branch #{branch} --keys KEYS` if you meant a subset.",
+                     code: 'REVIEW_NOT_OPEN')
+  end
+  return nil if whole_branch
+  api_error("`--review last --branch #{branch}` has no proposal of yours to spend, so it means the WHOLE branch: " \
+            "everything pending on #{branch} (#{shown}). Nothing was published. If you meant a subset, propose it again with " \
+            "`sites-cli publish #{slug} --branch #{branch} --keys KEYS` and run bare `--review last` in this terminal. " \
+            'If you mean the whole branch, add --whole-branch, or pass the review token itself.',
+            code: 'WHOLE_BRANCH_REVIEW')
+end
+
+def cmd_publish_review(slug, review, branch, base, idempotency, keys: [], whole_branch: false)
   if review == 'last'
-    found, err, age = resolve_last_review(slug, branch)
+    found, err, age = resolve_last_review(slug, branch, whole_branch: whole_branch)
     return fail_with(err) if err
+    if found[:source] != 'proposed'
+      err = check_whole_branch_review(slug, found, whole_branch)
+      return fail_with(err) if err
+    end
     review = found[:review]
     branch = found[:branch]
     $stderr.puts("publish: spending the review for #{slug} branch #{branch}, #{REVIEW_HOW[found[:source]]} #{describe_age(age)} ago; " \
@@ -1244,8 +1293,13 @@ def cmd_publish_review(slug, review, branch, base, idempotency, keys: [])
   # A spent review is not a review any more -- publishing with it again is a
   # 409 upstream_changed. Every slot and pane that remembered this exact token
   # is cleared, so an explicit token for another branch changes nothing else.
-  update_state { |state| forget_spent_review!(state, slug, review) } if data['published']
-  remember_branch_state(slug, data)
+  begin
+    update_state { |state| forget_spent_review!(state, slug, review) } if data['published']
+    remember_branch_state(slug, data)
+  rescue SystemCallError => e
+    # The publish happened; only the local cache failed. Say so, do not report INTERNAL.
+    $stderr.puts("publish: published, but local state was not saved (#{e.class}); the spent review may still be remembered here") if data['published']
+  end
   # publication is a site-wide sequence, not this site's own count, so a jump
   # from 12 to 38 is normal -- every other tenant's publish moved it too --
   # and reads as a missing publication unless something says so.
@@ -1253,6 +1307,7 @@ def cmd_publish_review(slug, review, branch, base, idempotency, keys: [])
     $stderr.puts("publish: publication #{data['publication']} (site-wide sequence; numbers are global " \
                  'across the platform, so gaps are normal)')
     $stderr.puts("publish: live now carries branch #{data['branch']}: #{Array(data['included']).join(', ')}") if data['branch']
+    $stderr.puts("publish: removed from live: #{Array(data['removed']).join(', ')}") if Array(data['removed']).any?
   end
   success(data)
 end
@@ -3166,7 +3221,7 @@ SUBCOMMANDS = [
   [%w[create-branch], 'SLUG NAME [--from live|BRANCH]', 'create_branch', 'draft', 'v2'],
   [%w[archive-branch], 'SLUG NAME', 'archive_branch', 'draft', 'v2'],
   [%w[diff], 'SLUG [--branch B] [--against live|BRANCH]', 'diff', 'read', 'v2'],
-  [%w[publish], 'SLUG --review T|last | --expected T --keys ... | PATH', 'publish', 'publish', 'both'],
+  [%w[publish], 'SLUG --review T|last [--branch B --whole-branch] | --expected T --keys ... | PATH', 'publish', 'publish', 'both'],
   [%w[merge-live], 'SLUG [--branch B] --expected T --expected-live ID', 'merge_live', 'draft', 'v2'],
   [%w[resolve-merge], 'SLUG --proposal T --resolutions FILE', 'resolve_merge', 'draft', 'v2'],
   [%w[history], 'SLUG [--branch B] [--limit N]', 'history', 'read', 'v2'],
@@ -3287,7 +3342,7 @@ def usage
       sites-cli create-branch SLUG NAME [--from live|BRANCH]
       sites-cli archive-branch SLUG NAME
       sites-cli diff SLUG [--branch B] [--against live|BRANCH]
-      sites-cli publish SLUG --review TOKEN|last [--idempotency-key K]
+      sites-cli publish SLUG --review TOKEN|last [--branch B --whole-branch] [--idempotency-key K]
       sites-cli publish SLUG --expected TOKEN --keys page:/about,asset:assets/x.js
       sites-cli merge-live SLUG [--branch B] --expected TOKEN --expected-live ID
       sites-cli resolve-merge SLUG --proposal TOKEN --resolutions FILE
@@ -3358,10 +3413,18 @@ def usage
     most recent `publish --keys` from this terminal pane ($HERDR_PANE_ID)
     printed, spent with that proposal's keys so the server refuses any other
     candidate; describe, wait-preview, save and merge-live never change it.
-    With --branch B it means B's own review (a save's or a describe's, which
-    covers everything pending on B). It prints the branch, the keys and the
-    age to stderr first, and refuses one older than an hour or of unknown
-    age. Pass the token itself to publish anything else.
+    It prints the branch, the keys and the age to stderr first, and refuses
+    one older than an hour or of unknown age.
+
+    THE RULE: `publish --keys`, then BARE `--review last` in the same pane
+    within an hour. Never add --branch to `last` for a subset. If it refuses
+    (a save or merge-live dropped the proposal), propose again. For a whole
+    branch, or after a long human check, pass the review token itself, or
+    `--review last --branch B --whole-branch`. Without --whole-branch,
+    `last --branch B` with no proposal of yours for B prints the keys of B's
+    whole-branch review (from describe_site open_reviews) and refuses.
+    Children of a pane (subagents) share its $HERDR_PANE_ID, so share its
+    proposal.
 
     publish --expected --keys proposes a candidate and answers published:false.
     That is a 200 and exit 0, and live is untouched: the second call,
@@ -3420,8 +3483,8 @@ def usage
         --message "onyx, three pages"
       sites-cli wait-preview onyx
       sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
-      sites-cli publish onyx --review last --branch draft
-      sites-cli connect-domain onyx onyxmodular.com   # then verify-domain, describe, publish --review last --branch draft
+      sites-cli publish onyx --review last --branch draft --whole-branch
+      sites-cli connect-domain onyx onyxmodular.com   # then verify-domain, describe, publish --review last --branch draft --whole-branch
 
     A preview hostname is <token>--onyx.gxbsites.com (two dashes). Grants
     minted before 2026-09-22 use one dash and still resolve.
@@ -3730,6 +3793,7 @@ def run(argv)
     keys = split_list(opt_all(argv, '--keys'))
     keys = Array(base['keys']) if keys.empty? && base['keys']
     branch = opt(argv, '--branch') || base['branch']
+    whole_branch = flag?(argv, '--whole-branch')
     expected_flag = opt(argv, '--expected') || base['expected']
     idempotency = opt(argv, '--idempotency-key') || base['idempotency_key']
     expected_version = opt(argv, '--expected-version')
@@ -3737,8 +3801,11 @@ def run(argv)
     return fail_with(flag_err) if flag_err
     path = argv.shift
 
+    if whole_branch && !(review == 'last' && branch)
+      return failure('--whole-branch goes with `--review last --branch B`; bare `last` spends your proposal, and an explicit token needs no flag', code: 'USAGE')
+    end
     if review
-      return cmd_publish_review(slug, review, branch, base, idempotency, keys: keys)
+      return cmd_publish_review(slug, review, branch, base, idempotency, keys: keys, whole_branch: whole_branch)
     end
     if keys.any? || expected_flag
       expected, err = resolve_expected(slug, branch || DEFAULT_BRANCH, expected_flag)

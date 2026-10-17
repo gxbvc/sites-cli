@@ -23,7 +23,7 @@ sites-cli save onyx --config config.json \
   --page /about --html about.html       # one changes array, one snapshot, one build
 sites-cli wait-preview onyx             # 1 on invalid/failed/revoked
 sites-cli check https://<token>--onyx.gxbsites.com --against https://onyx.com
-sites-cli publish onyx --review last --branch draft   # a save's review; or --review "$REVIEW"
+sites-cli publish onyx --review last --branch draft --whole-branch   # a save's whole-branch review; or --review "$REVIEW"
 sites-cli connect-domain onyx onyx.com  # prints the DNS record to publish
 sites-cli list-submissions onyx         # needs a read_submissions token
 
@@ -54,10 +54,17 @@ nothing ever prints a Ruby backtrace.
   your last `publish --keys` from this terminal pane printed (never silently
   `draft`); describe, wait-preview, save and other agents cannot change it.
   It sends that proposal's keys with the review, so the server refuses any
-  other candidate. A review from a save needs `--review last --branch B` or
-  its token. It prints the branch, keys and age first, and refuses a review
-  older than an hour or of unknown age, so publishing a stale candidate is
-  always deliberate.
+  other candidate. A review from a save is the whole branch: it needs
+  `--review last --branch B --whole-branch` or its token, and without
+  `--whole-branch` the CLI prints that review's keys and refuses. It prints the
+  branch, keys and age first, and refuses a review older than an hour or of
+  unknown age, so publishing a stale candidate is always deliberate.
+- **The rule:** `publish --keys`, then BARE `--review last` in the same terminal
+  pane within an hour. Never add `--branch` to `last` for a subset. If it
+  refuses (a save or merge-live dropped the proposal), propose again. For a
+  whole branch, or after a long human check, pass the review token itself or
+  use `--review last --branch B --whole-branch`. Subagents share their
+  parent's `$HERDR_PANE_ID`, so they share its proposal.
 - **One `save` carries as many documents as you name.** `--page KEY --html
   FILE`, `--markdown`, `--config`, `--collection`, `--redirect`, `--delete` and
   `--asset` all repeat and keep their order, and the whole command is one

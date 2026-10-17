@@ -39,7 +39,7 @@ prints the `SUBCOMMANDS` table in the binary; a test fails if a row and a
 | `create-branch SLUG NAME [--from live\|BRANCH]` | `create_branch` | draft | v2 |
 | `archive-branch SLUG NAME` | `archive_branch` | draft | v2 |
 | `diff SLUG [--branch B] [--against live\|BRANCH]` | `diff` | read | v2 |
-| `publish SLUG --review T\|last \| --expected T --keys ... \| PATH` | `publish` | publish | both |
+| `publish SLUG --review T\|last [--branch B --whole-branch] \| --expected T --keys ... \| PATH` | `publish` | publish | both |
 | `merge-live SLUG [--branch B] --expected T --expected-live ID` | `merge_live` | draft | v2 |
 | `resolve-merge SLUG --proposal T --resolutions FILE` | `resolve_merge` | draft | v2 |
 | `history SLUG [--branch B] [--limit N]` | `history` | read | v2 |
@@ -161,16 +161,31 @@ All three access commands need `manage_access` and use the same tools as Chat.
   keys** with the review, so the server refuses a swapped candidate (422
   `review_mismatch`, `review_branch_mismatch`). It never falls back to
   `draft`. A review from a `save` or a describe is not what bare `last`
-  means: spend it with `--review last --branch B` or the token itself. With
+  means: it covers the **whole branch**. `--review last --branch B` with no
+  proposal of yours for B asks `describe_site` for that review's keys
+  (`open_reviews`), prints them, and refuses with `WHOLE_BRANCH_REVIEW`
+  unless you add `--whole-branch` (or pass the token itself). With
+  `--whole-branch` it also refuses a review `open_reviews` does not list
+  (`REVIEW_NOT_OPEN`: the branch or live moved). A proposal for B in this
+  pane is still spent by `last --branch B` as before; `--whole-branch` skips
+  it and spends B's whole review. With
   nothing to go on, `last` fails locally with no request: `NO_REVIEW`
   (nothing remembered), `NO_LAST_REVIEW` (one review remembered) or
-  `AMBIGUOUS_REVIEW` (several), each listing the `--branch` choices. A review
+  `AMBIGUOUS_REVIEW` (several). Those refusals list what is remembered, never a
+  `--review last --branch` command, and say to propose again with
+  `publish --keys` or to pass the token after checking its keys. A review
   older than an hour, of unknown age, or dated in the future is
   `REVIEW_TOO_OLD`; the refusal prints the exact explicit command. Re-proposing
   the same keys returns the same review when nothing changed. A `save` whose
   build is not ready answers `review: null`, which drops the branch's
   remembered review; a save or merge-live on a branch also drops that branch's
   proposal, because its candidate was built from the old head.
+- **The rule for `--review last`:** `publish --keys`, then BARE `--review last`
+  in the same pane within an hour. Never add `--branch` to `last` for a subset;
+  if it refuses, propose again. For a whole branch, or after a long human
+  check, pass the explicit token or `--review last --branch B --whole-branch`.
+  Child processes (subagents) share their parent's `$HERDR_PANE_ID`, so they
+  share its proposal; processes with no pane share the key `shared`.
 - `--idempotency-key` defaults to a fresh UUID.
 - Every tool subcommand also takes `--json FILE` or `--json -` (stdin) to
   supply the whole arguments object; explicit flags override individual keys.
@@ -234,7 +249,7 @@ checkout. The CLI tightens each to mode 600 on every read.
 
 `_platform` (or `SITES_CLI_TOKEN`, which wins) is the personal bearer for
 `list-sites`, `create-site` and `platform-tools`, and the fallback for any slug
-with no entry of its own. `state.json` is one flat map with two key shapes:
+with no entry of its own. `state.json` is one flat map:
 
 | Key | Value | Written by |
 |---|---|---|
@@ -243,11 +258,11 @@ with no entry of its own. `state.json` is one flat map with two key shapes:
 | `review_meta:<slug>:<branch>` | `{at, source}`: when that review was first seen (`seen`) or saved (`saved`) | beside `last_review`. A describe that sees the same token again leaves `at` alone. Deleted with the review |
 | `proposal:<pane>:<slug>:<branch>` | `{review, keys, at}`: what `publish --keys` printed; `<pane>` is `$HERDR_PANE_ID` or `shared` | only `publish --keys`. Deleted when the token is spent (in every pane), by a save or merge-live on that branch, or by archive-branch |
 | `last_proposal:<pane>:<slug>` | `{branch, at}`: the branch bare `--review last` means in that pane | only `publish --keys`. Deleted with its proposal |
+| `<slug>/<path>` | legacy file version | `read_file`, `write_file`, `edit_file`, `write_file --file` |
 
 Every change to `state.json` takes an `flock` on `state.json.lock` and is
 written to a temp file and renamed, so concurrent agents do not lose each
 other's tokens.
-| `<slug>/<path>` | legacy file version | `read_file`, `write_file`, `edit_file`, `write_file --file` |
 
 A review is never written under an `expected:` key and is never sent unless
 the caller named it.
@@ -529,7 +544,7 @@ sites-cli connect-domain onyx onyxmodular.com  # creates the claim, prints the r
 # publish that TXT record at the registrar, wait for DNS
 sites-cli verify-domain onyx onyxmodular.com   # 200 {verified:true}, or 200 {verified:false, checked:[...]}
 sites-cli describe onyx --branch draft         # the first publish used up the old review; this shows the new one
-sites-cli publish onyx --review last --branch draft   # republish: the artifact is built for a host
+sites-cli publish onyx --review last --branch draft --whole-branch   # republish: the artifact is built for a host
 ```
 
 `connect-domain` prints one copyable line on stderr:
@@ -745,7 +760,8 @@ publishes nothing the second time (409 `upstream_changed`). The answer names
 the `branch`, the `included` keys that went live and `removed`, the keys that
 left live. A review from `save` covers the whole branch delta, so passing it
 with a narrower `--keys` list is 422 `review_mismatch`. To spend a save's
-review: `publish SLUG --review last --branch B`, or the token itself.
+review: `publish SLUG --review last --branch B --whole-branch`, or the token
+itself. Without `--whole-branch`, `last --branch B` prints the keys and refuses.
 
 ## wait-preview
 
@@ -869,13 +885,13 @@ sites-cli check https://<token>--onyx.gxbsites.com --screenshot /tmp/onyx.png
 
 # 5. publish the whole branch delta
 sites-cli describe onyx                       # remembers branches[].review
-sites-cli publish onyx --review last --branch draft   # the branch's whole delta
+sites-cli publish onyx --review last --branch draft --whole-branch   # the branch's whole delta
 
 # 6. the public URL
 sites-cli connect-domain onyx onyxmodular.com # prints the TXT record to publish
 sites-cli verify-domain onyx onyxmodular.com  # once DNS has propagated
 sites-cli describe onyx --branch draft        # the first publish used up the old review
-sites-cli publish onyx --review last --branch draft   # the artifact is built for a host
+sites-cli publish onyx --review last --branch draft --whole-branch   # the artifact is built for a host
 ```
 
 To see the conversion before committing to it, `sites-cli fragment
@@ -935,11 +951,11 @@ done
 
 # 5. Publish, then move the hostname.
 sites-cli describe SLUG
-sites-cli publish SLUG --review last --branch draft
+sites-cli publish SLUG --review last --branch draft --whole-branch
 sites-cli connect-domain SLUG SOURCE
 sites-cli verify-domain SLUG SOURCE
 sites-cli describe SLUG --branch draft      # the first publish used up the old review
-sites-cli publish SLUG --review last --branch draft
+sites-cli publish SLUG --review last --branch draft --whole-branch
 ```
 
 Read every `fragment` warning before step 3 finishes. Each one in that table is
